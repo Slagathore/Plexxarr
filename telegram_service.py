@@ -3,14 +3,15 @@ import logging
 import threading
 
 from telegram.ext import (Application, ApplicationBuilder, CallbackQueryHandler,
-                          CommandHandler)
+                          CommandHandler, MessageHandler, filters)
 
 import config
 from bot import (cmd_button_handler, hardreset_confirm_handler,
-                 hardreset_handler, launch_handler, libraries_handler,
-                 metrics_handler, reindex_handler, request_handler, requests_handler,
-                 reset_handler, search_handler, start_handler,
-                 status_handler)
+                 hardreset_handler, help_handler, launch_handler,
+                 libraries_handler, metrics_handler, reindex_handler,
+                 request_handler, requests_handler, reset_handler,
+                 search_handler, start_handler, status_handler,
+                 welcome_fallback_handler)
 from request_flow import REQUEST_CONV_HANDLER
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ def build_application() -> Application:
     app.add_handler(REQUEST_CONV_HANDLER)
 
     app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CommandHandler("launch", launch_handler))
     app.add_handler(CommandHandler("libraries", libraries_handler))
     app.add_handler(CommandHandler("metrics", metrics_handler))
@@ -39,6 +41,14 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("status", status_handler))
     app.add_handler(CallbackQueryHandler(hardreset_confirm_handler, pattern="^hardreset_"))
     app.add_handler(CallbackQueryHandler(cmd_button_handler, pattern="^cmd_"))
+
+    # Catch-all for any free-form text the user sends outside an active
+    # conversation (REQUEST_CONV_HANDLER's per-state handlers consume their own
+    # messages first, so this only fires when no menu/submenu is open).
+    # Must be registered LAST so it doesn't shadow other handlers.
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, welcome_fallback_handler)
+    )
 
     return app
 

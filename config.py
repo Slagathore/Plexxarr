@@ -1,8 +1,21 @@
 import os
 import sys
+from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable, cast
+
+
+@dataclass(frozen=True)
+class MediaLibraryPath:
+    """One configured library path, tagged with the kind of media it holds."""
+    path: str
+    media_type: str   # "movie" | "tv" | "anime" | "xanime" | "mixed"
+
+
+# All known media-type tags, plus "mixed" for un-typed paths (legacy or
+# untyped roots that hold more than one kind of content).
+MEDIA_TYPE_TAGS: tuple[str, ...] = ("movie", "tv", "anime", "xanime", "mixed")
 
 
 def _load_dotenv_func() -> Callable[..., Any] | None:
@@ -88,18 +101,97 @@ APP_DB_PATH: str = os.getenv(
     os.getenv("REQUESTS_DB_PATH", str(APP_DIR / "plex_reset_button.db")),
 )
 REQUESTS_DB_PATH: str = APP_DB_PATH
-PLEX_LIBRARY_PATHS: list[str] = _split_semicolon_list(
-    os.getenv("PLEX_LIBRARY_PATHS", "")
+def _parse_media_library_paths(raw: str) -> list[MediaLibraryPath]:
+    """
+    Parse the MEDIA_LIBRARY_PATHS env var.
+
+    Format: ``path|type;path|type;...`` where type is one of MEDIA_TYPE_TAGS.
+    Entries without an explicit type fall back to "mixed".
+    """
+    parsed: list[MediaLibraryPath] = []
+    for entry in raw.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "|" in entry:
+            path_part, type_part = entry.split("|", 1)
+            media_type = type_part.strip().lower()
+            if media_type not in MEDIA_TYPE_TAGS:
+                media_type = "mixed"
+            parsed.append(MediaLibraryPath(path=path_part.strip(), media_type=media_type))
+        else:
+            parsed.append(MediaLibraryPath(path=entry, media_type="mixed"))
+    return parsed
+
+
+def format_media_library_paths(paths: list[MediaLibraryPath]) -> str:
+    """Inverse of _parse_media_library_paths — for writing back to .env."""
+    return ";".join(f"{p.path}|{p.media_type}" for p in paths)
+
+
+# New typed format takes precedence; fall back to legacy PLEX_LIBRARY_PATHS
+# (untyped, treated as "mixed") so existing installs keep working.
+MEDIA_LIBRARY_PATHS: list[MediaLibraryPath] = _parse_media_library_paths(
+    os.getenv("MEDIA_LIBRARY_PATHS", "")
 )
-LIBRARY_INDEX_EXTENSIONS: tuple[str, ...] = tuple(
-    ext.lower()
-    for ext in _split_semicolon_list(
-        os.getenv(
-            "LIBRARY_INDEX_EXTENSIONS",
-            ".mkv;.mp4;.avi;.mov;.wmv;.m4v;.mpg;.mpeg;.ts;.m2ts;.iso",
-        )
+if not MEDIA_LIBRARY_PATHS:
+    MEDIA_LIBRARY_PATHS = [
+        MediaLibraryPath(path=p, media_type="mixed")
+        for p in _split_semicolon_list(os.getenv("PLEX_LIBRARY_PATHS", ""))
+    ]
+
+# Flat list of just paths — preserved for backward compatibility with existing
+# code that walked PLEX_LIBRARY_PATHS without caring about media type.
+PLEX_LIBRARY_PATHS: list[str] = [p.path for p in MEDIA_LIBRARY_PATHS]
+
+
+def media_paths_for_types(*types: str) -> list[str]:
+    """
+    Return library paths that match any of the given media-type tags, plus any
+    paths tagged "mixed" (since those may contain multiple kinds of content).
+    """
+    target = set(types) | {"mixed"}
+    return [p.path for p in MEDIA_LIBRARY_PATHS if p.media_type in target]
+def _parse_extensions(raw: str) -> tuple[str, ...]:
+    """
+    Parse the LIBRARY_INDEX_EXTENSIONS env var.
+
+    Canonical format is semicolon-separated: ``.mkv;.mp4;.avi``. This parser
+    is lenient and also accepts a few common alternates so a fat-fingered .env
+    edit (or a stringified tuple from an older save bug) still works:
+      - Wrapped in (...) or [...]  → unwrapped
+      - Comma-separated             → split on commas too
+      - Single/double quotes        → stripped
+      - Missing leading dot         → added
+    """
+    cleaned = raw.strip()
+    if cleaned.startswith(("(", "[")) and cleaned.endswith((")", "]")):
+        cleaned = cleaned[1:-1]
+    cleaned = cleaned.replace("'", "").replace('"', "").replace(",", ";")
+    out: list[str] = []
+    for token in cleaned.split(";"):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if not token.startswith("."):
+            token = "." + token
+        out.append(token)
+    return tuple(out)
+
+
+LIBRARY_INDEX_EXTENSIONS: tuple[str, ...] = _parse_extensions(
+    os.getenv(
+        "LIBRARY_INDEX_EXTENSIONS",
+        ".mkv;.mp4;.avi;.mov;.wmv;.m4v;.mpg;.mpeg;.ts;.m2ts;.iso",
     )
 )
+# Defensive fallback: if parsing somehow yields nothing (corrupt .env), use
+# the same defaults rather than silently matching zero files.
+if not LIBRARY_INDEX_EXTENSIONS:
+    LIBRARY_INDEX_EXTENSIONS = (
+        ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v",
+        ".mpg", ".mpeg", ".ts", ".m2ts", ".iso",
+    )
 LIBRARY_SEARCH_RESULT_LIMIT: int = int(
     os.getenv("LIBRARY_SEARCH_RESULT_LIMIT", "25")
 )

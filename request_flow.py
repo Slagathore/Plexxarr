@@ -176,6 +176,22 @@ def _requester_name(update: Update) -> str:
     return user.full_name or "Unknown"
 
 
+def _display_for_in_lib(lr: LookupResult) -> str:
+    """
+    Pick the best display string for an in-library item.
+
+    Why: when the user corrects a mismatched item and we re-check the library,
+    Plex's search can return tangentially related entries (a search for
+    "Reacher 2" came back showing "Jack Frost" because library_matches[0] was
+    whatever Plex's hub search surfaced). The chosen external-DB title is the
+    canonical name; prefer it over the library filename when set.
+    """
+    if lr.best_match is not None:
+        return lr.best_match.title
+    raw = lr.library_matches[0] if lr.library_matches else ""
+    return clean_library_name(raw) if raw else lr.request.display()
+
+
 def _build_results_message(
     results: list[LookupResult],
     media_type: str,
@@ -235,16 +251,14 @@ def _build_results_message(
     if in_lib:
         lines.append("✅ <b>Already in your library:</b>")
         for num, lr in in_lib:
-            raw = lr.library_matches[0] if lr.library_matches else ""
-            display = clean_library_name(raw) if raw else lr.request.display()
+            display = _display_for_in_lib(lr)
             lines.append(f"  <b>{num}.</b> <i>{display}</i>")
         lines.append("")
 
     if in_lib_qual:
         lines.append("⚠️ <b>In library — but you added a note (please verify):</b>")
         for num, lr in in_lib_qual:
-            raw = lr.library_matches[0] if lr.library_matches else ""
-            display = clean_library_name(raw) if raw else lr.request.display()
+            display = _display_for_in_lib(lr)
             lines.append(
                 f"  <b>{num}.</b> <i>{display}</i>"
                 f" — you asked for <code>[{lr.request.qualifier}]</code>"
@@ -293,8 +307,10 @@ def _build_results_message(
     fixable = found_online + uncertain + nf_searched + in_lib_qual
     if fixable:
         lines.append(
-            "💡 <i>If a match looks wrong, type its number followed by \"is wrong\" "
-            "(e.g. <code>9 is wrong</code>) to search again.</i>\n"
+            "💡 <i>To fix a match, type its number followed by \"is wrong\" "
+            "(e.g. <code>9 is wrong</code>) to search again.\n"
+            "To drop an item entirely, type <code>remove 9</code> "
+            "(or <code>remove 9 and 11</code>).</i>\n"
         )
 
     submittable = [lr for i, lr in enumerate(results) if i not in _removed and not lr.in_library]
@@ -608,22 +624,37 @@ def _format_candidates_page(
     label: str,
     candidates: list[MediaResult],
     page: int,
+    media_type: str,
 ) -> str:
-    """Format one page of candidates as an HTML string ready to send."""
+    """Format one page of candidates as an HTML string ready to send.
+
+    Numbering is absolute across pages (1..len(candidates)), so the user can
+    pick any item from any page without re-paging — e.g. they flip to page 3,
+    decide #2 from page 1 was right, and just type `2`.
+    """
     start = page * _CORRECTION_PAGE_SIZE
     page_items = candidates[start : start + _CORRECTION_PAGE_SIZE]
+    total_pages = (len(candidates) + _CORRECTION_PAGE_SIZE - 1) // _CORRECTION_PAGE_SIZE
     has_more = (start + _CORRECTION_PAGE_SIZE) < len(candidates)
 
-    lines = [f"🔍 Results for <b>{label}</b> (page {page + 1}):\n"]
-    for i, m in enumerate(page_items, start=1):
+    lines = [f"🔍 Results for <b>{label}</b> (page {page + 1}/{total_pages}):\n"]
+    for offset, m in enumerate(page_items):
+        abs_num = start + offset + 1
         year_str = f" ({m.year})" if m.year else ""
         title_link = f'<a href="{m.external_url}">{m.title}</a>' if m.external_url else f"<b>{m.title}</b>"
         snippet = f" — <i>{m.overview[:80]}…</i>" if m.overview else ""
-        lines.append(f"  <b>{i}.</b> {title_link}{year_str}{snippet}")
+        lines.append(f"  <b>{abs_num}.</b> {title_link}{year_str}{snippet}")
 
-    footer_parts = ["Reply with a number (1–5) to select", "0 to leave as-is"]
+    footer_parts = [f"Reply with a number (1–{len(candidates)}) to select"]
     if has_more:
         footer_parts.append("<code>more</code> for next page")
+    if page > 0:
+        footer_parts.append("<code>back</code> for previous page")
+    footer_parts.append("<code>0</code> to leave as-is")
+    footer_parts.append("<code>remove</code> to drop this item")
+    if media_type in ("anime", "xanime"):
+        other_label = "xAnime DBs" if media_type == "anime" else "regular anime DB"
+        footer_parts.append(f"<code>other db</code> to search {other_label}")
     footer_parts.append("or type a different search term")
     lines.append("\n" + ", ".join(footer_parts) + ".")
     return "\n".join(lines)
@@ -679,7 +710,7 @@ async def _search_and_show_candidates(
     context.user_data[_UD_CORRECTION_PAGE] = 0
 
     await update.message.reply_html(  # type: ignore[union-attr]
-        _format_candidates_page(search_label, candidates, 0)
+        _format_candidates_page(search_label, candidates, 0, media_type)
     )
     return True
 
@@ -722,8 +753,9 @@ async def handle_correction_request(update: Update, context: ContextTypes.DEFAUL
     wrong_numbers = _parse_wrong_numbers(update.message.text)
     if not wrong_numbers:
         await update.message.reply_text(
-            "Tap Submit Requests or Start Over, or type '<number> is wrong' "
-            "to fix a specific item (e.g. '9 is wrong'), or 'remove 9' to drop one."
+            "Tap Submit Requests or Start Over, or:\n"
+            "• type '<number> is wrong' to fix a match (e.g. '9 is wrong')\n"
+            "• type 'remove <number>' to drop an item (e.g. 'remove 9' or 'remove 9 and 11')"
         )
         return CONFIRMING
 
@@ -752,10 +784,14 @@ async def handle_correction_request(update: Update, context: ContextTypes.DEFAUL
 async def handle_correction_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     In CORRECTING state, handle:
-      • a digit      → pick that result from the current page
-      • 0 / "skip"   → leave item unchanged, advance queue
-      • "more"/"next" → show next page of candidates
-      • anything else → treat as a new search term and re-search
+      • a digit (1..len(candidates)) → pick that result by absolute index
+      • 0 / "skip"            → leave item unchanged, advance queue
+      • "more" / "next"       → show next page of candidates
+      • "back" / "previous"   → show previous page
+      • "remove" / "delete"   → drop this item from the request
+      • "other db" / "switch" → re-run the search against the alternate DB
+                                (anime ↔ xanime; otherwise no-op)
+      • anything else         → treat as a new search term and re-search
     """
     if update.message is None or update.message.text is None:
         return CORRECTING
@@ -798,11 +834,71 @@ async def handle_correction_pick(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data[_UD_CORRECTION_PAGE] = next_page
         lr = results[correcting_idx]
         await update.message.reply_html(
-            _format_candidates_page(lr.request.display(), candidates, next_page)
+            _format_candidates_page(lr.request.display(), candidates, next_page, media_type)
         )
         return CORRECTING
 
-    # ── numeric pick ─────────────────────────────────────────────────────────
+    # ── "back" / "previous" — go to previous page ────────────────────────────
+    if text_lower in {"back", "prev", "previous"}:
+        if page == 0:
+            await update.message.reply_text("Already on the first page.")
+            return CORRECTING
+        prev_page = page - 1
+        context.user_data[_UD_CORRECTION_PAGE] = prev_page
+        lr = results[correcting_idx]
+        await update.message.reply_html(
+            _format_candidates_page(lr.request.display(), candidates, prev_page, media_type)
+        )
+        return CORRECTING
+
+    # ── "other db" / "switch" — re-run search against the alternate DB ───────
+    if text_lower in {"other db", "switch db", "switch", "different db", "alt db", "alternate db"}:
+        lr = results[correcting_idx]
+        loop = asyncio.get_running_loop()
+        new_candidates: list[MediaResult] = []
+        switched_label = ""
+        if media_type == "anime":
+            switched_label = "xAnime DBs"
+            new_candidates = await loop.run_in_executor(
+                None,
+                lambda q=lr.request.title: search_anidb(q) or search_jikan_anime(
+                    q, explicit=True, limit=_CORRECTION_FETCH_LIMIT
+                ),
+            )
+        elif media_type == "xanime":
+            switched_label = "regular anime DB"
+            new_candidates = await loop.run_in_executor(
+                None,
+                lambda q=lr.request.title: search_jikan_anime(
+                    q, explicit=False, limit=_CORRECTION_FETCH_LIMIT
+                ),
+            )
+        else:
+            await update.message.reply_text(
+                "No alternate database is configured for this media type. "
+                "Try typing a different search term instead."
+            )
+            return CORRECTING
+
+        if not new_candidates:
+            await update.message.reply_text(
+                f"No results from the {switched_label} either."
+            )
+            return CORRECTING
+
+        context.user_data[_UD_CORRECTION_OPTS] = new_candidates
+        context.user_data[_UD_CORRECTION_PAGE] = 0
+        await update.message.reply_html(
+            _format_candidates_page(
+                f"{lr.request.display()} ({switched_label})",
+                new_candidates,
+                0,
+                media_type,
+            )
+        )
+        return CORRECTING
+
+    # ── numeric pick (absolute index across pages) ───────────────────────────
     try:
         pick = int(text_lower)
     except ValueError:
@@ -810,15 +906,13 @@ async def handle_correction_pick(update: Update, context: ContextTypes.DEFAULT_T
 
     if pick is not None:
         if pick != 0:
-            page_start = page * _CORRECTION_PAGE_SIZE
-            page_items = candidates[page_start : page_start + _CORRECTION_PAGE_SIZE]
-            if pick < 1 or pick > len(page_items):
+            if pick < 1 or pick > len(candidates):
                 await update.message.reply_text(
-                    f"Please choose between 1 and {len(page_items)}, or 0 to skip."
+                    f"Please choose between 1 and {len(candidates)}, or 0 to skip."
                 )
                 return CORRECTING
 
-            chosen = candidates[page_start + pick - 1]
+            chosen = candidates[pick - 1]
             lr = results[correcting_idx]
             if lr.request.qualifier:
                 chosen = MediaResult(
@@ -828,11 +922,15 @@ async def handle_correction_pick(update: Update, context: ContextTypes.DEFAULT_T
                     source=chosen.source, qualifier=lr.request.qualifier,
                 )
 
-            # Re-check the library for the corrected title — it may already be there
+            # Re-check the library against the canonical chosen title.
+            # Strict mode here — the chosen title is from an external DB, so
+            # we want exact-ish matches, not the loose fuzzy/substring/word-
+            # fallback logic that produces false positives like "Reacher 2"
+            # matching "Jack Frost".
             loop = asyncio.get_running_loop()
             in_lib, lib_matches = await loop.run_in_executor(
                 None,
-                lambda t=chosen.title: check_library_for_title(t, media_type),
+                lambda t=chosen.title: check_library_for_title(t, media_type, strict=True),
             )
             if in_lib:
                 await update.message.reply_html(

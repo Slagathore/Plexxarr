@@ -72,6 +72,25 @@ class UnindexedFile:
     size_bytes: int
 
 
+@dataclass
+class ShowInventory:
+    """Per-show season/episode counts derived from the on-disk filenames."""
+    title: str
+    media_type: str               # "tv" | "anime" | "xanime" | "mixed"
+    seasons: dict[int, int]       # season number → distinct episode count
+    total_episodes: int
+    total_size_bytes: int
+
+
+@dataclass
+class LibraryInventory:
+    """Aggregate stats for one walk of the library."""
+    shows: list[ShowInventory]
+    movie_count: int
+    movie_size_bytes: int
+    untyped_files: int            # files whose category couldn't be guessed
+
+
 # ---------------------------------------------------------------------------
 # Daily library check
 # ---------------------------------------------------------------------------
@@ -192,8 +211,14 @@ def _media_files(roots: list[str]) -> list[Path]:
 
 def find_duplicates() -> list[DuplicateGroup]:
     """
-    Group media files by their normalised title.  Files that share the same
-    normalised title (e.g. same movie in 1080p and 4K) are flagged.
+    Group media files that are likely duplicates of the same content.
+
+    Two files are duplicates when they share the same normalized title AND the
+    same season/episode (where applicable):
+        - Movies (no SxxExx pattern) are grouped by title alone — same movie
+          in 1080p and 4K should be flagged.
+        - Episodes are grouped by (show, season, episode) — different episodes
+          of the same show are NOT duplicates.
 
     Returns a list of DuplicateGroup objects, each with ≥ 2 candidate paths.
     """
@@ -202,21 +227,26 @@ def find_duplicates() -> list[DuplicateGroup]:
         logger.warning("find_duplicates: no media files found in configured library paths.")
         return []
 
-    groups: dict[str, list[Path]] = {}
+    # Key: (normalized_title, season_or_None, episode_or_None)
+    groups: dict[tuple[str, int | None, int | None], list[Path]] = {}
     for f in files:
-        key = _normalize_title(f.name)
-        if key:
-            groups.setdefault(key, []).append(f)
+        title = _normalize_title(f.name)
+        if not title:
+            continue
+        ep = _parse_episode(f.name)
+        key = (title, ep[0] if ep else None, ep[1] if ep else None)
+        groups.setdefault(key, []).append(f)
 
     results: list[DuplicateGroup] = []
-    for norm_title, paths in groups.items():
+    for (norm_title, season, episode), paths in groups.items():
         if len(paths) < 2:
             continue
-        total_bytes = sum(
-            p.stat().st_size for p in paths if p.exists()
-        )
+        total_bytes = sum(p.stat().st_size for p in paths if p.exists())
+        label = norm_title
+        if season is not None and episode is not None:
+            label = f"{norm_title} S{season:02d}E{episode:02d}"
         results.append(DuplicateGroup(
-            normalized_title=norm_title,
+            normalized_title=label,
             candidates=[str(p) for p in sorted(paths)],
             total_size_bytes=total_bytes,
         ))
@@ -224,6 +254,108 @@ def find_duplicates() -> list[DuplicateGroup]:
     results.sort(key=lambda g: -g.total_size_bytes)
     logger.info("find_duplicates: found %d potential duplicate group(s).", len(results))
     return results
+
+
+# ---------------------------------------------------------------------------
+# Library inventory — per-show season/episode counts
+# ---------------------------------------------------------------------------
+
+def _media_type_for_path(path: Path) -> str:
+    """
+    Map a file path to the media-type tag of the library root that contains it.
+
+    Returns the media_type ("tv", "movie", "anime", "xanime", "mixed") of the
+    first MediaLibraryPath whose root is an ancestor of `path`. Falls back to
+    "mixed" for legacy/untyped configurations.
+    """
+    try:
+        path_resolved = path.resolve()
+    except OSError:
+        path_resolved = path
+    for entry in config.MEDIA_LIBRARY_PATHS:
+        try:
+            root = Path(entry.path).resolve()
+        except OSError:
+            root = Path(entry.path)
+        try:
+            path_resolved.relative_to(root)
+            return entry.media_type
+        except ValueError:
+            continue
+    return "mixed"
+
+
+def library_inventory() -> LibraryInventory:
+    """
+    Walk every configured library path and produce per-show season/episode
+    statistics. Files matching SxxExx (or NxN) patterns are treated as TV/anime
+    episodes and grouped by show; everything else counts as a movie file.
+
+    The show key is the normalized title from the filename — this works
+    consistently whether the library is laid out as "Show/Season 01/file.mkv"
+    or as a flat folder of files.
+
+    Used by both the standalone "Library Inventory" tool and as the data
+    source for richer duplicate detection / missing-episode reports.
+    """
+    files = _media_files(config.PLEX_LIBRARY_PATHS)
+
+    # show_title -> { season -> set of episodes }
+    show_eps: dict[str, dict[int, set[int]]] = {}
+    show_size: dict[str, int] = {}
+    show_type: dict[str, str] = {}
+    movie_count = 0
+    movie_size = 0
+    untyped = 0
+
+    for f in files:
+        try:
+            size = f.stat().st_size
+        except OSError:
+            size = 0
+
+        ep = _parse_episode(f.name)
+        norm = _normalize_title(f.name)
+
+        if ep is not None and norm:
+            season, episode = ep
+            show_eps.setdefault(norm, {}).setdefault(season, set()).add(episode)
+            show_size[norm] = show_size.get(norm, 0) + size
+            # First time we see this show, remember the media type from the
+            # root path it lives under. If a later episode lives under a
+            # different root with a different type tag, prefer the more
+            # specific tag over "mixed".
+            existing = show_type.get(norm, "")
+            this_type = _media_type_for_path(f)
+            if not existing or existing == "mixed":
+                show_type[norm] = this_type
+        elif norm:
+            movie_count += 1
+            movie_size += size
+        else:
+            untyped += 1
+
+    shows: list[ShowInventory] = []
+    for title, seasons in show_eps.items():
+        shows.append(ShowInventory(
+            title=title,
+            media_type=show_type.get(title, "mixed"),
+            seasons={s: len(eps) for s, eps in seasons.items()},
+            total_episodes=sum(len(eps) for eps in seasons.values()),
+            total_size_bytes=show_size.get(title, 0),
+        ))
+    shows.sort(key=lambda s: (-s.total_episodes, s.title))
+
+    logger.info(
+        "library_inventory: %d show(s) / %d movie file(s) / %d untyped",
+        len(shows), movie_count, untyped,
+    )
+    return LibraryInventory(
+        shows=shows,
+        movie_count=movie_count,
+        movie_size_bytes=movie_size,
+        untyped_files=untyped,
+    )
 
 
 # ---------------------------------------------------------------------------

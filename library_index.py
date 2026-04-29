@@ -223,21 +223,49 @@ def format_library_summary_message() -> str:
     summary = library_index_summary()
     if not summary.configured_paths and not summary.missing_paths:
         return (
-            "No Plex library paths are configured yet.\n"
-            "Set PLEX_LIBRARY_PATHS in your .env file for offline folder indexing, "
-            "or configure PLEX_TOKEN for Plex-native library data."
+            "No library paths are configured yet.\n"
+            "Open the Settings tab and add one or more library paths "
+            "(tagged Movie / TV / Anime / xAnime), then click Reindex.\n"
+            "Or set PLEX_TOKEN in Settings to use Plex's own search."
         )
+
+    # Group configured paths by media type so the user can see which roots
+    # contribute to which collective library.
+    by_type: dict[str, list[str]] = {}
+    for entry in getattr(config, "MEDIA_LIBRARY_PATHS", []):
+        by_type.setdefault(entry.media_type, []).append(entry.path)
 
     lines = [
         f"Indexed library files: {summary.indexed_files}",
-        "",
-        "Configured library paths:",
     ]
-    lines.extend(f"- {path}" for path in summary.configured_paths)
+
+    if summary.indexed_files == 0 and summary.configured_paths:
+        lines.append(
+            "  (index is empty -- click Reindex or run /reindex to populate it)"
+        )
+
+    lines.append("")
+    lines.append("Configured library paths:")
+    if by_type:
+        for media_type in ("movie", "tv", "anime", "xanime", "mixed"):
+            paths = by_type.get(media_type, [])
+            if not paths:
+                continue
+            label = {
+                "movie": "Movies", "tv": "TV Shows",
+                "anime": "Anime", "xanime": "xAnime / Hentai",
+                "mixed": "Mixed / Untyped",
+            }.get(media_type, media_type)
+            lines.append(f"  {label}:")
+            lines.extend(f"    - {p}" for p in paths)
+    else:
+        # Fallback if MEDIA_LIBRARY_PATHS isn't loaded for some reason.
+        lines.extend(f"- {p}" for p in summary.configured_paths)
 
     if summary.missing_paths:
-        lines.extend(["", "Missing/unavailable paths:"])
-        lines.extend(f"- {path}" for path in summary.missing_paths)
+        lines.append("")
+        lines.append("Missing/unavailable paths (drive unplugged or path renamed?):")
+        lines.extend(f"- {p}" for p in summary.missing_paths)
 
     return "\n".join(lines)
 
@@ -297,15 +325,69 @@ def search_library(query: str, *, limit: int | None = None) -> list[LibraryEntry
 def format_search_results_message(query: str, *, limit: int | None = None) -> str:
     results = search_library(query, limit=limit)
     if not results:
-        return (
-            f'No Plex or indexed library matches for "{query}".\n'
-            "If Plex search is unavailable and you just changed your folders, run /reindex first."
-        )
+        return _format_no_results_diagnostic(query)
 
     lines = [f'Search results for "{query}" ({len(results)} shown):']
     for entry in results:
         lines.append(f"- {entry.name} [{entry.root_path}]")
         lines.append(f"  {entry.path}")
+    return "\n".join(lines)
+
+
+def _format_no_results_diagnostic(query: str) -> str:
+    """
+    Build a useful 'why did nothing match?' message instead of a generic
+    'no results'. The message names the actual blocker the user can fix:
+    no library paths configured, an empty SQLite index, or just no Plex
+    token + no fallback index.
+    """
+    lines = [f'No matches for "{query}".']
+
+    valid_paths, missing_paths = _configured_library_paths()
+    has_paths = bool(valid_paths) or bool(missing_paths)
+    has_plex_token = bool(getattr(config, "PLEX_TOKEN", "").strip())
+    indexed = indexed_file_count()
+
+    if not has_paths and not has_plex_token:
+        lines.append("")
+        lines.append(
+            "No library paths are configured and no Plex token is set, so "
+            "there's nothing to search. Open the Settings tab and add at "
+            "least one library path, then click Reindex on the Library tab."
+        )
+        return "\n".join(lines)
+
+    if has_paths and indexed == 0:
+        lines.append("")
+        lines.append(
+            f"The local file index is empty even though {len(valid_paths)} "
+            "library path(s) are configured. Click Reindex on the Library "
+            "tab (or run /reindex) so the index actually contains your files."
+        )
+        return "\n".join(lines)
+
+    if missing_paths:
+        lines.append("")
+        lines.append("Some configured library paths could not be reached:")
+        lines.extend(f"  - {p}" for p in missing_paths)
+        lines.append(
+            "Fix the paths in the Settings tab (or check that the drive is mounted)."
+        )
+
+    if has_plex_token and indexed == 0:
+        lines.append("")
+        lines.append(
+            "Plex search returned nothing and there's no local fallback index. "
+            "Either Plex's own libraries don't include your folders, or the "
+            "title really isn't there. Run Reindex to build a local fallback."
+        )
+    elif not has_plex_token and indexed > 0:
+        lines.append("")
+        lines.append(
+            f"(Searched the local index of {indexed} file(s). Set PLEX_TOKEN "
+            "in Settings if you also want Plex's metadata-aware search.)"
+        )
+
     return "\n".join(lines)
 
 

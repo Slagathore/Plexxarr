@@ -4,7 +4,7 @@ import threading
 import tkinter as tk
 from importlib import import_module
 from pathlib import Path
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Any, cast
 
 import config
@@ -18,13 +18,17 @@ from plex_auth import (PlexPinSession, PlexTokenResult, launch_auth_browser,
                        wait_for_plex_token)
 from plex_control import get_status, hard_reset, launch_plex, soft_reset
 from maintenance import (
-    DuplicateGroup, FilenameIssue, MissingEpisode, SanitizePair, UnindexedFile,
+    DuplicateGroup, FilenameIssue, LibraryInventory, MissingEpisode,
+    SanitizePair, ShowInventory, UnindexedFile,
     apply_sanitization, check_filenames_vs_plex, daily_library_check,
-    find_duplicates, find_missing_episodes, find_unindexed_files, sanitize_all,
+    find_duplicates, find_missing_episodes, find_unindexed_files,
+    library_inventory, sanitize_all,
 )
 from queue_store import (add_request, complete_request, find_duplicate_requests,
                           get_request, initialize_queue_db, list_requests,
                           open_request_count)
+from settings_store import (load_current_settings, reload_config_from_env,
+                             save_settings)
 from telegram_service import TelegramBotService
 
 logger = logging.getLogger(__name__)
@@ -69,6 +73,11 @@ class DesktopApp:
         self._maint_tree: ttk.Treeview | None = None
         self._maint_check_vars: list[tk.BooleanVar] = []
         self._maint_status_var = tk.StringVar(value="Select a tool to run.")
+        # Settings tab state — declared in _build_settings_tab
+        self._settings_vars: dict[str, tk.Variable] = {}
+        self._settings_paths: list[tuple[str, str]] = []  # (path, media_type)
+        self._settings_paths_tree: ttk.Treeview | None = None
+        self._settings_status_var = tk.StringVar(value="")
         self._last_library_check_date: str = ""
         self._last_log_count = 0
         self._tray_icon = self._build_tray_icon()
@@ -149,12 +158,14 @@ class DesktopApp:
         library_tab = ttk.Frame(notebook, padding=12)
         metrics_tab = ttk.Frame(notebook, padding=12)
         maintenance_tab = ttk.Frame(notebook, padding=12)
+        settings_tab = ttk.Frame(notebook, padding=12)
         logs_tab = ttk.Frame(notebook, padding=12)
         notebook.add(status_tab, text="Status")
         notebook.add(requests_tab, text="Requests")
         notebook.add(library_tab, text="Library")
         notebook.add(metrics_tab, text="Metrics")
         notebook.add(maintenance_tab, text="Maintenance")
+        notebook.add(settings_tab, text="Settings")
         notebook.add(logs_tab, text="Logs")
 
         status_tab.columnconfigure(0, weight=1)
@@ -280,19 +291,20 @@ class DesktopApp:
         # -----------------------------------------------------------------
         maint_toolbar = ttk.Frame(maintenance_tab)
         maint_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        for col in range(7):
+        for col in range(8):
             maint_toolbar.columnconfigure(col, weight=1)
 
-        ttk.Button(maint_toolbar, text="Daily Check",     command=self._run_daily_check).grid(row=0, column=0, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Find Duplicates", command=self._run_find_duplicates).grid(row=0, column=1, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Filename Issues", command=self._run_filename_check).grid(row=0, column=2, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Sanitize Names",  command=self._run_sanitize).grid(row=0, column=3, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Missing Episodes",command=self._run_missing_episodes).grid(row=0, column=4, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Unindexed Files", command=self._run_unindexed).grid(row=0, column=5, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Apply Selected",  command=self._apply_maint_selection).grid(row=0, column=6, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Daily Check",       command=self._run_daily_check).grid(row=0, column=0, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Library Inventory", command=self._run_library_inventory).grid(row=0, column=1, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Find Duplicates",   command=self._run_find_duplicates).grid(row=0, column=2, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Filename Issues",   command=self._run_filename_check).grid(row=0, column=3, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Sanitize Names",    command=self._run_sanitize).grid(row=0, column=4, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Missing Episodes",  command=self._run_missing_episodes).grid(row=0, column=5, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Unindexed Files",   command=self._run_unindexed).grid(row=0, column=6, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Apply Selected",    command=self._apply_maint_selection).grid(row=0, column=7, padx=2, sticky="ew")
 
         ttk.Label(maintenance_tab, textvariable=self._maint_status_var,
-                  font=("Segoe UI", 9, "italic")).grid(row=1, column=0, sticky="w", pady=(0, 4))
+                  font=("Segoe UI", 11, "bold")).grid(row=1, column=0, sticky="w", pady=(0, 6))
 
         maint_results_frame = ttk.Frame(maintenance_tab)
         maint_results_frame.grid(row=2, column=0, sticky="nsew")
@@ -319,6 +331,11 @@ class DesktopApp:
         maint_scroll.grid(row=0, column=1, sticky="ns")
         self._maint_tree.configure(yscrollcommand=maint_scroll.set)
         self._maint_tree.bind("<ButtonRelease-1>", self._on_maint_tree_click)
+
+        # -----------------------------------------------------------------
+        # Settings tab
+        # -----------------------------------------------------------------
+        self._build_settings_tab(settings_tab)
 
         # -----------------------------------------------------------------
         # Logs tab
@@ -798,6 +815,35 @@ class DesktopApp:
             for item in self._maint_tree.get_children():
                 self._maint_tree.delete(item)
 
+    def _maint_require_library_paths(self, tool_label: str) -> bool:
+        """
+        Ensure PLEX_LIBRARY_PATHS is configured before running filesystem
+        maintenance tools. Returns True when OK, False (with popup + status
+        update) when the user needs to configure paths first.
+        """
+        if config.PLEX_LIBRARY_PATHS:
+            return True
+        msg = (
+            f"{tool_label} needs PLEX_LIBRARY_PATHS to be set in your .env file.\n\n"
+            "Add a semicolon-separated list of folders, e.g.:\n"
+            r"PLEX_LIBRARY_PATHS=D:\Movies;D:\TV;E:\Anime"
+        )
+        self._maint_status_var.set(f"{tool_label}: PLEX_LIBRARY_PATHS not configured")
+        self._show_warning(tool_label, msg)
+        return False
+
+    def _maint_require_plex_token(self, tool_label: str) -> bool:
+        """Ensure PLEX_TOKEN is configured before running Plex-API-based tools."""
+        if config.PLEX_TOKEN and config.PLEX_SERVER_URL:
+            return True
+        msg = (
+            f"{tool_label} needs Plex API access.\n\n"
+            "Click 'Get Plex Token' to authorize, then try again."
+        )
+        self._maint_status_var.set(f"{tool_label}: Plex token not configured")
+        self._show_warning(tool_label, msg)
+        return False
+
     def _populate_maint_tree(
         self,
         rows: list[tuple[str, str, str, str]],
@@ -848,7 +894,7 @@ class DesktopApp:
     # Maintenance tab — daily library check
     # =====================================================================
 
-    def _run_daily_check(self) -> None:
+    def _run_daily_check(self, *, silent: bool = False) -> None:
         self._maint_set_busy("Daily Library Check")
 
         def worker() -> None:
@@ -857,11 +903,11 @@ class DesktopApp:
             except Exception as exc:
                 logger.exception("Daily library check failed.")
                 summary = {"checked": 0, "newly_found": 0, "errors": [str(exc)]}
-            self._post_to_ui(lambda: self._handle_daily_check_result(summary))
+            self._post_to_ui(lambda: self._handle_daily_check_result(summary, silent=silent))
 
         threading.Thread(target=worker, name="maint-daily-check", daemon=True).start()
 
-    def _handle_daily_check_result(self, summary: dict) -> None:
+    def _handle_daily_check_result(self, summary: dict, *, silent: bool = False) -> None:
         self._last_library_check_date = datetime.date.today().isoformat()
         checked = summary.get("checked", 0)
         newly_found = summary.get("newly_found", 0)
@@ -884,12 +930,22 @@ class DesktopApp:
         self._populate_maint_tree(rows, col1="Result", col2="Detail", col3="")
         self.refresh_requests()
 
+        if not silent:
+            popup_lines = [
+                f"Scanned {checked} open request(s).",
+                f"Newly found in library: {newly_found}",
+            ]
+            if errors:
+                popup_lines.append(f"Errors: {len(errors)}")
+                popup_lines.extend(f"  - {e}" for e in errors[:5])
+            self._show_info("Daily Library Check", "\n".join(popup_lines))
+
     def _schedule_daily_library_check(self) -> None:
         now = datetime.datetime.now()
         target_hour = getattr(config, "LIBRARY_CHECK_HOUR", 3)
         today_str = now.date().isoformat()
         if self._last_library_check_date != today_str and now.hour >= target_hour:
-            self._run_daily_check()
+            self._run_daily_check(silent=True)
         if not self._quitting:
             self.root.after(60 * 60 * 1000, self._daily_check_tick)
 
@@ -900,7 +956,7 @@ class DesktopApp:
         target_hour = getattr(config, "LIBRARY_CHECK_HOUR", 3)
         today_str = now.date().isoformat()
         if self._last_library_check_date != today_str and now.hour >= target_hour:
-            self._run_daily_check()
+            self._run_daily_check(silent=True)
         self.root.after(60 * 60 * 1000, self._daily_check_tick)
 
     # =====================================================================
@@ -908,6 +964,8 @@ class DesktopApp:
     # =====================================================================
 
     def _run_find_duplicates(self) -> None:
+        if not self._maint_require_library_paths("Find Duplicates"):
+            return
         self._maint_set_busy("Find Duplicates")
 
         def worker() -> None:
@@ -927,6 +985,7 @@ class DesktopApp:
         if not results:
             self._maint_status_var.set("No duplicate groups found.")
             self._populate_maint_tree([], col1="Title", col2="Candidates", col3="Total Size")
+            self._show_info("Find Duplicates", "No duplicate groups found across the configured library paths.")
             return
         total_size = sum(g.total_size_bytes for g in results)
         self._maint_status_var.set(f"{len(results)} duplicate group(s) -- {self._fmt_bytes(total_size)} total")
@@ -937,12 +996,21 @@ class DesktopApp:
                 rows.append(("", indent + group.normalized_title, candidate,
                               self._fmt_bytes(group.total_size_bytes) if i == 0 else ""))
         self._populate_maint_tree(rows, col1="Normalized Title", col2="File Path", col3="Group Size")
+        self._show_info(
+            "Find Duplicates",
+            f"Found {len(results)} duplicate group(s) -- {self._fmt_bytes(total_size)} total.\n\n"
+            "See the table below for details.",
+        )
 
     # =====================================================================
     # Maintenance tab — filename check
     # =====================================================================
 
     def _run_filename_check(self) -> None:
+        if not self._maint_require_library_paths("Filename Check"):
+            return
+        if not self._maint_require_plex_token("Filename Check"):
+            return
         self._maint_set_busy("Filename Check")
 
         def worker() -> None:
@@ -962,16 +1030,23 @@ class DesktopApp:
         if not results:
             self._maint_status_var.set("All filenames match Plex titles.")
             self._populate_maint_tree([], col1="Disk Name", col2="Expected Name", col3="Plex Title")
+            self._show_info("Filename Check", "All on-disk filenames match Plex titles.")
             return
         self._maint_status_var.set(f"{len(results)} filename mismatch(es) found")
         rows = [("", issue.disk_name, issue.expected_filename, issue.plex_title) for issue in results]
         self._populate_maint_tree(rows, col1="Disk Name", col2="Expected Name", col3="Plex Title")
+        self._show_info(
+            "Filename Check",
+            f"Found {len(results)} filename mismatch(es).\n\nSee the table below for the proposed names.",
+        )
 
     # =====================================================================
     # Maintenance tab — sanitize filenames
     # =====================================================================
 
     def _run_sanitize(self) -> None:
+        if not self._maint_require_library_paths("Sanitize Names"):
+            return
         self._maint_set_busy("Sanitize Names (preview)")
 
         def worker() -> None:
@@ -991,6 +1066,7 @@ class DesktopApp:
         if not results:
             self._maint_status_var.set("All filenames are already Plex-friendly.")
             self._populate_maint_tree([], col1="Original Name", col2="Proposed Name", col3="Size")
+            self._show_info("Sanitize Names", "All filenames are already Plex-friendly -- nothing to rename.")
             return
         self._maint_status_var.set(f"{len(results)} rename(s) proposed -- check boxes then click Apply Selected")
         rows = [
@@ -998,12 +1074,20 @@ class DesktopApp:
             for pair in results
         ]
         self._populate_maint_tree(rows, col1="Original Name", col2="Proposed Name", col3="Size")
+        self._show_info(
+            "Sanitize Names",
+            f"{len(results)} rename(s) proposed.\n\n"
+            "Tick the checkbox column on rows you want renamed, then click "
+            "'Apply Selected' to rename them on disk.",
+        )
 
     # =====================================================================
     # Maintenance tab — missing episodes
     # =====================================================================
 
     def _run_missing_episodes(self) -> None:
+        if not self._maint_require_library_paths("Missing Episodes"):
+            return
         self._maint_set_busy("Missing Episodes")
 
         def worker() -> None:
@@ -1023,17 +1107,25 @@ class DesktopApp:
         if not results:
             self._maint_status_var.set("No missing episodes detected.")
             self._populate_maint_tree([], col1="Show", col2="Missing Episode", col3="Show Path")
+            self._show_info("Missing Episodes", "No gaps detected in any show's episode numbering.")
             return
         shows = len({r.show_title for r in results})
         self._maint_status_var.set(f"{len(results)} missing episode slot(s) across {shows} show(s)")
         rows = [("", ep.show_title, f"S{ep.season:02d}E{ep.episode:02d}", ep.show_path) for ep in results]
         self._populate_maint_tree(rows, col1="Show", col2="Missing Episode", col3="Show Path")
+        self._show_info(
+            "Missing Episodes",
+            f"Detected {len(results)} missing episode slot(s) across {shows} show(s).\n\n"
+            "See the table below.",
+        )
 
     # =====================================================================
     # Maintenance tab — unindexed files
     # =====================================================================
 
     def _run_unindexed(self) -> None:
+        if not self._maint_require_library_paths("Unindexed Files"):
+            return
         self._maint_set_busy("Unindexed Files")
 
         def worker() -> None:
@@ -1053,11 +1145,22 @@ class DesktopApp:
         if not results:
             self._maint_status_var.set("No unindexed files found -- library index is up to date.")
             self._populate_maint_tree([], col1="Filename", col2="Full Path", col3="Size")
+            self._show_info(
+                "Unindexed Files",
+                "No unindexed files found -- everything on disk is in the library index.\n\n"
+                "Tip: if the index is empty, click 'Reindex' on the Library tab first.",
+            )
             return
         total = sum(f.size_bytes for f in results)
         self._maint_status_var.set(f"{len(results)} unindexed file(s) -- {self._fmt_bytes(total)} total")
         rows = [("", f.name, f.path, self._fmt_bytes(f.size_bytes)) for f in results]
         self._populate_maint_tree(rows, col1="Filename", col2="Full Path", col3="Size")
+        self._show_info(
+            "Unindexed Files",
+            f"Found {len(results)} unindexed file(s) -- {self._fmt_bytes(total)} total.\n\n"
+            "These files exist on disk but aren't in the library index. "
+            "Click 'Reindex' on the Library tab to add them.",
+        )
 
     # =====================================================================
     # Maintenance tab — apply selected (sanitize renames)
@@ -1124,6 +1227,458 @@ class DesktopApp:
                 return f"{value:.1f} {unit}"
             value /= 1024
         return f"{value:.1f} PB"
+
+    # =====================================================================
+    # Maintenance tab — library inventory (per-show season/episode counts)
+    # =====================================================================
+
+    def _run_library_inventory(self) -> None:
+        if not self._maint_require_library_paths("Library Inventory"):
+            return
+        self._maint_set_busy("Library Inventory")
+
+        def worker() -> None:
+            try:
+                inventory = library_inventory()
+            except Exception as exc:
+                logger.exception("library_inventory failed.")
+                self._post_to_ui(lambda: self._maint_status_var.set(f"Library inventory error: {exc}"))
+                return
+            self._post_to_ui(lambda: self._handle_library_inventory_result(inventory))
+
+        threading.Thread(target=worker, name="maint-inventory", daemon=True).start()
+
+    def _handle_library_inventory_result(self, inventory: LibraryInventory) -> None:
+        self._maint_tool_name = "library_inventory"
+        self._maint_results = list(inventory.shows)
+
+        total_shows = len(inventory.shows)
+        total_episodes = sum(s.total_episodes for s in inventory.shows)
+        status = (
+            f"{total_shows} show(s) / {total_episodes} episode file(s) / "
+            f"{inventory.movie_count} movie file(s)"
+        )
+        if inventory.untyped_files:
+            status += f" / {inventory.untyped_files} untyped"
+        self._maint_status_var.set(status)
+
+        # One row per show with summarized seasons (e.g. "S1: 8, S2: 10").
+        rows: list[tuple[str, str, str, str]] = []
+        for show in inventory.shows:
+            seasons_summary = ", ".join(
+                f"S{season}: {count}"
+                for season, count in sorted(show.seasons.items())
+            )
+            rows.append((
+                "",
+                f"{show.title}  [{show.media_type}]",
+                f"{show.total_episodes} ep — {seasons_summary}",
+                self._fmt_bytes(show.total_size_bytes),
+            ))
+
+        self._populate_maint_tree(rows, col1="Show", col2="Seasons / Episodes", col3="Size")
+
+        popup_lines = [
+            f"Shows detected: {total_shows}",
+            f"Total episode files: {total_episodes}",
+            f"Movie files: {inventory.movie_count}",
+        ]
+        if inventory.untyped_files:
+            popup_lines.append(f"Untyped files: {inventory.untyped_files}")
+        if inventory.shows:
+            popup_lines.append("")
+            popup_lines.append("Top shows by episode count:")
+            for show in inventory.shows[:5]:
+                popup_lines.append(f"  - {show.title}: {show.total_episodes} ep across {len(show.seasons)} season(s)")
+        self._show_info("Library Inventory", "\n".join(popup_lines))
+
+    # =====================================================================
+    # Settings tab
+    # =====================================================================
+
+    # Single source of truth for what shows up in the form, in order.
+    # Each entry: (env_key, label, kind)
+    #   kind ∈ {"text", "secret", "int", "bool", "path"}
+    _SETTINGS_FIELDS: tuple[tuple[str, str, str], ...] = (
+        # Telegram
+        ("TELEGRAM_BOT_TOKEN", "Bot Token", "secret"),
+        # Plex API
+        ("PLEX_SERVER_URL", "Plex Server URL", "text"),
+        ("PLEX_TOKEN", "Plex Auth Token", "secret"),
+        ("PLEX_CLIENT_IDENTIFIER", "Plex Client ID", "text"),
+        ("PLEX_VERIFY_SSL", "Verify Plex SSL certificate", "bool"),
+        ("PLEX_MEDIA_SERVER_PATH", "Plex Media Server EXE", "path"),
+        # External DBs
+        ("TMDB_API_KEY", "TMDB API Key", "secret"),
+        ("TVDB_API_KEY", "TVDB API Key", "secret"),
+        ("ANIDB_CLIENT", "AniDB Client Name", "text"),
+        # Ollama
+        ("OLLAMA_HOST", "Ollama Host URL", "text"),
+        ("OLLAMA_MODEL", "Ollama Model Tag", "text"),
+        # Misc
+        ("LIBRARY_CHECK_HOUR", "Daily library check hour (0-23)", "int"),
+        ("ADMIN_STATUS_REFRESH_SECONDS", "Status refresh interval (seconds)", "int"),
+        ("LIBRARY_SEARCH_RESULT_LIMIT", "Library search result limit", "int"),
+        ("LIBRARY_INDEX_EXTENSIONS", "Indexed extensions (.mkv;.mp4;...)", "text"),
+    )
+
+    _PATH_TYPE_LABELS: tuple[tuple[str, str], ...] = (
+        ("movie",  "Movie"),
+        ("tv",     "TV Show"),
+        ("anime",  "Anime"),
+        ("xanime", "Hentai / xAnime"),
+        ("mixed",  "Mixed / Untyped"),
+    )
+
+    def _build_settings_tab(self, parent: ttk.Frame) -> None:
+        """Construct the Settings tab — scrollable form bound to .env."""
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        # Outer scrollable area: Canvas + inner frame + vertical scrollbar.
+        canvas = tk.Canvas(parent, highlightthickness=0)
+        vscroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vscroll.grid(row=0, column=1, sticky="ns")
+
+        inner = ttk.Frame(canvas, padding=(4, 4, 12, 4))
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event: Any) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event: Any) -> None:
+            canvas.itemconfigure(inner_id, width=event.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mouse wheel scrolling — bind only while pointer is over the canvas
+        # so it doesn't hijack scrolling on other tabs.
+        def _on_mousewheel(event: Any) -> None:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_wheel(_e: Any) -> None:
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        def _unbind_wheel(_e: Any) -> None:
+            canvas.unbind_all("<MouseWheel>")
+
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+
+        inner.columnconfigure(0, weight=1)
+
+        # ---- Library Paths section ------------------------------------------
+        paths_frame = ttk.LabelFrame(inner, text="Library Paths", padding=10)
+        paths_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        paths_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            paths_frame,
+            text=(
+                "Add one entry per folder. Multiple folders tagged with the same type "
+                "are treated as a single library for that type."
+            ),
+            wraplength=720,
+            foreground="#444",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        paths_tree_frame = ttk.Frame(paths_frame)
+        paths_tree_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        paths_tree_frame.columnconfigure(0, weight=1)
+
+        self._settings_paths_tree = ttk.Treeview(
+            paths_tree_frame, columns=("type", "path"), show="headings", height=6,
+        )
+        self._settings_paths_tree.heading("type", text="Type")
+        self._settings_paths_tree.heading("path", text="Path")
+        self._settings_paths_tree.column("type", width=130, anchor=tk.W, stretch=False)
+        self._settings_paths_tree.column("path", width=540, anchor=tk.W)
+        self._settings_paths_tree.grid(row=0, column=0, sticky="ew")
+
+        paths_scroll = ttk.Scrollbar(paths_tree_frame, orient=tk.VERTICAL, command=self._settings_paths_tree.yview)
+        paths_scroll.grid(row=0, column=1, sticky="ns")
+        self._settings_paths_tree.configure(yscrollcommand=paths_scroll.set)
+
+        # Add-row controls
+        add_row = ttk.Frame(paths_frame)
+        add_row.grid(row=2, column=0, columnspan=2, sticky="ew")
+        add_row.columnconfigure(2, weight=1)
+
+        new_type_var = tk.StringVar(value=self._PATH_TYPE_LABELS[0][0])
+        type_combo = ttk.Combobox(
+            add_row,
+            textvariable=new_type_var,
+            values=[label for _tag, label in self._PATH_TYPE_LABELS],
+            state="readonly",
+            width=18,
+        )
+        type_combo.set(self._PATH_TYPE_LABELS[0][1])
+        type_combo.grid(row=0, column=0, sticky="w")
+
+        new_path_var = tk.StringVar()
+        new_path_entry = ttk.Entry(add_row, textvariable=new_path_var)
+        new_path_entry.grid(row=0, column=2, sticky="ew", padx=(8, 6))
+
+        def _browse_new_path() -> None:
+            chosen = filedialog.askdirectory(parent=self.root, title="Select library folder")
+            if chosen:
+                new_path_var.set(chosen)
+
+        ttk.Button(add_row, text="Browse...", command=_browse_new_path).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(
+            add_row, text="Add Path",
+            command=lambda: self._settings_add_path(new_type_var.get(), new_path_var.get()),
+        ).grid(row=0, column=4)
+        ttk.Button(
+            add_row, text="Remove Selected",
+            command=self._settings_remove_selected_paths,
+        ).grid(row=0, column=5, padx=(6, 0))
+
+        # ---- Generic key/value settings -------------------------------------
+        current_values = load_current_settings(config.DOTENV_PATH)
+
+        form_frame = ttk.LabelFrame(inner, text="App Settings", padding=10)
+        form_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        form_frame.columnconfigure(1, weight=1)
+
+        for row, (key, label, kind) in enumerate(self._SETTINGS_FIELDS):
+            ttk.Label(form_frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+            current = current_values.get(key, self._format_config_value(getattr(config, key, "")))
+
+            if kind == "bool":
+                var: tk.Variable = tk.BooleanVar(value=current.strip().lower() in {"1", "true", "yes", "on"})
+                ttk.Checkbutton(form_frame, variable=var).grid(row=row, column=1, sticky="w")
+            elif kind == "int":
+                var = tk.StringVar(value=current)
+                ttk.Entry(form_frame, textvariable=var, width=10).grid(row=row, column=1, sticky="w")
+            elif kind == "secret":
+                var = tk.StringVar(value=current)
+                ttk.Entry(form_frame, textvariable=var, show="•").grid(row=row, column=1, sticky="ew")
+            elif kind == "path":
+                var = tk.StringVar(value=current)
+                cell = ttk.Frame(form_frame)
+                cell.grid(row=row, column=1, sticky="ew")
+                cell.columnconfigure(0, weight=1)
+                ttk.Entry(cell, textvariable=var).grid(row=0, column=0, sticky="ew")
+                ttk.Button(
+                    cell, text="Browse...",
+                    command=lambda v=var: self._settings_browse_file(v),
+                ).grid(row=0, column=1, padx=(6, 0))
+            else:  # "text"
+                var = tk.StringVar(value=current)
+                ttk.Entry(form_frame, textvariable=var).grid(row=row, column=1, sticky="ew")
+
+            self._settings_vars[key] = var
+
+        # ---- Save / Reload bar ---------------------------------------------
+        button_bar = ttk.Frame(inner)
+        button_bar.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        button_bar.columnconfigure(0, weight=1)
+
+        ttk.Label(button_bar, textvariable=self._settings_status_var,
+                  font=("Segoe UI", 10, "italic"), foreground="#0a6").grid(row=0, column=0, sticky="w")
+        ttk.Button(button_bar, text="Reload from .env",
+                   command=self._settings_reload_from_disk).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(button_bar, text="Save Settings",
+                   command=self._settings_save).grid(row=0, column=2)
+
+        # Populate the path list from current config.
+        self._settings_load_paths_from_config()
+
+    # ---- Settings helpers ---------------------------------------------------
+
+    @classmethod
+    def _path_type_label(cls, tag: str) -> str:
+        for t, label in cls._PATH_TYPE_LABELS:
+            if t == tag:
+                return label
+        return tag
+
+    @classmethod
+    def _path_type_tag(cls, label: str) -> str:
+        for t, lbl in cls._PATH_TYPE_LABELS:
+            if lbl == label:
+                return t
+        # If the user passes a tag string directly, accept it.
+        return label.lower()
+
+    @staticmethod
+    def _format_config_value(value: object) -> str:
+        """
+        Render a config attribute as the string we want pre-filled in the form.
+
+        Crucially, tuple/list values are joined with ';' rather than left as
+        their repr (which is what str(tuple) gives you). Without this, opening
+        Settings and clicking Save would round-trip ``LIBRARY_INDEX_EXTENSIONS``
+        as ``"('.mkv', '.mp4', ...)"`` -- a literal single-element value that
+        matches no file on disk and broke every filesystem walk.
+        """
+        if value is None:
+            return ""
+        if isinstance(value, (tuple, list)):
+            return ";".join(str(v) for v in value)
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+
+    def _settings_load_paths_from_config(self) -> None:
+        """Pull current MEDIA_LIBRARY_PATHS into the editing list + tree."""
+        self._settings_paths = [
+            (entry.path, entry.media_type) for entry in config.MEDIA_LIBRARY_PATHS
+        ]
+        self._settings_refresh_paths_tree()
+
+    def _settings_refresh_paths_tree(self) -> None:
+        if self._settings_paths_tree is None:
+            return
+        for item_id in self._settings_paths_tree.get_children():
+            self._settings_paths_tree.delete(item_id)
+        for index, (path, media_type) in enumerate(self._settings_paths):
+            self._settings_paths_tree.insert(
+                "", "end", iid=str(index),
+                values=(self._path_type_label(media_type), path),
+            )
+
+    def _settings_add_path(self, type_label: str, path: str) -> None:
+        path = path.strip()
+        if not path:
+            self._show_warning("Add Path", "Enter a folder path or use Browse to pick one.")
+            return
+        tag = self._path_type_tag(type_label)
+        if tag not in {t for t, _l in self._PATH_TYPE_LABELS}:
+            self._show_warning("Add Path", f"Unknown media type '{type_label}'.")
+            return
+        self._settings_paths.append((path, tag))
+        self._settings_refresh_paths_tree()
+        self._settings_status_var.set(f"Added {tag} path (not yet saved)")
+
+    def _settings_remove_selected_paths(self) -> None:
+        if self._settings_paths_tree is None:
+            return
+        selection = self._settings_paths_tree.selection()
+        if not selection:
+            self._show_warning("Remove Path", "Select one or more rows in the list first.")
+            return
+        # Translate iids (string indices) to ints, drop them from the list.
+        to_drop = sorted({int(iid) for iid in selection}, reverse=True)
+        for idx in to_drop:
+            if 0 <= idx < len(self._settings_paths):
+                del self._settings_paths[idx]
+        self._settings_refresh_paths_tree()
+        self._settings_status_var.set(f"Removed {len(to_drop)} path(s) (not yet saved)")
+
+    def _settings_browse_file(self, var: tk.Variable) -> None:
+        chosen = filedialog.askopenfilename(parent=self.root, title="Select file")
+        if chosen:
+            var.set(chosen)
+
+    def _settings_reload_from_disk(self) -> None:
+        """Re-read current values from .env into the form (drops unsaved edits)."""
+        current_values = load_current_settings(config.DOTENV_PATH)
+        for key, var in self._settings_vars.items():
+            value = current_values.get(key, self._format_config_value(getattr(config, key, "")))
+            if isinstance(var, tk.BooleanVar):
+                var.set(value.strip().lower() in {"1", "true", "yes", "on"})
+            else:
+                var.set(value)
+        self._settings_load_paths_from_config()
+        self._settings_status_var.set("Reloaded from .env")
+
+    def _settings_collect(self) -> tuple[dict[str, str], list[str]]:
+        """
+        Pull every form value into a {ENV_KEY: str_value} dict for save_settings,
+        plus a list of validation errors.
+        """
+        updates: dict[str, str] = {}
+        errors: list[str] = []
+
+        for key, _label, kind in self._SETTINGS_FIELDS:
+            var = self._settings_vars.get(key)
+            if var is None:
+                continue
+            if isinstance(var, tk.BooleanVar):
+                updates[key] = "true" if var.get() else "false"
+                continue
+            raw = str(var.get()).strip()
+            if kind == "int" and raw:
+                try:
+                    int(raw)
+                except ValueError:
+                    errors.append(f"{key} must be an integer (got '{raw}')")
+                    continue
+            updates[key] = raw
+
+        # Encode the path list. Always write MEDIA_LIBRARY_PATHS, and clear
+        # PLEX_LIBRARY_PATHS so we don't keep a stale legacy fallback active.
+        updates["MEDIA_LIBRARY_PATHS"] = config.format_media_library_paths(
+            [config.MediaLibraryPath(path=p, media_type=t) for p, t in self._settings_paths]
+        )
+        updates["PLEX_LIBRARY_PATHS"] = ""
+
+        return updates, errors
+
+    def _settings_save(self) -> None:
+        updates, errors = self._settings_collect()
+        if errors:
+            self._show_warning("Settings", "Cannot save:\n\n" + "\n".join(errors))
+            return
+
+        # Snapshot the *encoded* path string before save so we can detect
+        # whether the user changed library paths (and therefore needs a
+        # reindex).
+        old_paths_encoded = config.format_media_library_paths(config.MEDIA_LIBRARY_PATHS)
+        new_paths_encoded = updates.get("MEDIA_LIBRARY_PATHS", "")
+        paths_changed = old_paths_encoded != new_paths_encoded
+
+        try:
+            save_settings(updates, config.DOTENV_PATH)
+        except RuntimeError as exc:
+            logger.exception("Settings save failed.")
+            self._show_warning("Save Settings", str(exc))
+            self._settings_status_var.set("Save failed — see popup")
+            return
+
+        # Live-reload .env into the running config so changes take effect
+        # immediately for everything that reads `config.NAME` at call time
+        # (library paths, API keys, server URLs, etc.).
+        reload_warning = ""
+        try:
+            reload_config_from_env(config.DOTENV_PATH)
+        except RuntimeError as exc:
+            logger.warning("Live config reload failed: %s", exc)
+            reload_warning = (
+                "\n\nNote: live reload failed -- you'll need to restart the app "
+                "for the changes to take effect."
+            )
+
+        # Refresh anything in the UI that's keyed on config values.
+        self._settings_load_paths_from_config()
+        self.refresh_library_summary()
+        self.refresh_library_metrics()
+
+        self._settings_status_var.set("Saved and applied")
+
+        if paths_changed and config.PLEX_LIBRARY_PATHS:
+            if self._ask_yes_no(
+                "Library paths changed",
+                "Library paths were updated. The local file index still reflects "
+                "the old folders.\n\n"
+                "Reindex now? (Searches won't find files in newly-added paths "
+                "until the index is rebuilt.)",
+            ):
+                self.rebuild_library_index_from_ui()
+                return
+
+        self._show_info(
+            "Settings Saved",
+            "Settings were written to your .env file and applied to the "
+            "running app." + reload_warning + "\n\n"
+            "The Telegram bot itself uses its token from startup, so if you "
+            "changed TELEGRAM_BOT_TOKEN, restart the app for that one.",
+        )
 
     # =====================================================================
     # Shutdown

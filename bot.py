@@ -85,6 +85,46 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ---------------------------------------------------------------------------
+# /help — same content as /start; documented as a command in Telegram clients
+# ---------------------------------------------------------------------------
+
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await start_handler(update, context)
+
+
+# ---------------------------------------------------------------------------
+# Welcome fallback — fired when a user sends free-form text outside of any
+# active conversation. Gives them a quick orientation plus a button that
+# re-opens the full start menu.
+# ---------------------------------------------------------------------------
+
+_WELCOME_FALLBACK_TEXT = (
+    "👋 <b>Hi! I'm your Plex Reset Bot.</b>\n\n"
+    "I didn't catch that, but I can help you with:\n"
+    "• Launching, resetting, or checking on your Plex server\n"
+    "• Adding to the request queue\n"
+    "• Searching the library\n"
+    "• Showing usage metrics\n\n"
+    "Type <code>/help</code> any time, or tap the button below to open the main menu."
+)
+
+_WELCOME_FALLBACK_KEYBOARD = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("📋 Open Start Menu", callback_data="cmd_help")]]
+)
+
+
+async def welcome_fallback_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Catch-all for free-form text when the user isn't in a flow."""
+    if update.message is None:
+        return
+    await update.message.reply_html(
+        _WELCOME_FALLBACK_TEXT, reply_markup=_WELCOME_FALLBACK_KEYBOARD,
+    )
+
+
+# ---------------------------------------------------------------------------
 # /status — Plex process + asset health check
 # ---------------------------------------------------------------------------
 
@@ -197,6 +237,13 @@ async def cmd_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     chat_id = query.message.chat.id
+
+    if query.data == "cmd_help":
+        await context.bot.send_message(
+            chat_id=chat_id, text=_WELCOME_TEXT,
+            reply_markup=_MAIN_KEYBOARD, parse_mode="HTML",
+        )
+        return
 
     if query.data == "cmd_launch":
         if control_busy():

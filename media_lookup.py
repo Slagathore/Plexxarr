@@ -664,17 +664,26 @@ def _word_fallback_search(title: str) -> list:
     return all_results
 
 
-def check_library_for_title(title: str, media_type: str) -> tuple[bool, list[str]]:
+def check_library_for_title(
+    title: str,
+    media_type: str,
+    *,
+    strict: bool = False,
+) -> tuple[bool, list[str]]:
     """
     Check whether a title exists in the configured Plex library (or file index).
 
     Returns:
         (found: bool, matched_display_titles: list[str])
 
-    Fuzzy matching: a misspelled title like "get hin to the greek" will still
-    match "Get Him to the Greek" via rapidfuzz WRatio (threshold 0.75).
-    If the full-title search returns no candidates at all, a word-by-word
-    fallback search is run so that correctly-spelled words still locate the entry.
+    Modes:
+        strict=False (default) — typo-tolerant. Threshold 0.75 plus a substring
+            fallback and a word-by-word fallback so misspellings still match.
+        strict=True — used when `title` is a canonical name picked from an
+            external DB (e.g. after the user corrects a mismatch). Requires
+            ≥0.92 similarity OR exact case-insensitive match. No substring or
+            word-fallback hacks, since those produce false positives like
+            "Reacher 2" matching unrelated entries returned by Plex search.
     """
     try:
         from library_index import search_library
@@ -683,15 +692,15 @@ def check_library_for_title(title: str, media_type: str) -> tuple[bool, list[str
         logger.warning("Library search failed for '%s': %s", title, exc)
         return False, []
 
-    # If the full-title query found nothing, try word-by-word so a single typo
-    # doesn't silently eliminate all candidates.
-    if not results:
+    # Word-by-word fallback only in fuzzy mode — strict mode doesn't want it.
+    if not results and not strict:
         results = _word_fallback_search(title)
 
     if not results:
         return False, []
 
     title_lower = title.casefold()
+    threshold = 0.92 if strict else _FUZZY_LIBRARY_THRESHOLD
 
     matched: list[str] = []
     for entry in results:
@@ -699,10 +708,16 @@ def check_library_for_title(title: str, media_type: str) -> tuple[bool, list[str
         if not cleaned:
             continue
 
-        # Fuzzy match: tolerates typos and minor spelling errors.
-        sim = title_similarity(title_lower, cleaned)
-        if sim >= _FUZZY_LIBRARY_THRESHOLD:
+        if cleaned == title_lower:
             matched.append(entry.name)
+            continue
+
+        sim = title_similarity(title_lower, cleaned)
+        if sim >= threshold:
+            matched.append(entry.name)
+            continue
+
+        if strict:
             continue
 
         # Exact substring fallback for very short titles (e.g. "It", "Us").
