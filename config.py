@@ -217,6 +217,9 @@ EXIT_MENU_ITEM_PATH: str = str(ASSETS_DIR / "exit_menu_item.png")
 # ---------------------------------------------------------------------------
 TMDB_API_KEY: str = os.getenv("TMDB_API_KEY", "").strip()
 TVDB_API_KEY: str = os.getenv("TVDB_API_KEY", "").strip()
+# OMDB is an alternate movie DB used as an opt-in fallback when TMDB results
+# don't include what the user is looking for. Free key from omdbapi.com.
+OMDB_API_KEY: str = os.getenv("OMDB_API_KEY", "").strip()
 
 # ---------------------------------------------------------------------------
 # Ollama — used for fuzzy title matching and 'Other' request categorization

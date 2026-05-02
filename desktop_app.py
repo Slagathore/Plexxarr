@@ -1,5 +1,7 @@
 import datetime
 import logging
+import os
+import re
 import threading
 import tkinter as tk
 from importlib import import_module
@@ -1455,6 +1457,212 @@ class DesktopApp:
         # Re-run find_duplicates so the tree reflects what's left
         self._run_find_duplicates()
 
+    # =====================================================================
+    # Custom Rename dialog (Bulk Rename Utility-style)
+    # =====================================================================
+
+    def _open_custom_rename(self) -> None:
+        """
+        Open a small Toplevel that lets the user define a find/replace rule
+        (with optional regex + case transform) and preview the resulting
+        renames before committing them via Apply Selected.
+
+        The preview populates the maintenance tab's tree with SanitizePair
+        rows tagged ``custom_rename`` so the existing Apply Selected handler
+        can rename only the rows the user ticks.
+        """
+        if not self._maint_require_library_paths("Custom Rename"):
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Custom Rename")
+        win.transient(self.root)
+        win.geometry("560x340")
+        win.columnconfigure(1, weight=1)
+
+        ttk.Label(win, text="Find:").grid(row=0, column=0, sticky="w", padx=10, pady=(12, 2))
+        find_var = tk.StringVar()
+        ttk.Entry(win, textvariable=find_var).grid(row=0, column=1, sticky="ew", padx=10, pady=(12, 2))
+
+        ttk.Label(win, text="Replace with:").grid(row=1, column=0, sticky="w", padx=10, pady=2)
+        replace_var = tk.StringVar()
+        ttk.Entry(win, textvariable=replace_var).grid(row=1, column=1, sticky="ew", padx=10, pady=2)
+
+        regex_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(win, text="Treat 'Find' as a regular expression",
+                        variable=regex_var).grid(row=2, column=1, sticky="w", padx=10, pady=(4, 8))
+
+        ttk.Label(win, text="Case:").grid(row=3, column=0, sticky="w", padx=10, pady=2)
+        case_var = tk.StringVar(value="none")
+        ttk.Combobox(
+            win, textvariable=case_var, state="readonly",
+            values=["none", "lower", "UPPER", "Title Case"],
+        ).grid(row=3, column=1, sticky="w", padx=10, pady=2)
+
+        ttk.Label(win, text="Limit to media types:").grid(row=4, column=0, sticky="nw", padx=10, pady=(8, 2))
+        type_frame = ttk.Frame(win)
+        type_frame.grid(row=4, column=1, sticky="w", padx=10, pady=(8, 2))
+        type_vars: dict[str, tk.BooleanVar] = {}
+        for tag, label in (("movie", "Movies"), ("tv", "TV"),
+                            ("anime", "Anime"), ("xanime", "xAnime"),
+                            ("mixed", "Mixed/Other")):
+            v = tk.BooleanVar(value=True)
+            type_vars[tag] = v
+            ttk.Checkbutton(type_frame, text=label, variable=v).pack(side=tk.LEFT, padx=2)
+
+        status_var = tk.StringVar(value="")
+        ttk.Label(win, textvariable=status_var, foreground="#666",
+                  font=("Segoe UI", 9, "italic")).grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0)
+        )
+
+        button_bar = ttk.Frame(win)
+        button_bar.grid(row=6, column=0, columnspan=2, sticky="e", padx=10, pady=(10, 12))
+
+        def do_preview() -> None:
+            find = find_var.get()
+            replace = replace_var.get()
+            use_regex = regex_var.get()
+            case_mode = case_var.get()
+            allowed_tags = {tag for tag, v in type_vars.items() if v.get()}
+
+            if not find and case_mode == "none":
+                self._show_warning(
+                    "Custom Rename",
+                    "Either 'Find' must be set, or pick a Case transform "
+                    "other than 'none'. Otherwise the rule wouldn't change "
+                    "any filenames.",
+                )
+                return
+
+            try:
+                pattern = re.compile(find) if (use_regex and find) else None
+            except re.error as exc:
+                self._show_warning("Custom Rename", f"Invalid regex: {exc}")
+                return
+
+            status_var.set("Building preview...")
+            win.update_idletasks()
+
+            def worker() -> None:
+                try:
+                    pairs = self._build_custom_rename_pairs(
+                        find, replace, pattern, case_mode, allowed_tags,
+                    )
+                except Exception as exc:
+                    logger.exception("Custom rename preview failed.")
+                    self._post_to_ui(lambda: status_var.set(f"Error: {exc}"))
+                    return
+                self._post_to_ui(lambda: self._apply_custom_rename_preview(pairs, win))
+
+            threading.Thread(target=worker, name="custom-rename-preview", daemon=True).start()
+
+        ttk.Button(button_bar, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(button_bar, text="Preview", command=do_preview).pack(side=tk.RIGHT)
+
+    def _build_custom_rename_pairs(
+        self,
+        find: str,
+        replace: str,
+        pattern: "re.Pattern[str] | None",
+        case_mode: str,
+        allowed_tags: set[str],
+    ) -> list[SanitizePair]:
+        """
+        Walk every configured library path, apply the custom rule to each
+        media file's stem, and return SanitizePair entries for files whose
+        new name would actually differ from the current name. Runs on a
+        worker thread.
+        """
+        pairs: list[SanitizePair] = []
+        extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
+
+        for entry in config.MEDIA_LIBRARY_PATHS:
+            if entry.media_type not in allowed_tags:
+                continue
+            root = Path(entry.path)
+            if not root.is_dir():
+                continue
+            for dirpath, _dirs, names in os.walk(root):
+                for name in names:
+                    suffix = Path(name).suffix.lower()
+                    if suffix not in extensions:
+                        continue
+                    stem = Path(name).stem
+                    new_stem = stem
+                    if pattern is not None:
+                        new_stem = pattern.sub(replace, new_stem)
+                    elif find:
+                        new_stem = new_stem.replace(find, replace)
+                    if case_mode == "lower":
+                        new_stem = new_stem.lower()
+                    elif case_mode == "UPPER":
+                        new_stem = new_stem.upper()
+                    elif case_mode == "Title Case":
+                        new_stem = new_stem.title()
+                    if new_stem == stem:
+                        continue
+                    full = Path(dirpath) / name
+                    new_path = full.parent / f"{new_stem}{Path(name).suffix}"
+                    try:
+                        size = full.stat().st_size
+                    except OSError:
+                        size = 0
+                    pairs.append(SanitizePair(
+                        original=str(full),
+                        sanitized=str(new_path),
+                        size_bytes=size,
+                    ))
+        return pairs
+
+    def _apply_custom_rename_preview(
+        self, pairs: list[SanitizePair], dialog: tk.Toplevel,
+    ) -> None:
+        """Push the SanitizePair preview into the maintenance tree."""
+        try:
+            dialog.destroy()
+        except tk.TclError:
+            pass
+
+        self._maint_tool_name = "custom_rename"
+        self._maint_results = pairs
+
+        if not pairs:
+            self._maint_status_var.set("Custom Rename: no files would change.")
+            self._populate_maint_tree([], col1="Original", col2="Proposed", col3="Size")
+            self._show_info(
+                "Custom Rename",
+                "Your rule didn't match any filenames -- no changes proposed.",
+            )
+            return
+
+        self._maint_status_var.set(
+            f"Custom Rename preview: {len(pairs)} file(s) -- check rows then click Apply Selected"
+        )
+        typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = [
+            (
+                media_type_for_path(pair.original),
+                (
+                    "",
+                    Path(pair.original).name,
+                    Path(pair.sanitized).name,
+                    self._fmt_bytes(pair.size_bytes),
+                ),
+                pair,  # payload for Apply Selected
+            )
+            for pair in pairs
+        ]
+        self._populate_maint_tree(
+            [], col1="Original", col2="Proposed", col3="Size",
+            typed_rows=typed_rows,
+        )
+        self._show_info(
+            "Custom Rename",
+            f"Previewing {len(pairs)} proposed rename(s).\n\n"
+            "Tick the rows you want to apply, then click 'Apply Selected'. "
+            "The media-type filter checkboxes still hide/show rows by category.",
+        )
+
     @staticmethod
     def _remove_empty_dirs(dirs: list[str]) -> tuple[int, list[str]]:
         removed = 0
@@ -1585,6 +1793,7 @@ class DesktopApp:
         # External DBs
         ("TMDB_API_KEY", "TMDB API Key", "secret"),
         ("TVDB_API_KEY", "TVDB API Key", "secret"),
+        ("OMDB_API_KEY", "OMDB API Key (movie fallback)", "secret"),
         ("ANIDB_CLIENT", "AniDB Client Name", "text"),
         # Ollama
         ("OLLAMA_HOST", "Ollama Host URL", "text"),

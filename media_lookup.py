@@ -287,6 +287,80 @@ def search_tmdb_shows(title: str, year: int | None = None, *, limit: int = 5) ->
 
 
 # ---------------------------------------------------------------------------
+# OMDB — alternate movie source. Used as an opt-in "try a different DB"
+# fallback when TMDB returned nothing useful.
+# ---------------------------------------------------------------------------
+
+_OMDB_BASE = "https://www.omdbapi.com/"
+_IMDB_TITLE_WEB = "https://www.imdb.com/title"
+
+
+def _omdb_enabled() -> bool:
+    return bool(config.OMDB_API_KEY)
+
+
+def search_omdb_movies(
+    title: str, year: int | None = None, *, limit: int = 10,
+) -> list[MediaResult]:
+    """
+    Search OMDB (an IMDB-backed free API) for movies. Used as a fallback
+    when TMDB doesn't have what the user is looking for. Free tier is
+    capped at 1000 requests/day; treat any HTTP error as 'no results'
+    rather than failing the whole correction flow.
+
+    Returns up to `limit` ranked results. Empty list if no key configured,
+    no results, or the API errors out.
+    """
+    if not _omdb_enabled():
+        logger.warning("OMDB_API_KEY not set — OMDB fallback unavailable.")
+        return []
+
+    params: dict[str, str] = {
+        "s": title,
+        "type": "movie",
+        "apikey": config.OMDB_API_KEY,
+    }
+    if year:
+        params["y"] = str(year)
+
+    url = f"{_OMDB_BASE}?{urllib.parse.urlencode(params)}"
+    try:
+        data = _get_json(url)
+    except RuntimeError as exc:
+        logger.error("OMDB movie search failed: %s", exc)
+        return []
+
+    if data.get("Response") != "True":
+        # OMDB returns {"Response":"False","Error":"Movie not found!"} for misses
+        return []
+
+    results: list[MediaResult] = []
+    for item in (data.get("Search") or [])[:limit]:
+        imdb_id = (item.get("imdbID") or "").strip()
+        raw_year = (item.get("Year") or "").strip()
+        # OMDB sometimes returns "2014–" or "2014–2018" for year ranges
+        year_int: int | None = None
+        m = re.match(r"^(\d{4})", raw_year)
+        if m:
+            try:
+                year_int = int(m.group(1))
+            except ValueError:
+                pass
+
+        results.append(MediaResult(
+            title=item.get("Title") or "Unknown",
+            year=year_int,
+            external_id=imdb_id,
+            external_url=f"{_IMDB_TITLE_WEB}/{imdb_id}/" if imdb_id else "",
+            media_type="movie",
+            overview="",  # OMDB's search endpoint doesn't include plots
+            source="omdb",
+        ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # TVDB — TV shows (primary for show requests)
 # ---------------------------------------------------------------------------
 

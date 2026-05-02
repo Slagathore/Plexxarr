@@ -43,7 +43,7 @@ from media_lookup import (
     check_library_for_title, clean_library_name, lookup_media,
     parse_request_list, title_similarity,
     search_tmdb_movies, search_tmdb_shows, search_tvdb_shows,
-    search_jikan_anime, search_anidb,
+    search_jikan_anime, search_anidb, search_omdb_movies,
 )
 from queue_store import add_request, format_requests_message_user
 
@@ -655,6 +655,8 @@ def _format_candidates_page(
     if media_type in ("anime", "xanime"):
         other_label = "xAnime DBs" if media_type == "anime" else "regular anime DB"
         footer_parts.append(f"<code>other db</code> to search {other_label}")
+    elif media_type == "movie" and config.OMDB_API_KEY:
+        footer_parts.append("<code>other db</code> to search OMDB / IMDB")
     footer_parts.append("or type a different search term")
     lines.append("\n" + ", ".join(footer_parts) + ".")
     return "\n".join(lines)
@@ -872,6 +874,23 @@ async def handle_correction_pick(update: Update, context: ContextTypes.DEFAULT_T
                 lambda q=lr.request.title: search_jikan_anime(
                     q, explicit=False, limit=_CORRECTION_FETCH_LIMIT
                 ),
+            )
+        elif media_type == "movie":
+            # Movies fall through to OMDB (IMDB-backed) when configured. If
+            # the user hasn't set OMDB_API_KEY yet, point them at Settings.
+            if not config.OMDB_API_KEY:
+                await update.message.reply_text(
+                    "No alternate movie database is configured. "
+                    "Add an OMDB_API_KEY (free at omdbapi.com) in the "
+                    "Settings tab and try again, or type a different "
+                    "search term to retry against TMDB."
+                )
+                return CORRECTING
+            switched_label = "OMDB / IMDB"
+            new_candidates = await loop.run_in_executor(
+                None,
+                lambda q=lr.request.title, y=lr.request.year:
+                    search_omdb_movies(q, y, limit=_CORRECTION_FETCH_LIMIT),
             )
         else:
             await update.message.reply_text(
