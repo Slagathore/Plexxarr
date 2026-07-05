@@ -11,6 +11,10 @@
 //
 // Seeding stops the moment the download completes (client.destroy on "done") —
 // this runner never uploads beyond what the swarm gets during the download.
+//
+// Credit: the design of this pipeline (webtorrent engine, per-category
+// sources, stop-seed-on-complete) is modeled on torlink by bairon
+// (https://github.com/baairon/torlink, MIT). See README Acknowledgements.
 // =============================================================================
 
 import WebTorrent from "webtorrent";

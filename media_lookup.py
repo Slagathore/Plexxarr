@@ -718,18 +718,49 @@ _NUMBER_WORDS = {
 _PART_MARKERS = {"part", "pt", "chapter", "vol", "volume", "book", "season"}
 
 
+# Tokens that mark the start of release-group junk in a filename. Sequel
+# numbers sit NEXT TO the title ("John Wick 3"); digits after these markers
+# are codec/audio noise ("DDP5.1", "x265", "1080p") and must not pollute the
+# signature — otherwise junk digits block legitimate matches.
+_JUNK_TOKEN_RE = re.compile(
+    r"^(?:\d{3,4}p|x26[45]|h26[45]|hevc|avc|blu-?ray|b[dr]rip|web-?(?:dl|rip)?"
+    r"|hdtv|dvdrip|remux|proper|repack|extended|uncut|imax|hdr(?:10)?\+?"
+    r"|dolby|vision|dv|atmos|ddp?\d?|dts(?:hd)?|aac\d?|ac3|truehd|opus"
+    r"|\d+bit|multi|dual|sub(?:bed|s)?|dub(?:bed)?|remaster(?:ed)?)$",
+    re.IGNORECASE,
+)
+
+
+def _signature_portion(title: str) -> list[str]:
+    """Tokens of the title up to the first year or release-junk marker.
+
+    "john wick 3 2019 1080p ddp5 1 x265 group" → ["john", "wick", "3"]
+    """
+    tokens = re.findall(r"[a-z0-9]+", title.casefold())
+    portion: list[str] = []
+    for tok in tokens:
+        if tok.isdigit() and len(tok) == 4 and 1880 <= int(tok) <= 2159:
+            break  # year — title (and any sequel number) ends here
+        if _JUNK_TOKEN_RE.match(tok):
+            break
+        portion.append(tok)
+    return portion or tokens  # a title that IS a year/junk word survives
+
+
 def _sequel_signature(title: str) -> frozenset[int]:
     """Return the set of sequel/part numbers a title carries.
 
-    Captures: standalone digit tokens ("Movie 2"), roman numerals
+    Captures: standalone digit tokens ("Movie 2", "Movie 10"), roman numerals
     ("Rocky III"), and number words directly after a part marker
-    ("Dune Part Two"). Four-digit numbers in the plausible-year range are
-    ignored so "Blade Runner 2049" isn't treated as sequel #2049.
+    ("Dune Part Two"). Only the portion of the name before the first
+    year/release-junk marker is considered, so "DDP5.1"/"x265"-style noise
+    from release groups can't inject phantom numbers. Four-digit numbers in
+    the plausible-year range are ignored so "Blade Runner 2049" isn't
+    treated as sequel #2049.
     """
-    tokens = re.findall(r"[a-z0-9]+", title.casefold())
     numbers: set[int] = set()
     prev = ""
-    for tok in tokens:
+    for tok in _signature_portion(title):
         if tok.isdigit():
             value = int(tok)
             if not (1880 <= value <= 2159 and len(tok) == 4):  # skip years

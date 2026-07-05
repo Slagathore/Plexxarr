@@ -216,6 +216,16 @@ To enable API-based features (metrics, library search, session data) you need a 
 
 ---
 
+## Acknowledgements
+
+The torrent download pipeline (Downloads tab) is modeled on
+[**torlink**](https://github.com/baairon/torlink) by **bairon**
+([bairon.dev](https://bairon.dev), MIT) — the per-category source registry,
+the webtorrent engine choice, and the stop-seeding-on-complete behavior all
+follow torlink's design. torlink ships as an interactive terminal app, so this
+project reimplements that pipeline headlessly rather than embedding his code —
+but the architecture is his. Thanks, bairon. 🙏
+
 ## License
 
 MIT — see [LICENSE](LICENSE) if present, otherwise free to use and modify.
