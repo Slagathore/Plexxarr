@@ -47,6 +47,9 @@ torrent_routing.py   Destination planner — show/season folders, safe renames
 download_manager.py  Torrent downloads via Node webtorrent runner + history
 downloads_store.py   Downloads + before/after history tables
 torrent_runner/      Headless Node webtorrent downloader (npm install once)
+shows_store.py       Tracked-show inventory: shows, folders, episode air dates
+show_tracker.py      Folder scan → tracker identify → episode sync → missing
+shows_tab.py         Shows tab UI (Sonarr-style; first split-out tab module)
 config.py            Centralised config: reads .env, validates required keys
 app_logging.py       Dual log handler: stderr stream + in-memory ring buffer
 diagnose.py          Standalone DPI/asset diagnostic tool (read-only, safe to run)
