@@ -303,11 +303,16 @@ def _build_results_message(
         )
         lines.append("")
 
-    # Correction hint — shown whenever there's anything that could need fixing
-    fixable = found_online + uncertain + nf_searched + in_lib_qual
+    # Correction hint — shown whenever anything is still on the list. This
+    # deliberately includes clean ✅ in-library matches: the library check is
+    # fuzzy, so "already in your library" can be a false positive, and the
+    # user needs to know they can dispute it (the correction handlers already
+    # accept any item number).
+    fixable = in_lib + in_lib_qual + found_online + uncertain + nf_searched
     if fixable:
         lines.append(
-            "💡 <i>To fix a match, type its number followed by \"is wrong\" "
+            "💡 <i>Did I match something wrong — even one marked ✅ in-library? "
+            "Type its number followed by \"is wrong\" "
             "(e.g. <code>9 is wrong</code>) to search again.\n"
             "To drop an item entirely, type <code>remove 9</code> "
             "(or <code>remove 9 and 11</code>).</i>\n"
@@ -320,7 +325,11 @@ def _build_results_message(
             "or <b>Start Over</b> to try again."
         )
     else:
-        lines.append("Everything you asked for is already in the library! 🎉")
+        lines.append(
+            "Everything you asked for is already in the library! 🎉\n"
+            "<i>If that doesn't look right for one of them, type its number "
+            "+ \"is wrong\" and I'll take another look.</i>"
+        )
 
     return "\n".join(lines)
 

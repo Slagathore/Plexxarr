@@ -700,6 +700,52 @@ _EP_PATTERNS = [
 
 _FUZZY_LIBRARY_THRESHOLD = 0.75
 
+# --- Sequel-number guard -----------------------------------------------------
+# "Dune Part Two" must never match a library entry of just "Dune", and
+# "<movie> 2" must not match "<movie>". Both the substring fallback and
+# rapidfuzz's WRatio (which rewards partial matches) were producing these
+# false "already in your library" positives. The guard extracts the sequel
+# numbers each title carries and rejects a match when they differ.
+
+_ROMAN_NUMERALS = {
+    "ii": 2, "iii": 3, "iv": 4, "v": 5,
+    "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10,
+}
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+_PART_MARKERS = {"part", "pt", "chapter", "vol", "volume", "book", "season"}
+
+
+def _sequel_signature(title: str) -> frozenset[int]:
+    """Return the set of sequel/part numbers a title carries.
+
+    Captures: standalone digit tokens ("Movie 2"), roman numerals
+    ("Rocky III"), and number words directly after a part marker
+    ("Dune Part Two"). Four-digit numbers in the plausible-year range are
+    ignored so "Blade Runner 2049" isn't treated as sequel #2049.
+    """
+    tokens = re.findall(r"[a-z0-9]+", title.casefold())
+    numbers: set[int] = set()
+    prev = ""
+    for tok in tokens:
+        if tok.isdigit():
+            value = int(tok)
+            if not (1880 <= value <= 2159 and len(tok) == 4):  # skip years
+                numbers.add(value)
+        elif tok in _ROMAN_NUMERALS:
+            numbers.add(_ROMAN_NUMERALS[tok])
+        elif tok in _NUMBER_WORDS and prev in _PART_MARKERS:
+            numbers.add(_NUMBER_WORDS[tok])
+        prev = tok
+    return frozenset(numbers)
+
+
+def _sequel_mismatch(a: str, b: str) -> bool:
+    """True when the two titles clearly refer to different entries in a series."""
+    return _sequel_signature(a) != _sequel_signature(b)
+
 
 def clean_library_name(name: str) -> str:
     """Strip episode notation / extensions from a library filename."""
@@ -784,6 +830,11 @@ def check_library_for_title(
 
         if cleaned == title_lower:
             matched.append(entry.name)
+            continue
+
+        # Different sequel numbers → different film/season, no matter how
+        # similar the base titles are ("Dune Part Two" vs "Dune").
+        if _sequel_mismatch(title_lower, cleaned):
             continue
 
         sim = title_similarity(title_lower, cleaned)
