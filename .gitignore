@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------
 # SQLite databases contain user request history and library index
 *.db
+*.db-shm
+*.db-wal
 # PyAutoGUI debug screenshots may capture personal screen content
 debug_*.png
 # Log files may contain token fragments or personal file paths
