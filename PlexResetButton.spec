@@ -2,12 +2,25 @@
 
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 spec_file = globals().get("__file__")
 project_dir = Path(spec_file).resolve().parent if spec_file else Path.cwd().resolve()
+
 datas = [(str(project_dir / "assets"), "assets")]
+# sv-ttk ships its Sun Valley theme as Tcl data files; without collecting them
+# the dark theme silently falls back to the stock gray ttk look in the EXE.
+datas += collect_data_files("sv_ttk")
+# The Node webtorrent downloader lives beside the app; ship the script +
+# manifest so the Downloads pipeline works from the bundle. (node_modules is
+# NOT bundled — run `npm install` in torrent_runner/ next to the EXE once, and
+# Node.js must be on PATH.)
+for _rf in ("download.mjs", "package.json", "package-lock.json", "diag.mjs"):
+    _src = project_dir / "torrent_runner" / _rf
+    if _src.is_file():
+        datas.append((str(_src), "torrent_runner"))
+
 hiddenimports = (
     collect_submodules("telegram")
     + collect_submodules("pyautogui")
@@ -15,6 +28,10 @@ hiddenimports = (
     + collect_submodules("mouseinfo")
     + collect_submodules("pyscreeze")
     + collect_submodules("pygetwindow")
+    # New modules are imported dynamically enough that we pin them explicitly.
+    + ["sv_ttk", "send2trash", "shows_tab", "shows_store", "show_tracker",
+       "downloads_store", "download_manager", "torrent_search", "torrent_routing",
+       "auth_store", "db"]
 )
 
 
