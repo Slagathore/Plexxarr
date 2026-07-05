@@ -533,6 +533,21 @@ def launch_plex() -> str:
 # Status / diagnostics
 # ---------------------------------------------------------------------------
 
+def is_plex_running() -> bool:
+    """Cheap structured check: is any Plex process alive right now?
+
+    Used by the desktop UI status indicator; get_status() below returns the
+    human-readable diagnostic text.
+    """
+    for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+        try:
+            if _is_plex_process(proc):
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return False
+
+
 def get_status() -> str:
     """
     Return a plain-text diagnostic summary:

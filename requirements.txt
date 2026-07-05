@@ -37,3 +37,7 @@ ollama>=0.4.0
 
 # Fuzzy string matching — fallback for title similarity when Ollama is unavailable
 rapidfuzz>=3.0.0
+
+# Sun Valley ttk theme — dark mode for the desktop UI (optional at runtime;
+# the app falls back to the stock ttk look if missing)
+sv-ttk>=2.6.0

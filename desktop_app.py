@@ -21,7 +21,7 @@ from metrics_report import format_combined_metrics_message
 from plex_auth import (PlexPinSession, PlexTokenResult, launch_auth_browser,
                        save_plex_credentials, start_plex_pin_login,
                        wait_for_plex_token)
-from plex_control import get_status, hard_reset, launch_plex, soft_reset
+from plex_control import get_status, hard_reset, is_plex_running, launch_plex, soft_reset
 from maintenance import (
     DuplicateGroup, LibraryInventory, SanitizePair, ShowInventory,
     UnindexedFile, apply_sanitization, daily_library_check,
@@ -35,6 +35,12 @@ from queue_store import (add_request, complete_request, find_duplicate_requests,
 from settings_store import (load_current_settings, reload_config_from_env,
                              save_settings)
 from telegram_service import TelegramBotService
+
+import auth_store
+import downloads_store
+import torrent_routing
+from download_manager import DownloadManager
+from torrent_search import TorrentResult, format_size, search_torrents
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +65,21 @@ _SOURCE_SEARCH_BY_TYPE = {
     "anime":  _NYAA_ANIME_SEARCH,
     "xanime": _SUKEBEI_SEARCH,
 }
+# Sun Valley ttk theme (dark). Optional — the app falls back to the stock
+# Windows ttk look if the package isn't installed.
+try:
+    import sv_ttk
+except ImportError:
+    sv_ttk = None
+
+# Status-indicator palette (also readable on the stock light theme).
+_DOT_GREEN = "#3fb950"
+_DOT_RED = "#f85149"
+_DOT_AMBER = "#d29922"
+_DOT_GRAY = "#8b949e"
+# Muted helper-text color — depends on whether the dark theme is active.
+_MUTED_TEXT = "#9a9a9a" if sv_ttk is not None else "#444"
+
 Image = cast(Any, import_module("PIL.Image"))
 ImageDraw = cast(Any, import_module("PIL.ImageDraw"))
 pystray = cast(Any, import_module("pystray"))
@@ -76,6 +97,15 @@ class DesktopApp:
         self.root.geometry("860x620")
         self.root.minsize(760, 520)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
+        if sv_ttk is not None:
+            try:
+                sv_ttk.set_theme("dark")
+            except Exception:
+                logger.warning("Failed to apply sv-ttk theme; using default look.")
+        # Destructive actions get their own button style so they can't be
+        # mistaken for a harmless refresh.
+        style = ttk.Style(self.root)
+        style.configure("Danger.TButton", foreground=_DOT_RED, font=("Segoe UI", 9, "bold"))
         initialize_queue_db()
 
         self.status_var = tk.StringVar(value="Starting...")
@@ -117,6 +147,26 @@ class DesktopApp:
         self._maint_filter_vars: dict[str, tk.BooleanVar] = {
             tag: tk.BooleanVar(value=True) for tag in ("movie", "tv", "anime", "xanime", "mixed")
         }
+        # Downloads tab state
+        self.download_manager = DownloadManager(on_update=self._on_download_update)
+        self._dl_search_var = tk.StringVar()
+        self._dl_type_var = tk.StringVar(value="movie")
+        self._dl_plan_var = tk.StringVar(value="Select a search result to preview its destination.")
+        self._dl_status_var = tk.StringVar(value="")
+        self._dl_auto_rename_var = tk.BooleanVar(value=config.TORRENT_AUTO_RENAME)
+        self._dl_auto_move_var = tk.BooleanVar(value=config.TORRENT_AUTO_MOVE)
+        self._dl_auto_grab_var = tk.BooleanVar(value=config.TORRENT_AUTO_GRAB)
+        self._dl_results: list[TorrentResult] = []
+        self._dl_request_context: tuple[int, str] | None = None  # (request_id, title)
+        self._dl_results_tree: ttk.Treeview | None = None
+        self._dl_downloads_tree: ttk.Treeview | None = None
+        self._dl_history_tree: ttk.Treeview | None = None
+        # Users tab state
+        self._users_pending_tree: ttk.Treeview | None = None
+        self._users_allowed_tree: ttk.Treeview | None = None
+        self._notebook: ttk.Notebook | None = None
+        self._users_tab: ttk.Frame | None = None
+        self._downloads_tab: ttk.Frame | None = None
         # Settings tab state — declared in _build_settings_tab
         self._settings_vars: dict[str, tk.Variable] = {}
         self._settings_paths: list[tuple[str, str]] = []  # (path, media_type)
@@ -132,14 +182,43 @@ class DesktopApp:
         self._library_metrics_refresh_pending = False
 
         self._build_ui()
+        self._apply_dark_widget_styles(self.root)
+
+    def _apply_dark_widget_styles(self, root_widget: tk.Misc) -> None:
+        """Restyle plain-tk widgets (Text/ScrolledText/Canvas) for the dark theme.
+
+        ttk widgets follow the sv-ttk theme automatically, but tk.Text and
+        tk.Canvas keep their stock white backgrounds, which looks broken on a
+        dark window. Walk the tree once after building the UI (and call again
+        for any later Toplevel, e.g. the Custom Rename dialog).
+        """
+        if sv_ttk is None:
+            return
+
+        def walk(widget: tk.Misc) -> None:
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Text):
+                    child.configure(
+                        bg="#1e1e1e", fg="#e8e8e8",
+                        insertbackground="#e8e8e8",
+                        selectbackground="#264f78",
+                        relief=tk.FLAT, borderwidth=1,
+                    )
+                elif isinstance(child, tk.Canvas):
+                    child.configure(bg="#1c1c1c", highlightthickness=0)
+                walk(child)
+
+        walk(root_widget)
 
     def run(self) -> None:
         try:
             self.bot_service.start()
             self.bot_status_var.set("Telegram bot: running")
+            self._bot_dot.configure(foreground=_DOT_GREEN)
         except Exception as exc:
             logger.exception("Failed to start Telegram bot service.")
             self.bot_status_var.set(f"Telegram bot: failed ({exc})")
+            self._bot_dot.configure(foreground=_DOT_RED)
             messagebox.showerror(
                 "Telegram bot failed",
                 f"Could not start the Telegram bot service.\n\n{exc}",
@@ -160,9 +239,12 @@ class DesktopApp:
         self.refresh_requests()
         self.refresh_library_summary()
         self.refresh_library_metrics()
+        self.refresh_downloads()
+        self.refresh_users_tab()
         self._schedule_status_refresh()
         self._schedule_log_refresh()
         self._schedule_daily_library_check()
+        self._schedule_auto_grab()
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -178,19 +260,33 @@ class DesktopApp:
             text="Plex Reset Button",
             font=("Segoe UI", 18, "bold"),
         ).grid(row=0, column=0, sticky="w")
-        ttk.Label(header, textvariable=self.bot_status_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(header, textvariable=self.last_action_var).grid(row=2, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(header, textvariable=self.queue_var).grid(row=3, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(header, textvariable=self.library_var).grid(row=4, column=0, sticky="w", pady=(4, 0))
+
+        # Bot + Plex status lines with colored ● indicators.
+        bot_row = ttk.Frame(header)
+        bot_row.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self._bot_dot = ttk.Label(bot_row, text="●", foreground=_DOT_AMBER)
+        self._bot_dot.grid(row=0, column=0, padx=(0, 6))
+        ttk.Label(bot_row, textvariable=self.bot_status_var).grid(row=0, column=1)
+
+        plex_row = ttk.Frame(header)
+        plex_row.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self._plex_dot = ttk.Label(plex_row, text="●", foreground=_DOT_GRAY)
+        self._plex_dot.grid(row=0, column=0, padx=(0, 6))
+        self.plex_status_var = tk.StringVar(value="Plex: checking…")
+        ttk.Label(plex_row, textvariable=self.plex_status_var).grid(row=0, column=1)
+
+        ttk.Label(header, textvariable=self.last_action_var).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(header, textvariable=self.queue_var).grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(header, textvariable=self.library_var).grid(row=5, column=0, sticky="w", pady=(4, 0))
 
         actions = ttk.Frame(self.root, padding=(16, 0, 16, 12))
         actions.grid(row=1, column=0, sticky="ew")
         for index in range(5):
             actions.columnconfigure(index, weight=1)
 
-        ttk.Button(actions, text="Launch Plex", command=lambda: self.run_action("Launch Plex", launch_plex)).grid(row=0, column=0, padx=4, sticky="ew")
+        ttk.Button(actions, text="Launch Plex", style="Accent.TButton", command=lambda: self.run_action("Launch Plex", launch_plex)).grid(row=0, column=0, padx=4, sticky="ew")
         ttk.Button(actions, text="Soft Reset", command=lambda: self.run_action("Soft Reset", soft_reset)).grid(row=0, column=1, padx=4, sticky="ew")
-        ttk.Button(actions, text="Hard Reset", command=self.confirm_hard_reset).grid(row=0, column=2, padx=4, sticky="ew")
+        ttk.Button(actions, text="⚠ Hard Reset", style="Danger.TButton", command=self.confirm_hard_reset).grid(row=0, column=2, padx=4, sticky="ew")
         ttk.Button(actions, text="Refresh Status", command=self.refresh_status).grid(row=0, column=3, padx=4, sticky="ew")
         ttk.Button(actions, text="Get Plex Token", command=self.authenticate_plex_account).grid(row=0, column=4, padx=4, sticky="ew")
 
@@ -199,18 +295,27 @@ class DesktopApp:
 
         status_tab = ttk.Frame(notebook, padding=12)
         requests_tab = ttk.Frame(notebook, padding=12)
+        downloads_tab = ttk.Frame(notebook, padding=12)
         library_tab = ttk.Frame(notebook, padding=12)
         metrics_tab = ttk.Frame(notebook, padding=12)
         maintenance_tab = ttk.Frame(notebook, padding=12)
+        users_tab = ttk.Frame(notebook, padding=12)
         settings_tab = ttk.Frame(notebook, padding=12)
         logs_tab = ttk.Frame(notebook, padding=12)
         notebook.add(status_tab, text="Status")
         notebook.add(requests_tab, text="Requests")
+        notebook.add(downloads_tab, text="Downloads")
         notebook.add(library_tab, text="Library")
         notebook.add(metrics_tab, text="Metrics")
         notebook.add(maintenance_tab, text="Maintenance")
+        notebook.add(users_tab, text="Users")
         notebook.add(settings_tab, text="Settings")
         notebook.add(logs_tab, text="Logs")
+        self._notebook = notebook
+        self._users_tab = users_tab
+        self._downloads_tab = downloads_tab
+        self._build_downloads_tab(downloads_tab)
+        self._build_users_tab(users_tab)
 
         status_tab.columnconfigure(0, weight=1)
         status_tab.rowconfigure(0, weight=1)
@@ -243,8 +348,9 @@ class DesktopApp:
         request_entry.bind("<Return>", lambda _event: self.add_request_from_ui())
         ttk.Button(requests_toolbar, text="Add", command=self.add_request_from_ui).grid(row=0, column=4, padx=(0, 6))
         ttk.Button(requests_toolbar, text="🔍 Find Source", command=self.search_source_for_selected_request).grid(row=0, column=5, padx=(0, 6))
-        ttk.Button(requests_toolbar, text="Complete Selected", command=self.complete_selected_request).grid(row=0, column=6, padx=(0, 6))
-        ttk.Button(requests_toolbar, text="Refresh", command=self.refresh_requests).grid(row=0, column=7)
+        ttk.Button(requests_toolbar, text="⬇ Grab Torrent", command=self.grab_torrent_for_selected_request).grid(row=0, column=6, padx=(0, 6))
+        ttk.Button(requests_toolbar, text="Complete Selected", command=self.complete_selected_request).grid(row=0, column=7, padx=(0, 6))
+        ttk.Button(requests_toolbar, text="Refresh", command=self.refresh_requests).grid(row=0, column=8)
 
         requests_frame = ttk.Frame(requests_tab)
         requests_frame.grid(row=1, column=0, sticky="nsew")
@@ -720,7 +826,24 @@ class DesktopApp:
     # =====================================================================
 
     def refresh_status(self) -> None:
+        self._update_plex_indicator()
         self.run_action("Refresh Status", get_status, show_popup=False, update_status_only=True)
+
+    def _update_plex_indicator(self) -> None:
+        """Refresh the header's Plex ● dot from a cheap process scan."""
+        def worker() -> None:
+            running = False
+            try:
+                running = is_plex_running()
+            except Exception:
+                logger.exception("Plex status check failed.")
+            self._post_to_ui(lambda: self._set_plex_indicator(running))
+
+        threading.Thread(target=worker, name="ui-plex-indicator", daemon=True).start()
+
+    def _set_plex_indicator(self, running: bool) -> None:
+        self._plex_dot.configure(foreground=_DOT_GREEN if running else _DOT_RED)
+        self.plex_status_var.set("Plex: running" if running else "Plex: not running")
 
     def confirm_hard_reset(self, from_tray: bool = False) -> None:
         self._post_to_ui(lambda: self._confirm_hard_reset(from_tray))
@@ -901,7 +1024,28 @@ class DesktopApp:
             self._show_warning("Missing search", "Enter a title or keyword to search for.")
             return
 
-        results = search_library(query)
+        # Run the search off the Tk main thread — on a large index a
+        # synchronous search freezes the whole window.
+        self.status_var.set(f'Searching library for "{query}"…')
+
+        def worker() -> None:
+            try:
+                results = search_library(query)
+            except Exception as exc:
+                logger.exception("Library search failed.")
+                self._post_to_ui(lambda: self._handle_library_search_error(query, str(exc)))
+                return
+            self._post_to_ui(lambda: self._handle_library_search_results(query, results))
+
+        threading.Thread(target=worker, name="ui-library-search", daemon=True).start()
+
+    def _handle_library_search_error(self, query: str, error: str) -> None:
+        self.status_var.set(f'Library search for "{query}" failed')
+        self._show_warning("Library search failed", error)
+
+    def _handle_library_search_results(self, query: str, results: list[Any]) -> None:
+        if self.library_results_tree is None:
+            return
         for item_id in self.library_results_tree.get_children():
             self.library_results_tree.delete(item_id)
 
@@ -934,6 +1078,453 @@ class DesktopApp:
         self.status_var.set(message.splitlines()[0] if message else "Library reindex complete")
         self.last_action_var.set("Last action: library reindex")
         self._show_info("Library Reindex", message)
+
+    # =====================================================================
+    # Downloads tab — in-app torrent search, grab, routing, history
+    # =====================================================================
+
+    def _build_downloads_tab(self, tab: ttk.Frame) -> None:
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(2, weight=2)
+        tab.rowconfigure(5, weight=2)
+        tab.rowconfigure(7, weight=1)
+
+        toolbar = ttk.Frame(tab)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        toolbar.columnconfigure(1, weight=1)
+        ttk.Label(toolbar, text="Search").grid(row=0, column=0, sticky="w")
+        search_entry = ttk.Entry(toolbar, textvariable=self._dl_search_var)
+        search_entry.grid(row=0, column=1, sticky="ew", padx=(6, 6))
+        search_entry.bind("<Return>", lambda _e: self.search_torrents_from_ui())
+        ttk.Combobox(
+            toolbar, textvariable=self._dl_type_var, state="readonly", width=8,
+            values=["movie", "tv", "anime", "xanime", "other"],
+        ).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(toolbar, text="Search", command=self.search_torrents_from_ui).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(toolbar, text="⬇ Download Selected", style="Accent.TButton",
+                   command=self.download_selected_result).grid(row=0, column=4)
+
+        options = ttk.Frame(tab)
+        options.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ttk.Checkbutton(
+            options, text="Automatic rename", variable=self._dl_auto_rename_var,
+            command=lambda: self._persist_dl_toggle("TORRENT_AUTO_RENAME", self._dl_auto_rename_var),
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(
+            options, text="Move to destination", variable=self._dl_auto_move_var,
+            command=lambda: self._persist_dl_toggle("TORRENT_AUTO_MOVE", self._dl_auto_move_var),
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(
+            options, text="Auto-grab new requests", variable=self._dl_auto_grab_var,
+            command=lambda: self._persist_dl_toggle("TORRENT_AUTO_GRAB", self._dl_auto_grab_var),
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(options, textvariable=self._dl_plan_var, foreground=_MUTED_TEXT,
+                  font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT, padx=(8, 0))
+
+        results_tree = ttk.Treeview(
+            tab, columns=("title", "size", "seeders", "source"),
+            show="headings", height=7, selectmode="browse",
+        )
+        results_tree.heading("title", text="Title")
+        results_tree.heading("size", text="Size")
+        results_tree.heading("seeders", text="Seeders")
+        results_tree.heading("source", text="Source")
+        results_tree.column("title", width=520, anchor=tk.W)
+        results_tree.column("size", width=90, anchor=tk.E, stretch=False)
+        results_tree.column("seeders", width=70, anchor=tk.E, stretch=False)
+        results_tree.column("source", width=80, anchor=tk.W, stretch=False)
+        results_tree.grid(row=2, column=0, sticky="nsew")
+        results_tree.bind("<<TreeviewSelect>>", lambda _e: self._preview_route_for_selected_result())
+        results_tree.bind("<Double-1>", lambda _e: self.download_selected_result())
+        self._dl_results_tree = results_tree
+
+        dl_bar = ttk.Frame(tab)
+        dl_bar.grid(row=3, column=0, sticky="ew", pady=(10, 4))
+        ttk.Label(dl_bar, text="Downloads", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Label(dl_bar, textvariable=self._dl_status_var, foreground=_MUTED_TEXT).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(dl_bar, text="Open Staging Folder", command=self.open_staging_folder).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(dl_bar, text="Cancel", command=self.cancel_selected_download).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(dl_bar, text="Apply Route", command=self.apply_route_to_selected_download).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(dl_bar, text="Refresh", command=self.refresh_downloads).pack(side=tk.RIGHT, padx=(6, 0))
+
+        downloads_tree = ttk.Treeview(
+            tab, columns=("id", "title", "status", "progress", "route"),
+            show="headings", height=7, selectmode="browse",
+        )
+        for col, text, width, anchor, stretch in (
+            ("id", "ID", 40, tk.E, False),
+            ("title", "Title", 380, tk.W, True),
+            ("status", "Status", 90, tk.W, False),
+            ("progress", "%", 50, tk.E, False),
+            ("route", "Destination / route", 320, tk.W, True),
+        ):
+            downloads_tree.heading(col, text=text)
+            downloads_tree.column(col, width=width, anchor=cast(Any, anchor), stretch=stretch)
+        downloads_tree.grid(row=5, column=0, sticky="nsew")
+        self._dl_downloads_tree = downloads_tree
+
+        ttk.Label(tab, text="History (downloads / renames / moves — before → after)",
+                  font=("Segoe UI", 10, "bold")).grid(row=6, column=0, sticky="w", pady=(10, 4))
+        history_tree = ttk.Treeview(
+            tab, columns=("at", "action", "before", "after"),
+            show="headings", height=5, selectmode="browse",
+        )
+        for col, text, width, anchor, stretch in (
+            ("at", "When", 130, tk.W, False),
+            ("action", "Action", 90, tk.W, False),
+            ("before", "Before", 330, tk.W, True),
+            ("after", "After", 330, tk.W, True),
+        ):
+            history_tree.heading(col, text=text)
+            history_tree.column(col, width=width, anchor=cast(Any, anchor), stretch=stretch)
+        history_tree.grid(row=7, column=0, sticky="nsew")
+        self._dl_history_tree = history_tree
+
+    def _on_download_update(self, download_id: int) -> None:
+        # Called from download worker threads — marshal to the UI thread.
+        self._post_to_ui(self.refresh_downloads)
+
+    def _persist_dl_toggle(self, key: str, var: tk.BooleanVar) -> None:
+        value = bool(var.get())
+        setattr(config, key, value)
+        try:
+            save_settings({key: "true" if value else "false"}, config.DOTENV_PATH)
+        except Exception:
+            logger.exception("Failed to persist %s to .env", key)
+
+    def search_torrents_from_ui(self) -> None:
+        query = self._dl_search_var.get().strip()
+        if not query:
+            self._show_warning("Missing search", "Enter a title to search for.")
+            return
+        media_type = self._dl_type_var.get()
+        self._dl_status_var.set(f'Searching torrent sources for "{query}"…')
+
+        def worker() -> None:
+            try:
+                results = search_torrents(query, media_type, limit=40)
+            except Exception as exc:
+                logger.exception("Torrent search failed.")
+                self._post_to_ui(lambda: self._dl_status_var.set(f"Search failed: {exc}"))
+                return
+            self._post_to_ui(lambda: self._handle_torrent_results(query, results))
+
+        threading.Thread(target=worker, name="ui-torrent-search", daemon=True).start()
+
+    def _handle_torrent_results(self, query: str, results: list[TorrentResult]) -> None:
+        if self._dl_results_tree is None:
+            return
+        self._dl_results = results
+        for item in self._dl_results_tree.get_children():
+            self._dl_results_tree.delete(item)
+        for idx, r in enumerate(results):
+            self._dl_results_tree.insert(
+                "", "end", iid=str(idx),
+                values=(r.title, format_size(r.size_bytes), r.seeders, r.source),
+            )
+        self._dl_status_var.set(f'{len(results)} result(s) for "{query}"')
+        if not results:
+            self._dl_plan_var.set("No results — try another search term or media type.")
+
+    def _selected_torrent_result(self) -> TorrentResult | None:
+        if self._dl_results_tree is None:
+            return None
+        selected = self._dl_results_tree.selection()
+        if not selected:
+            return None
+        try:
+            return self._dl_results[int(selected[0])]
+        except (ValueError, IndexError):
+            return None
+
+    def _preview_route_for_selected_result(self) -> None:
+        result = self._selected_torrent_result()
+        if result is None:
+            return
+        context_title = self._dl_request_context[1] if self._dl_request_context else None
+
+        def worker() -> None:
+            try:
+                plan = torrent_routing.plan_route(
+                    result.title, self._dl_type_var.get(), request_title=context_title,
+                )
+                text = plan.describe()
+            except Exception as exc:
+                text = f"route preview failed: {exc}"
+            self._post_to_ui(lambda: self._dl_plan_var.set(text))
+
+        threading.Thread(target=worker, name="ui-route-preview", daemon=True).start()
+
+    def download_selected_result(self) -> None:
+        result = self._selected_torrent_result()
+        if result is None:
+            self._show_warning("No result selected", "Select a search result first.")
+            return
+        media_type = self._dl_type_var.get()
+        # The search result rows carry the source's media type, but the combo
+        # box is authoritative — the admin may have overridden it.
+        result = TorrentResult(
+            title=result.title, magnet=result.magnet, size_bytes=result.size_bytes,
+            seeders=result.seeders, source=result.source, media_type=media_type,
+        )
+        request_id, request_title = (self._dl_request_context or (None, None))
+        download_id = self.download_manager.grab(
+            result,
+            request_id=request_id,
+            request_title=request_title,
+            auto_rename=bool(self._dl_auto_rename_var.get()),
+            auto_move=bool(self._dl_auto_move_var.get()),
+        )
+        self._dl_status_var.set(f"Started download #{download_id}: {result.title}")
+        self.last_action_var.set("Last action: torrent grab")
+        self.refresh_downloads()
+
+    def _selected_download_id(self) -> int | None:
+        if self._dl_downloads_tree is None:
+            return None
+        selected = self._dl_downloads_tree.selection()
+        if not selected:
+            return None
+        values = self._dl_downloads_tree.item(selected[0], "values")
+        return int(values[0]) if values else None
+
+    def refresh_downloads(self) -> None:
+        if self._dl_downloads_tree is None:
+            return
+        selected_id = self._selected_download_id()
+        for item in self._dl_downloads_tree.get_children():
+            self._dl_downloads_tree.delete(item)
+        for row in downloads_store.list_downloads(limit=100):
+            route = row.error if row.status == "error" else (
+                (f"{row.planned_dest or ''}" + (f" / {row.planned_name}" if row.planned_name else ""))
+                or row.route_reason or ""
+            )
+            iid = str(row.download_id)
+            self._dl_downloads_tree.insert(
+                "", "end", iid=iid,
+                values=(row.download_id, row.title, row.status,
+                        f"{row.progress * 100:.0f}", route),
+            )
+            if selected_id is not None and row.download_id == selected_id:
+                self._dl_downloads_tree.selection_set(iid)
+        self.refresh_download_history()
+
+    def refresh_download_history(self) -> None:
+        if self._dl_history_tree is None:
+            return
+        for item in self._dl_history_tree.get_children():
+            self._dl_history_tree.delete(item)
+        for h in downloads_store.list_history(limit=200):
+            self._dl_history_tree.insert(
+                "", "end",
+                values=(h.at, h.action, h.before_value or "", h.after_value or ""),
+            )
+
+    def apply_route_to_selected_download(self) -> None:
+        download_id = self._selected_download_id()
+        if download_id is None:
+            self._show_warning("No download selected", "Select a download first.")
+            return
+
+        def worker() -> None:
+            outcome = self.download_manager.apply_route(download_id)
+            self._post_to_ui(lambda: self._handle_apply_route_result(outcome))
+
+        threading.Thread(target=worker, name="ui-apply-route", daemon=True).start()
+
+    def _handle_apply_route_result(self, outcome: str) -> None:
+        self._dl_status_var.set(outcome)
+        self.refresh_downloads()
+
+    def cancel_selected_download(self) -> None:
+        download_id = self._selected_download_id()
+        if download_id is None:
+            self._show_warning("No download selected", "Select a download first.")
+            return
+        if self.download_manager.cancel(download_id):
+            self._dl_status_var.set(f"Cancelled download #{download_id}")
+        else:
+            self._dl_status_var.set(f"Download #{download_id} is not running.")
+        self.refresh_downloads()
+
+    def open_staging_folder(self) -> None:
+        staging = Path(config.TORRENT_DOWNLOAD_DIR)
+        staging.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(staging))  # noqa: S606 — local folder open on Windows
+
+    def grab_torrent_for_selected_request(self) -> None:
+        """Requests tab → Downloads tab: pre-fill the search for a request."""
+        request_id = self._selected_request_id()
+        if request_id is None:
+            self._show_warning("No request selected", "Select a request in the list first.")
+            return
+        req = get_request(request_id)
+        if req is None:
+            self._show_warning("Request not found", f"Request #{request_id} no longer exists.")
+            return
+        query = (req.resolved_title or req.content or "").strip()
+        media_type = req.media_type if req.media_type in ("movie", "tv", "anime", "xanime") else "other"
+        self._dl_request_context = (request_id, query)
+        self._dl_search_var.set(query)
+        self._dl_type_var.set(media_type)
+        if self._notebook is not None and self._downloads_tab is not None:
+            self._notebook.select(self._downloads_tab)
+        self.search_torrents_from_ui()
+
+    # --- Auto-grab poller -------------------------------------------------
+
+    def _schedule_auto_grab(self) -> None:
+        if self._quitting:
+            return
+        # First pass shortly after startup, then every 5 minutes.
+        self.root.after(30_000, self._auto_grab_tick)
+
+    def _auto_grab_tick(self) -> None:
+        if self._quitting:
+            return
+        if config.TORRENT_AUTO_GRAB:
+            def worker() -> None:
+                try:
+                    started = self.download_manager.auto_grab_open_requests()
+                except Exception:
+                    logger.exception("Auto-grab pass failed.")
+                    return
+                if started:
+                    self._post_to_ui(self.refresh_downloads)
+            threading.Thread(target=worker, name="ui-auto-grab", daemon=True).start()
+        self.root.after(300_000, self._auto_grab_tick)
+
+    # =====================================================================
+    # Users tab — Telegram access requests and the allowlist
+    # =====================================================================
+
+    def _build_users_tab(self, tab: ttk.Frame) -> None:
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        tab.rowconfigure(3, weight=2)
+
+        pending_bar = ttk.Frame(tab)
+        pending_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        ttk.Label(pending_bar, text="Pending access requests", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Button(pending_bar, text="Refresh", command=self.refresh_users_tab).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(pending_bar, text="Deny", style="Danger.TButton", command=self.deny_selected_access_request).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(pending_bar, text="Approve", style="Accent.TButton", command=self.approve_selected_access_request).pack(side=tk.RIGHT, padx=(6, 0))
+
+        pending_tree = ttk.Treeview(
+            tab, columns=("id", "user_id", "name", "username", "requested"),
+            show="headings", height=4, selectmode="browse",
+        )
+        for col, text, width, stretch in (
+            ("id", "Req#", 50, False), ("user_id", "Telegram ID", 110, False),
+            ("name", "Name", 220, True), ("username", "Username", 150, False),
+            ("requested", "Requested", 140, False),
+        ):
+            pending_tree.heading(col, text=text)
+            pending_tree.column(col, width=width, anchor=tk.W, stretch=stretch)
+        pending_tree.grid(row=1, column=0, sticky="nsew")
+        self._users_pending_tree = pending_tree
+
+        allowed_bar = ttk.Frame(tab)
+        allowed_bar.grid(row=2, column=0, sticky="ew", pady=(10, 4))
+        ttk.Label(allowed_bar, text="Allowed users", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Button(allowed_bar, text="Revoke Selected", style="Danger.TButton",
+                   command=self.revoke_selected_allowed_user).pack(side=tk.RIGHT)
+
+        allowed_tree = ttk.Treeview(
+            tab, columns=("id", "user_id", "name", "username", "source", "claimed"),
+            show="headings", height=8, selectmode="browse",
+        )
+        for col, text, width, stretch in (
+            ("id", "#", 40, False), ("user_id", "Telegram ID", 110, False),
+            ("name", "Name", 200, True), ("username", "Username", 140, False),
+            ("source", "Source", 150, False), ("claimed", "Claimed", 140, False),
+        ):
+            allowed_tree.heading(col, text=text)
+            allowed_tree.column(col, width=width, anchor=tk.W, stretch=stretch)
+        allowed_tree.grid(row=3, column=0, sticky="nsew")
+        self._users_allowed_tree = allowed_tree
+
+    def refresh_users_tab(self) -> None:
+        if self._users_pending_tree is None or self._users_allowed_tree is None:
+            return
+        pending = auth_store.list_access_requests(status="pending")
+        for item in self._users_pending_tree.get_children():
+            self._users_pending_tree.delete(item)
+        for r in pending:
+            self._users_pending_tree.insert(
+                "", "end", iid=str(r.request_id),
+                values=(r.request_id, r.telegram_user_id, r.display_name or "",
+                        f"@{r.username}" if r.username else "", r.requested_at),
+            )
+
+        for item in self._users_allowed_tree.get_children():
+            self._users_allowed_tree.delete(item)
+        for u in auth_store.list_allowed_users():
+            self._users_allowed_tree.insert(
+                "", "end", iid=str(u.row_id),
+                values=(u.row_id, u.telegram_user_id or "—", u.display_name or "",
+                        f"@{u.username}" if u.username else "", u.source,
+                        u.claimed_at or "unclaimed"),
+            )
+
+        # Badge the tab title with the pending count so requests get noticed.
+        if self._notebook is not None and self._users_tab is not None:
+            label = f"Users ({len(pending)})" if pending else "Users"
+            self._notebook.tab(self._users_tab, text=label)
+
+    def _selected_pending_request_id(self) -> int | None:
+        if self._users_pending_tree is None:
+            return None
+        selected = self._users_pending_tree.selection()
+        return int(selected[0]) if selected else None
+
+    def approve_selected_access_request(self) -> None:
+        request_id = self._selected_pending_request_id()
+        if request_id is None:
+            self._show_warning("No request selected", "Select a pending request first.")
+            return
+
+        def worker() -> None:
+            resolved = auth_store.approve_access_request(request_id)
+            if resolved is not None and resolved.chat_id is not None:
+                self.bot_service.notify_user(
+                    resolved.chat_id,
+                    "🎉 You've been approved! Send /start to begin using the bot.",
+                )
+            self._post_to_ui(self.refresh_users_tab)
+
+        threading.Thread(target=worker, name="ui-approve-user", daemon=True).start()
+
+    def deny_selected_access_request(self) -> None:
+        request_id = self._selected_pending_request_id()
+        if request_id is None:
+            self._show_warning("No request selected", "Select a pending request first.")
+            return
+        if not self._ask_yes_no("Deny access", "Deny this user? They won't be re-prompted."):
+            return
+
+        def worker() -> None:
+            resolved = auth_store.deny_access_request(request_id)
+            if resolved is not None and resolved.chat_id is not None:
+                self.bot_service.notify_user(
+                    resolved.chat_id, "⛔ Your access request was declined."
+                )
+            self._post_to_ui(self.refresh_users_tab)
+
+        threading.Thread(target=worker, name="ui-deny-user", daemon=True).start()
+
+    def revoke_selected_allowed_user(self) -> None:
+        if self._users_allowed_tree is None:
+            return
+        selected = self._users_allowed_tree.selection()
+        if not selected:
+            self._show_warning("No user selected", "Select an allowed user first.")
+            return
+        row_id = int(selected[0])
+        if not self._ask_yes_no("Revoke access", "Remove this user from the allowlist?"):
+            return
+        auth_store.remove_allowed_user(row_id)
+        self.refresh_users_tab()
 
     # =====================================================================
     # Scheduled refresh loops
@@ -1644,10 +2235,11 @@ class DesktopApp:
             ttk.Checkbutton(type_frame, text=label, variable=v).pack(side=tk.LEFT, padx=2)
 
         status_var = tk.StringVar(value="")
-        ttk.Label(win, textvariable=status_var, foreground="#666",
+        ttk.Label(win, textvariable=status_var, foreground=_MUTED_TEXT,
                   font=("Segoe UI", 9, "italic")).grid(
             row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0)
         )
+        self._apply_dark_widget_styles(win)
 
         button_bar = ttk.Frame(win)
         button_bar.grid(row=6, column=0, columnspan=2, sticky="e", padx=10, pady=(10, 12))
@@ -1917,6 +2509,7 @@ class DesktopApp:
     _SETTINGS_FIELDS: tuple[tuple[str, str, str], ...] = (
         # Telegram
         ("TELEGRAM_BOT_TOKEN", "Bot Token", "secret"),
+        ("TELEGRAM_ALLOWED_USER_IDS", "Allowed Telegram user IDs (comma-sep)", "text"),
         # Plex API
         ("PLEX_SERVER_URL", "Plex Server URL", "text"),
         ("PLEX_TOKEN", "Plex Auth Token", "secret"),
@@ -1931,6 +2524,9 @@ class DesktopApp:
         # Ollama
         ("OLLAMA_HOST", "Ollama Host URL", "text"),
         ("OLLAMA_MODEL", "Ollama Model Tag", "text"),
+        # Torrent pipeline
+        ("TORRENT_DOWNLOAD_DIR", "Torrent staging folder", "path"),
+        ("TORRENT_STALL_TIMEOUT_SECONDS", "Torrent stall timeout (seconds)", "int"),
         # Misc
         ("LIBRARY_CHECK_HOUR", "Daily library check hour (0-23)", "int"),
         ("ADMIN_STATUS_REFRESH_SECONDS", "Status refresh interval (seconds)", "int"),
@@ -1998,7 +2594,7 @@ class DesktopApp:
                 "are treated as a single library for that type."
             ),
             wraplength=720,
-            foreground="#444",
+            foreground=_MUTED_TEXT,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
         paths_tree_frame = ttk.Frame(paths_frame)
