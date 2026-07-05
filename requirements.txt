@@ -41,3 +41,7 @@ rapidfuzz>=3.0.0
 # Sun Valley ttk theme — dark mode for the desktop UI (optional at runtime;
 # the app falls back to the stock ttk look if missing)
 sv-ttk>=2.6.0
+
+# Recycle-bin deletes for the Maintenance tab (falls back to permanent
+# unlink if missing)
+send2trash>=1.8.0

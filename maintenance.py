@@ -495,6 +495,14 @@ def delete_files_with_cleanup(
         except OSError:
             library_roots.add(Path(entry.path))
 
+    # Prefer the recycle bin so a wrong click is recoverable; fall back to a
+    # permanent unlink only when send2trash isn't installed.
+    try:
+        from send2trash import send2trash as _to_trash
+    except ImportError:
+        _to_trash = None
+        logger.warning("send2trash not installed — deletes will be permanent.")
+
     for raw_path in paths:
         path = Path(raw_path)
         if not path.is_file():
@@ -502,10 +510,13 @@ def delete_files_with_cleanup(
             continue
         try:
             parent = path.parent
-            path.unlink()
+            if _to_trash is not None:
+                _to_trash(str(path))
+            else:
+                path.unlink()
             deleted.append(raw_path)
             candidate_parents.add(parent)
-            logger.info("Deleted duplicate file: %s", raw_path)
+            logger.info("Deleted (to recycle bin): %s", raw_path)
         except OSError as exc:
             errors.append(f"Delete failed for {raw_path}: {exc}")
 
