@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import tkinter as tk
 import urllib.parse
 import webbrowser
@@ -159,6 +160,8 @@ class DesktopApp:
         self._dl_auto_grab_var = tk.BooleanVar(value=config.TORRENT_AUTO_GRAB)
         self._dl_results: list[TorrentResult] = []
         self._dl_request_context: tuple[int, str] | None = None  # (request_id, title)
+        self._dl_episode_context: tuple[int, int, int] | None = None  # (show_id, season, ep)
+        self._last_shows_grab_pass = 0.0
         self._dl_results_tree: ttk.Treeview | None = None
         self._dl_downloads_tree: ttk.Treeview | None = None
         self._dl_history_tree: ttk.Treeview | None = None
@@ -1199,11 +1202,16 @@ class DesktopApp:
         except Exception:
             logger.exception("Failed to persist %s to .env", key)
 
-    def search_torrents_from_ui(self) -> None:
+    def search_torrents_from_ui(self, *, keep_context: bool = False) -> None:
         query = self._dl_search_var.get().strip()
         if not query:
             self._show_warning("Missing search", "Enter a title to search for.")
             return
+        if not keep_context:
+            # A fresh manual search must not inherit a stale request/episode
+            # link from an earlier jump into this tab.
+            self._dl_request_context = None
+            self._dl_episode_context = None
         media_type = self._dl_type_var.get()
         self._dl_status_var.set(f'Searching torrent sources for "{query}"…')
 
@@ -1281,6 +1289,7 @@ class DesktopApp:
             request_title=request_title,
             auto_rename=bool(self._dl_auto_rename_var.get()),
             auto_move=bool(self._dl_auto_move_var.get()),
+            episode_context=self._dl_episode_context,
         )
         self._dl_status_var.set(f"Started download #{download_id}: {result.title}")
         self.last_action_var.set("Last action: torrent grab")
@@ -1362,20 +1371,23 @@ class DesktopApp:
     def open_downloads_search(
         self, query: str, media_type: str,
         *, request_context: tuple[int, str] | None = None,
+        episode_context: tuple[int, int, int] | None = None,
     ) -> None:
         """Jump to the Downloads tab with a search pre-filled and running.
 
         Used by the Requests tab ("Grab Torrent") and the Shows tab ("Find
-        Torrent for Selected Episode").
+        Torrent for Selected Episode"). episode_context ties the eventual
+        grab to a tracked show's episode for deterministic routing.
         """
         if media_type not in ("movie", "tv", "anime", "xanime"):
             media_type = "other"
         self._dl_request_context = request_context
+        self._dl_episode_context = episode_context
         self._dl_search_var.set(query)
         self._dl_type_var.set(media_type)
         if self._notebook is not None and self._downloads_tab is not None:
             self._notebook.select(self._downloads_tab)
-        self.search_torrents_from_ui()
+        self.search_torrents_from_ui(keep_context=True)
 
     def grab_torrent_for_selected_request(self) -> None:
         """Requests tab → Downloads tab: pre-fill the search for a request."""
@@ -1413,6 +1425,24 @@ class DesktopApp:
                 if started:
                     self._post_to_ui(self.refresh_downloads)
             threading.Thread(target=worker, name="ui-auto-grab", daemon=True).start()
+
+        # Shows loop: auto-grab missing episodes at most every 6 hours (the
+        # pass re-syncs stale shows itself, so freshly-aired episodes appear).
+        if config.SHOWS_AUTO_GRAB and time.time() - self._last_shows_grab_pass > 6 * 3600:
+            self._last_shows_grab_pass = time.time()
+
+            def shows_worker() -> None:
+                try:
+                    started = self.download_manager.auto_grab_missing_episodes()
+                except Exception:
+                    logger.exception("Shows auto-grab pass failed.")
+                    return
+                if started:
+                    logger.info("Shows auto-grab started %d download(s).", len(started))
+                    self._post_to_ui(self.refresh_downloads)
+                    self._post_to_ui(self.shows_tab.refresh)
+            threading.Thread(target=shows_worker, name="ui-shows-auto-grab", daemon=True).start()
+
         self.root.after(300_000, self._auto_grab_tick)
 
     # =====================================================================

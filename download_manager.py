@@ -20,7 +20,6 @@
 
 import json
 import logging
-import re
 import shutil
 import subprocess
 import threading
@@ -29,6 +28,8 @@ from typing import Any, Callable
 
 import config
 import downloads_store
+import show_tracker
+import shows_store
 import torrent_routing
 from queue_store import get_request, list_requests
 from torrent_search import TorrentResult, search_torrents
@@ -64,14 +65,25 @@ class DownloadManager:
         request_title: str | None = None,
         auto_rename: bool | None = None,
         auto_move: bool | None = None,
+        episode_context: tuple[int, int, int] | None = None,  # (show_id, season, episode)
     ) -> int:
         """Start downloading a search result. Returns the download row id."""
         auto_rename = config.TORRENT_AUTO_RENAME if auto_rename is None else auto_rename
         auto_move = config.TORRENT_AUTO_MOVE if auto_move is None else auto_move
 
-        plan = torrent_routing.plan_route(
-            result.title, result.media_type, request_title=request_title
-        )
+        show_id = season = episode = None
+        if episode_context is not None:
+            show_id, season, episode = episode_context
+            show = shows_store.get_show(show_id)
+            plan = (
+                show_tracker.plan_for_episode(show, season, episode)
+                if show is not None
+                else torrent_routing.plan_route(result.title, result.media_type)
+            )
+        else:
+            plan = torrent_routing.plan_route(
+                result.title, result.media_type, request_title=request_title
+            )
         staging = Path(config.TORRENT_DOWNLOAD_DIR)
         staging.mkdir(parents=True, exist_ok=True)
 
@@ -83,7 +95,12 @@ class DownloadManager:
             planned_name=plan.new_filename,
             route_reason=plan.reason,
             auto_rename=auto_rename, auto_move=auto_move,
+            show_id=show_id, season=season, episode=episode,
         )
+        if episode_context is not None:
+            shows_store.set_episode_grab(
+                episode_context[0], episode_context[1], episode_context[2], download_id,
+            )
 
         thread = threading.Thread(
             target=self._run_download,
@@ -151,6 +168,77 @@ class DownloadManager:
                 req.request_id, download_id, best.title, best.seeders,
             )
             started.append(download_id)
+        return started
+
+    def auto_grab_missing_episodes(self, *, limit: int | None = None) -> list[int]:
+        """Grab the best torrent for each missing episode of every tracked show.
+
+        The full Sonarr-replacement loop: shows whose episode data is stale
+        get re-synced first (so freshly-aired episodes show up as missing),
+        then each missing episode without a live grab is searched and the
+        best-seeded result downloaded with rename+move forced ON — routing
+        for tracked episodes is deterministic (plan_for_episode), so
+        auto-placement is safe.
+
+        Skips episodes whose linked download is still queued / downloading /
+        downloaded / moved; a grab that errored or was cancelled is retried.
+        Grabs at most `limit` episodes per pass (politeness cap).
+        """
+        limit = config.SHOWS_GRAB_LIMIT_PER_PASS if limit is None else limit
+        started: list[int] = []
+
+        for show in shows_store.list_shows():
+            if len(started) >= limit:
+                break
+            # Re-sync stale shows so "missing" reflects reality.
+            stale = True
+            if show.last_synced:
+                try:
+                    from datetime import datetime, timedelta, timezone
+                    synced = datetime.fromisoformat(show.last_synced).replace(tzinfo=timezone.utc)
+                    stale = datetime.now(timezone.utc) - synced > timedelta(
+                        hours=config.SHOWS_SYNC_MAX_AGE_HOURS
+                    )
+                except ValueError:
+                    pass
+            if stale:
+                try:
+                    show_tracker.sync_show(show.show_id)
+                except Exception:
+                    logger.exception("Auto-grab: sync failed for '%s'", show.title)
+                    continue
+
+            for ep in shows_store.missing_episodes(show.show_id):
+                if len(started) >= limit:
+                    break
+                if ep.grab_download_id is not None:
+                    linked = downloads_store.get_download(ep.grab_download_id)
+                    if linked is not None and linked.status not in ("error", "cancelled"):
+                        continue  # already being handled
+                query = f"{show.title} S{ep.season:02d}E{ep.episode:02d}"
+                try:
+                    results = search_torrents(query, show.media_type, limit=10)
+                    if not results and show.media_type in ("anime", "xanime"):
+                        # Absolute-numbered releases are common for anime.
+                        results = search_torrents(
+                            f"{show.title} {ep.episode:02d}", show.media_type, limit=10,
+                        )
+                except Exception:
+                    logger.exception("Auto-grab search failed for %s", query)
+                    continue
+                results = [r for r in results if r.seeders > 0]
+                if not results:
+                    continue
+                download_id = self.grab(
+                    results[0],
+                    episode_context=(show.show_id, ep.season, ep.episode),
+                    auto_rename=True, auto_move=True,
+                )
+                logger.info(
+                    "Auto-grabbed %s → download #%s (%s, %s seeders)",
+                    query, download_id, results[0].title, results[0].seeders,
+                )
+                started.append(download_id)
         return started
 
     # ------------------------------------------------------------------
@@ -283,9 +371,17 @@ class DownloadManager:
         do_rename = force_rename or row.auto_rename
         do_move = force_move or row.auto_move
 
-        plan = torrent_routing.plan_route(
-            row.title, row.media_type, request_title=request_title
-        )
+        # Episode-linked grabs route deterministically — we KNOW the show,
+        # season, and episode, so no fuzzy folder matching is involved.
+        plan = None
+        if row.show_id is not None and row.season is not None and row.episode is not None:
+            show = shows_store.get_show(row.show_id)
+            if show is not None:
+                plan = show_tracker.plan_for_episode(show, row.season, row.episode)
+        if plan is None:
+            plan = torrent_routing.plan_route(
+                row.title, row.media_type, request_title=request_title
+            )
         downloads_store.set_route(
             download_id, planned_dest=plan.dest_dir,
             planned_name=plan.new_filename, route_reason=plan.reason,
@@ -334,6 +430,15 @@ class DownloadManager:
         if moved_any:
             downloads_store.set_status(download_id, "moved", completed=True)
             self._cleanup_staging_leftovers(row)
+            # Close the loop for tracked episodes: mark it on-disk right away
+            # instead of waiting for the next full sync.
+            if row.show_id is not None and row.season is not None and row.episode is not None:
+                moved_video = next(
+                    (h.after_value for h in downloads_store.list_history(limit=20)
+                     if h.download_id == download_id and h.action == "moved"),
+                    str(dest_dir),
+                )
+                shows_store.set_episode_file(row.show_id, row.season, row.episode, moved_video)
             return f"moved to {dest_dir}"
         return f"processed (no move) — planned: {plan.describe()}"
 
@@ -361,8 +466,6 @@ class DownloadManager:
                 logger.exception("Download update callback failed.")
 
 
-_INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*]')
-
-
-def sanitize_for_filesystem(name: str) -> str:
-    return _INVALID_FS_CHARS.sub("", name).strip()
+# Re-exported for backwards compatibility; the canonical home is
+# torrent_routing.sanitize_for_filesystem.
+sanitize_for_filesystem = torrent_routing.sanitize_for_filesystem

@@ -33,10 +33,23 @@ CREATE TABLE IF NOT EXISTS downloads (
     auto_move     INTEGER NOT NULL DEFAULT 0,
     error         TEXT,
     created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    completed_at  TEXT
+    completed_at  TEXT,
+    show_id       INTEGER,
+    season        INTEGER,
+    episode       INTEGER
 )
 """
 # status: queued | downloading | downloaded | moved | error | cancelled
+# show_id/season/episode are set when the grab targets a tracked show's
+# episode — routing then uses show_tracker.plan_for_episode (deterministic)
+# instead of fuzzy name matching.
+
+# Columns added after the table first shipped — applied via ALTER on upgrade.
+_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("downloads", "show_id", "INTEGER"),
+    ("downloads", "season", "INTEGER"),
+    ("downloads", "episode", "INTEGER"),
+]
 
 _SCHEMA_HISTORY = """
 CREATE TABLE IF NOT EXISTS download_history (
@@ -70,6 +83,9 @@ class DownloadRow:
     error: str | None
     created_at: str
     completed_at: str | None
+    show_id: int | None = None
+    season: int | None = None
+    episode: int | None = None
 
 
 @dataclass(frozen=True)
@@ -85,7 +101,7 @@ class HistoryRow:
 _DOWNLOAD_COLUMNS = (
     "id, request_id, title, magnet, source, media_type, status, progress, "
     "staging_dir, planned_dest, planned_name, route_reason, auto_rename, "
-    "auto_move, error, created_at, completed_at"
+    "auto_move, error, created_at, completed_at, show_id, season, episode"
 )
 
 
@@ -93,6 +109,10 @@ def initialize_downloads_db() -> None:
     with _DL_LOCK, db.connect() as conn:
         conn.execute(_SCHEMA_DOWNLOADS)
         conn.execute(_SCHEMA_HISTORY)
+        for table, column, col_def in _MIGRATIONS:
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if existing and column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
         conn.commit()
 
 
@@ -103,6 +123,7 @@ def _row_to_download(row) -> DownloadRow:
         staging_dir=row[8], planned_dest=row[9], planned_name=row[10],
         route_reason=row[11], auto_rename=bool(row[12]), auto_move=bool(row[13]),
         error=row[14], created_at=row[15], completed_at=row[16],
+        show_id=row[17], season=row[18], episode=row[19],
     )
 
 
@@ -111,6 +132,8 @@ def create_download(
     request_id: int | None, staging_dir: str, planned_dest: str | None,
     planned_name: str | None, route_reason: str | None,
     auto_rename: bool, auto_move: bool,
+    show_id: int | None = None, season: int | None = None,
+    episode: int | None = None,
 ) -> int:
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
@@ -118,12 +141,13 @@ def create_download(
             """
             INSERT INTO downloads
                 (request_id, title, magnet, source, media_type, staging_dir,
-                 planned_dest, planned_name, route_reason, auto_rename, auto_move)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 planned_dest, planned_name, route_reason, auto_rename, auto_move,
+                 show_id, season, episode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (request_id, title, magnet, source, media_type, staging_dir,
              planned_dest, planned_name, route_reason,
-             int(auto_rename), int(auto_move)),
+             int(auto_rename), int(auto_move), show_id, season, episode),
         )
         conn.commit()
         download_id = int(cursor.lastrowid or 0)

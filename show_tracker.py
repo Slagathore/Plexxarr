@@ -25,6 +25,7 @@ from pathlib import Path
 
 import config
 import shows_store
+import torrent_routing
 from media_lookup import (
     EpisodeInfo, MediaResult,
     get_jikan_episodes, get_jikan_status,
@@ -204,3 +205,67 @@ def sync_show(show_id: int) -> str:
 
 def sync_all() -> list[str]:
     return [sync_show(s.show_id) for s in shows_store.list_shows()]
+
+
+# ---------------------------------------------------------------------------
+# Deterministic routing for tracked episodes (feeds the download pipeline)
+# ---------------------------------------------------------------------------
+
+def _folder_containing_season(show: shows_store.TrackedShow, season: int) -> str | None:
+    """The mapped folder that already holds this season's subfolder, if any."""
+    season_re = re.compile(rf"^(?:Season[\s._-]*0*{season}|S0*{season})$", re.IGNORECASE)
+    for folder in show.folders:
+        root = Path(folder)
+        if not root.is_dir():
+            continue
+        try:
+            if any(d.is_dir() and season_re.match(d.name.strip()) for d in root.iterdir()):
+                return folder
+        except OSError:
+            continue
+    return None
+
+
+def plan_for_episode(
+    show: shows_store.TrackedShow, season: int, episode: int,
+) -> torrent_routing.RoutePlan:
+    """Route plan for a KNOWN episode of a tracked show — no fuzzy matching.
+
+    Precedence for the destination:
+      1. An explicit per-season target folder (season_targets) — the file
+         lands directly in that folder.
+      2. The mapped folder that already contains this season, keeping its
+         season-subfolder naming style.
+      3. The show's first mapped folder, creating "Season NN" per the
+         sibling style.
+    Only a show with no mapped folders at all falls back to staging.
+    """
+    new_filename = torrent_routing.sanitize_for_filesystem(
+        f"{show.title} - S{season:02d}E{episode:02d}"
+    )
+
+    target = shows_store.get_season_target(show.show_id, season)
+    if target:
+        return torrent_routing.RoutePlan(
+            confident=True, dest_dir=target, new_filename=new_filename,
+            season_folder=None, show_folder=None,
+            reason=f"season target rule for '{show.title}' S{season}",
+        )
+
+    folder = _folder_containing_season(show, season) or (
+        show.folders[0] if show.folders else None
+    )
+    if folder is None:
+        return torrent_routing.RoutePlan(
+            confident=False, dest_dir=str(Path(config.TORRENT_DOWNLOAD_DIR)),
+            reason=f"'{show.title}' has no mapped folders — staying in staging",
+        )
+
+    season_name = torrent_routing._season_folder_name(Path(folder), season)
+    return torrent_routing.RoutePlan(
+        confident=True,
+        dest_dir=str(Path(folder) / season_name),
+        new_filename=new_filename,
+        show_folder=folder, season_folder=season_name,
+        reason=f"tracked show '{show.title}' → {Path(folder).name}/{season_name}",
+    )

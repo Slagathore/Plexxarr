@@ -17,8 +17,9 @@
 import logging
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
+import config
 import show_tracker
 import shows_store
 
@@ -43,6 +44,12 @@ class ShowsTab:
         ttk.Button(toolbar, text="Sync Episodes", command=self.sync_all).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(toolbar, text="Refresh", command=self.refresh).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(toolbar, text="Untrack Selected", command=self.untrack_selected).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(toolbar, text="⬇ Grab Missing Now", command=self.grab_missing_now).pack(side=tk.LEFT, padx=(0, 6))
+        self._auto_grab_var = tk.BooleanVar(value=config.SHOWS_AUTO_GRAB)
+        ttk.Checkbutton(
+            toolbar, text="Auto-grab missing", variable=self._auto_grab_var,
+            command=lambda: self.app._persist_dl_toggle("SHOWS_AUTO_GRAB", self._auto_grab_var),
+        ).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Label(toolbar, textvariable=self._status_var,
                   font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT, padx=(10, 0))
 
@@ -87,6 +94,8 @@ class ShowsTab:
                   font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
         ttk.Button(missing_bar, text="Sync Selected Show",
                    command=self.sync_selected).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(missing_bar, text="Set Season Target Folder…",
+                   command=self.set_season_target_for_selected).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(missing_bar, text="⬇ Find Torrent for Selected Episode",
                    command=self.find_torrent_for_selected_episode).pack(side=tk.RIGHT)
 
@@ -221,6 +230,62 @@ class ShowsTab:
         shows_store.remove_show(show_id)
         self.refresh()
 
+    def grab_missing_now(self) -> None:
+        """Run one auto-grab pass immediately (rename+move forced on)."""
+        self._status_var.set("Searching torrents for missing episodes…")
+
+        def worker() -> None:
+            try:
+                started = self.app.download_manager.auto_grab_missing_episodes()
+                msg = (
+                    f"Started {len(started)} download(s) — see the Downloads tab"
+                    if started else "No grabbable missing episodes found this pass"
+                )
+            except Exception as exc:
+                logger.exception("Grab-missing pass failed.")
+                msg = f"Grab pass failed: {exc}"
+            self.app._post_to_ui(lambda: (self._status_var.set(msg), self.refresh()))
+
+        threading.Thread(target=worker, name="shows-grab-missing", daemon=True).start()
+
+    def set_season_target_for_selected(self) -> None:
+        """Pin a season of the selected show to an explicit folder (rule the
+        torrent pipeline routes into — including a folder on another drive)."""
+        show_id = self._selected_show_id()
+        if show_id is None:
+            self.app._show_warning("No show selected", "Select a show first.")
+            return
+        sel = self._missing_tree.selection()
+        if sel:
+            try:
+                season = self._missing[int(sel[0])].season
+            except (ValueError, IndexError):
+                season = None
+        else:
+            season = None
+        if season is None:
+            # No missing episode selected — ask which season the rule is for.
+            from tkinter import simpledialog
+            season = simpledialog.askinteger(
+                "Season target", "Season number for the target-folder rule:",
+                minvalue=0, maxvalue=99,
+            )
+            if season is None:
+                return
+
+        current = shows_store.get_season_target(show_id, season)
+        path = filedialog.askdirectory(
+            title=f"Target folder for Season {season}",
+            initialdir=current or None,
+        )
+        if not path:
+            return
+        shows_store.set_season_target(show_id, season, path)
+        show = shows_store.get_show(show_id)
+        self._status_var.set(
+            f"Season {season} of '{show.title if show else show_id}' now routes to {path}"
+        )
+
     def find_torrent_for_selected_episode(self) -> None:
         show_id = self._selected_show_id()
         sel = self._missing_tree.selection()
@@ -238,4 +303,7 @@ class ShowsTab:
         if show is None:
             return
         query = f"{show.title} S{ep.season:02d}E{ep.episode:02d}"
-        self.app.open_downloads_search(query, show.media_type)
+        self.app.open_downloads_search(
+            query, show.media_type,
+            episode_context=(show.show_id, ep.season, ep.episode),
+        )

@@ -54,10 +54,31 @@ _SCHEMA = [
         air_date  TEXT,
         has_file  INTEGER NOT NULL DEFAULT 0,
         file_path TEXT,
+        grab_download_id INTEGER,
         UNIQUE(show_id, season, episode)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS season_targets (
+        show_id INTEGER NOT NULL,
+        season  INTEGER NOT NULL,
+        path    TEXT NOT NULL,
+        PRIMARY KEY (show_id, season)
+    )
+    """,
 ]
+
+# Columns added after the tables first shipped — applied via ALTER on upgrade.
+_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("episodes", "grab_download_id", "INTEGER"),
+]
+
+
+def _apply_migrations(conn) -> None:
+    for table, column, col_def in _MIGRATIONS:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if existing and column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
 
 
 @dataclass(frozen=True)
@@ -89,12 +110,14 @@ class EpisodeRow:
     air_date: str | None
     has_file: bool
     file_path: str | None
+    grab_download_id: int | None = None
 
 
 def initialize_shows_db() -> None:
     with _SHOWS_LOCK, db.connect() as conn:
         for stmt in _SCHEMA:
             conn.execute(stmt)
+        _apply_migrations(conn)
         conn.commit()
 
 
@@ -146,6 +169,7 @@ def remove_show(show_id: int) -> None:
     with _SHOWS_LOCK, db.connect() as conn:
         conn.execute("DELETE FROM episodes WHERE show_id = ?", (show_id,))
         conn.execute("DELETE FROM show_folders WHERE show_id = ?", (show_id,))
+        conn.execute("DELETE FROM season_targets WHERE show_id = ?", (show_id,))
         conn.execute("DELETE FROM tracked_shows WHERE id = ?", (show_id,))
         conn.commit()
 
@@ -246,12 +270,13 @@ def list_episodes(show_id: int) -> list[EpisodeRow]:
     with _SHOWS_LOCK, db.connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, show_id, season, episode, title, air_date, has_file, file_path
+            SELECT id, show_id, season, episode, title, air_date, has_file,
+                   file_path, grab_download_id
             FROM episodes WHERE show_id = ? ORDER BY season, episode
             """,
             (show_id,),
         ).fetchall()
-    return [EpisodeRow(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7]) for r in rows]
+    return [EpisodeRow(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7], r[8]) for r in rows]
 
 
 def missing_episodes(show_id: int) -> list[EpisodeRow]:
@@ -260,7 +285,8 @@ def missing_episodes(show_id: int) -> list[EpisodeRow]:
     with _SHOWS_LOCK, db.connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, show_id, season, episode, title, air_date, has_file, file_path
+            SELECT id, show_id, season, episode, title, air_date, has_file,
+                   file_path, grab_download_id
             FROM episodes
             WHERE show_id = ? AND season > 0 AND has_file = 0
               AND air_date IS NOT NULL AND air_date <= ?
@@ -268,7 +294,68 @@ def missing_episodes(show_id: int) -> list[EpisodeRow]:
             """,
             (show_id, today),
         ).fetchall()
-    return [EpisodeRow(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7]) for r in rows]
+    return [EpisodeRow(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7], r[8]) for r in rows]
+
+
+def set_episode_grab(show_id: int, season: int, episode: int,
+                     download_id: int | None) -> None:
+    """Link (or clear) the download that is fetching this episode."""
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute(
+            "UPDATE episodes SET grab_download_id = ? "
+            "WHERE show_id = ? AND season = ? AND episode = ?",
+            (download_id, show_id, season, episode),
+        )
+        conn.commit()
+
+
+def set_episode_file(show_id: int, season: int, episode: int, path: str) -> None:
+    """Mark one episode as on-disk (called after a routed move completes)."""
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO episodes (show_id, season, episode, has_file, file_path)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(show_id, season, episode) DO UPDATE SET
+                has_file = 1, file_path = excluded.file_path
+            """,
+            (show_id, season, episode, path),
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Per-season target folders — the policy layer Sonarr doesn't offer
+# ---------------------------------------------------------------------------
+
+def set_season_target(show_id: int, season: int, path: str) -> None:
+    initialize_shows_db()
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute(
+            "INSERT INTO season_targets (show_id, season, path) VALUES (?, ?, ?) "
+            "ON CONFLICT(show_id, season) DO UPDATE SET path = excluded.path",
+            (show_id, season, path),
+        )
+        conn.commit()
+
+
+def get_season_target(show_id: int, season: int) -> str | None:
+    initialize_shows_db()
+    with _SHOWS_LOCK, db.connect() as conn:
+        row = conn.execute(
+            "SELECT path FROM season_targets WHERE show_id = ? AND season = ?",
+            (show_id, season),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def clear_season_target(show_id: int, season: int) -> None:
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute(
+            "DELETE FROM season_targets WHERE show_id = ? AND season = ?",
+            (show_id, season),
+        )
+        conn.commit()
 
 
 def upcoming_episodes(*, days: int = 14) -> list[tuple[TrackedShow, EpisodeRow]]:

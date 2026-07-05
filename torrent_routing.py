@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 VIDEO_EXTENSIONS = set(config.LIBRARY_INDEX_EXTENSIONS)
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".vtt"}
 
+_INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*]')
+
+
+def sanitize_for_filesystem(name: str) -> str:
+    """Strip characters Windows refuses in file/folder names."""
+    return _INVALID_FS_CHARS.sub("", name).strip()
+
 # Confidence needed before we'll route into an existing show folder.
 _SHOW_MATCH_THRESHOLD = 0.85
 

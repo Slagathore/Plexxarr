@@ -293,3 +293,15 @@ TORRENT_STALL_TIMEOUT_SECONDS: int = int(
 )
 # Path to the Node.js executable used to run the webtorrent downloader.
 NODE_PATH: str = os.getenv("NODE_PATH_EXE", "node")
+
+# ---------------------------------------------------------------------------
+# Shows auto-grab — the full Sonarr-style loop
+# ---------------------------------------------------------------------------
+# When on, missing episodes of tracked shows are searched and grabbed
+# automatically (rename+move forced on; routing is deterministic for tracked
+# episodes). Toggled from the Shows tab.
+SHOWS_AUTO_GRAB: bool = _env_bool("SHOWS_AUTO_GRAB", False)
+# Max episodes grabbed per pass (politeness cap toward the torrent sources).
+SHOWS_GRAB_LIMIT_PER_PASS: int = int(os.getenv("SHOWS_GRAB_LIMIT_PER_PASS", "8"))
+# Re-sync a show's episode list when older than this before auto-grabbing.
+SHOWS_SYNC_MAX_AGE_HOURS: int = int(os.getenv("SHOWS_SYNC_MAX_AGE_HOURS", "12"))
