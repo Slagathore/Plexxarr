@@ -202,10 +202,19 @@ class DownloadManager:
         for tracked episodes is deterministic (plan_for_episode), so
         auto-placement is safe.
 
-        Skips episodes whose linked download is still queued / downloading /
-        downloaded / moved; a grab that errored or was cancelled is retried.
-        Grabs at most `limit` episodes per pass (politeness cap).
+        Guarded by the same lock as scan/sync so a scheduled pass never runs
+        concurrently with a manual scan or sync (which would multiply the API
+        rate). Returns [] if a Shows operation is already in progress.
         """
+        try:
+            return show_tracker.run_exclusive(
+                "Auto-grab missing", lambda: self._auto_grab_missing_impl(limit),
+            )
+        except show_tracker.ShowsBusyError:
+            logger.info("Auto-grab missing skipped — a Shows scan/sync is already running.")
+            return []
+
+    def _auto_grab_missing_impl(self, limit: int | None) -> list[int]:
         limit = config.SHOWS_GRAB_LIMIT_PER_PASS if limit is None else limit
         started: list[int] = []
 

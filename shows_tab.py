@@ -32,6 +32,9 @@ class ShowsTab:
         self._shows: list[shows_store.TrackedShow] = []
         self._missing: list[shows_store.EpisodeRow] = []
         self._status_var = tk.StringVar(value="Scan Folders to identify your show libraries.")
+        # Only one scan/sync/grab may run at a time — see _run_guarded. This
+        # flag is touched only on the Tk main thread, so no lock is needed.
+        self._busy = False
 
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(2, weight=1)
@@ -165,56 +168,67 @@ class ShowsTab:
     # Actions (workers post back via app._post_to_ui)
     # ------------------------------------------------------------------
 
-    def scan_folders(self) -> None:
-        self._status_var.set("Scanning library folders and identifying shows…")
+    def _run_guarded(self, name: str, thread_name: str, running_msg: str,
+                     work, describe) -> None:
+        """Run a scan/sync/grab in a worker thread, at most one at a time.
+
+        Blocks a second click while one is in flight (the reported bug: 4
+        clicks = 4 concurrent scans hammering Jikan). describe(result) -> str
+        builds the done message; ShowsBusyError (from the module-level guard,
+        e.g. the scheduler beat us to it) is reported plainly, not as a crash.
+        """
+        if self._busy:
+            self._status_var.set(f"Already running — '{name}' skipped until it finishes.")
+            return
+        self._busy = True
+        self._status_var.set(running_msg)
 
         def worker() -> None:
             try:
-                result = show_tracker.scan_library_folders()
-                msg = (
-                    f"Identified {result.identified} new show(s); "
-                    f"{result.already_tracked} already tracked; "
-                    f"{len(result.unidentified)} unidentified"
-                )
-                if result.unidentified:
-                    msg += " (see log for folder names)"
+                msg = describe(work())
+            except show_tracker.ShowsBusyError as exc:
+                msg = str(exc)
             except Exception as exc:
-                logger.exception("Show folder scan failed.")
-                msg = f"Scan failed: {exc}"
-            self.app._post_to_ui(lambda: (self._status_var.set(msg), self.refresh()))
+                logger.exception("%s failed.", name)
+                msg = f"{name} failed: {exc}"
+            self.app._post_to_ui(lambda: self._finish_operation(msg))
 
-        threading.Thread(target=worker, name="shows-scan", daemon=True).start()
+        threading.Thread(target=worker, name=thread_name, daemon=True).start()
+
+    def _finish_operation(self, msg: str) -> None:
+        self._busy = False
+        self._status_var.set(msg)
+        self.refresh()
+
+    def scan_folders(self) -> None:
+        def describe(result) -> str:
+            msg = (f"Identified {result.identified} new show(s); "
+                   f"{result.already_tracked} already tracked; "
+                   f"{len(result.unidentified)} unidentified")
+            return msg + (" (see log for folder names)" if result.unidentified else "")
+
+        self._run_guarded(
+            "Scan Folders", "shows-scan",
+            "Scanning library folders and identifying shows…",
+            show_tracker.scan_library_folders, describe,
+        )
 
     def sync_all(self) -> None:
-        self._status_var.set("Syncing episode lists for all tracked shows…")
-
-        def worker() -> None:
-            try:
-                summaries = show_tracker.sync_all()
-                msg = f"Synced {len(summaries)} show(s)"
-            except Exception as exc:
-                logger.exception("Episode sync failed.")
-                msg = f"Sync failed: {exc}"
-            self.app._post_to_ui(lambda: (self._status_var.set(msg), self.refresh()))
-
-        threading.Thread(target=worker, name="shows-sync", daemon=True).start()
+        self._run_guarded(
+            "Sync Episodes", "shows-sync",
+            "Syncing episode lists for all tracked shows…",
+            show_tracker.sync_all, lambda summaries: f"Synced {len(summaries)} show(s)",
+        )
 
     def sync_selected(self) -> None:
         show_id = self._selected_show_id()
         if show_id is None:
             self.app._show_warning("No show selected", "Select a show first.")
             return
-        self._status_var.set("Syncing…")
-
-        def worker() -> None:
-            try:
-                msg = show_tracker.sync_show(show_id)
-            except Exception as exc:
-                logger.exception("Show sync failed.")
-                msg = f"Sync failed: {exc}"
-            self.app._post_to_ui(lambda: (self._status_var.set(msg), self.refresh()))
-
-        threading.Thread(target=worker, name="shows-sync-one", daemon=True).start()
+        self._run_guarded(
+            "Sync show", "shows-sync-one", "Syncing…",
+            lambda: show_tracker.sync_show(show_id), lambda msg: msg,
+        )
 
     def untrack_selected(self) -> None:
         show_id = self._selected_show_id()
@@ -232,21 +246,15 @@ class ShowsTab:
 
     def grab_missing_now(self) -> None:
         """Run one auto-grab pass immediately (rename+move forced on)."""
-        self._status_var.set("Searching torrents for missing episodes…")
-
-        def worker() -> None:
-            try:
-                started = self.app.download_manager.auto_grab_missing_episodes()
-                msg = (
-                    f"Started {len(started)} download(s) — see the Downloads tab"
-                    if started else "No grabbable missing episodes found this pass"
-                )
-            except Exception as exc:
-                logger.exception("Grab-missing pass failed.")
-                msg = f"Grab pass failed: {exc}"
-            self.app._post_to_ui(lambda: (self._status_var.set(msg), self.refresh()))
-
-        threading.Thread(target=worker, name="shows-grab-missing", daemon=True).start()
+        self._run_guarded(
+            "Grab Missing", "shows-grab-missing",
+            "Searching torrents for missing episodes…",
+            self.app.download_manager.auto_grab_missing_episodes,
+            lambda started: (
+                f"Started {len(started)} download(s) — see the Downloads tab"
+                if started else "No grabbable missing episodes found this pass"
+            ),
+        )
 
     def set_season_target_for_selected(self) -> None:
         """Pin a season of the selected show to an explicit folder (rule the

@@ -20,6 +20,7 @@
 
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +40,35 @@ from media_lookup import (
 from torrent_routing import VIDEO_EXTENSIONS, parse_torrent_name
 
 logger = logging.getLogger(__name__)
+
+# --- Concurrency guard -------------------------------------------------------
+# Scan and Sync each fan out many external API calls (Jikan especially is
+# rate-limited). Clicking "Scan Folders" 4 times used to launch 4 concurrent
+# scans that quadrupled the request rate and tripped rate limits; the 6-hour
+# auto-grab scheduler could also overlap a manual sync. This RLock lets only
+# ONE of these operations run at a time across the whole app, while its
+# reentrancy still allows sync_all()/auto-grab to call sync_show() internally.
+_OPERATION_LOCK = threading.RLock()
+
+
+class ShowsBusyError(RuntimeError):
+    """Raised when a Shows scan/sync is already running elsewhere."""
+
+
+def run_exclusive(name: str, fn):
+    """Run fn() only if no other Shows operation holds the lock.
+
+    Same-thread nested calls (sync_all → sync_show) are allowed via the RLock;
+    a different thread trying to start gets ShowsBusyError immediately instead
+    of piling on more concurrent API calls.
+    """
+    if not _OPERATION_LOCK.acquire(blocking=False):
+        raise ShowsBusyError(f"A Shows operation is already running — '{name}' skipped.")
+    try:
+        return fn()
+    finally:
+        _OPERATION_LOCK.release()
+
 
 _IDENTIFY_THRESHOLD = 0.72
 
@@ -145,7 +175,13 @@ def _identify_folder(folder_name: str, media_type: str) -> MediaResult | None:
 
 
 def scan_library_folders(media_types: tuple[str, ...] = ("tv", "anime", "xanime")) -> ScanResult:
-    """Identify and track every unmapped show folder under the typed roots."""
+    """Identify and track every unmapped show folder under the typed roots.
+
+    Guarded: only one scan/sync runs at a time (see run_exclusive)."""
+    return run_exclusive("Scan Folders", lambda: _scan_library_folders_impl(media_types))
+
+
+def _scan_library_folders_impl(media_types: tuple[str, ...]) -> ScanResult:
     shows_store.initialize_shows_db()
     identified = already = 0
     unidentified: list[str] = []
@@ -254,7 +290,14 @@ def _sync_airing(show: shows_store.TrackedShow) -> EpisodeInfo | None:
 
 
 def sync_show(show_id: int) -> str:
-    """Refresh one show's episode list, on-disk state, and airing schedule."""
+    """Refresh one show's episode list, on-disk state, and airing schedule.
+
+    Guarded: reentrant, so sync_all()/auto-grab may call it while holding the
+    lock, but a fresh concurrent click is rejected with ShowsBusyError."""
+    return run_exclusive("Sync show", lambda: _sync_show_impl(show_id))
+
+
+def _sync_show_impl(show_id: int) -> str:
     show = shows_store.get_show(show_id)
     if show is None:
         return f"show #{show_id} not found"
@@ -285,7 +328,12 @@ def sync_show(show_id: int) -> str:
 
 
 def sync_all() -> list[str]:
-    return [sync_show(s.show_id) for s in shows_store.list_shows()]
+    """Sync every tracked show. Guarded; runs shows serially (holds the lock
+    the whole time) so it never overlaps another scan/sync."""
+    return run_exclusive(
+        "Sync all",
+        lambda: [_sync_show_impl(s.show_id) for s in shows_store.list_shows()],
+    )
 
 
 # ---------------------------------------------------------------------------
