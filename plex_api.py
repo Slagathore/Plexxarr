@@ -1,4 +1,5 @@
 import json
+import logging
 import ssl
 import time
 import urllib.error
@@ -8,6 +9,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import config
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -147,20 +150,33 @@ def _request_json(
         headers.update(extra_headers)
 
     request = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=config.PLEX_REQUEST_TIMEOUT_SECONDS,
-            context=_ssl_context(),
-        ) as response:
-            payload = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            f"Plex API request failed with HTTP {exc.code} for {path}: {details or exc.reason}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Plex API connection failed for {path}: {exc.reason}") from exc
+    # The local Plex server can briefly stall when several requests hit it at
+    # once (the app fires status + metrics + library + maintenance refreshes on
+    # startup). One retry after a short pause absorbs those transient timeouts
+    # instead of surfacing an uncaught TimeoutError. A read-timeout raises a
+    # bare TimeoutError (not URLError), so it must be caught explicitly.
+    timeout = config.PLEX_REQUEST_TIMEOUT_SECONDS
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
+                payload = response.read().decode("utf-8")
+            break
+        except urllib.error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"Plex API request failed with HTTP {exc.code} for {path}: {details or exc.reason}"
+            ) from exc
+        except (TimeoutError, urllib.error.URLError) as exc:
+            last_error = exc
+            reason = getattr(exc, "reason", exc)
+            if attempt == 0:
+                logger.debug("Plex API timeout for %s (%s) — retrying once.", path, reason)
+                time.sleep(1.0)
+                continue
+            raise RuntimeError(f"Plex API connection failed for {path}: {reason}") from exc
+    else:  # pragma: no cover - loop always breaks or raises
+        raise RuntimeError(f"Plex API connection failed for {path}: {last_error}")
 
     try:
         return json.loads(payload)

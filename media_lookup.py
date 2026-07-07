@@ -301,6 +301,55 @@ def search_tmdb_shows(title: str, year: int | None = None, *, limit: int = 5) ->
     return results
 
 
+def search_tmdb_anime(title: str, year: int | None = None, *, limit: int = 5) -> list[MediaResult]:
+    """Search TMDB for anime, biased toward Japanese-language animation.
+
+    Used as a fallback when Jikan (the primary anime source) is down — TMDB is
+    far more reliable for bulk identification, and carries most anime, though
+    its titles skew English so romaji folder matching is weaker.
+    """
+    if not _tmdb_enabled():
+        return []
+    params = {"api_key": config.TMDB_API_KEY, "query": title,
+              "include_adult": "true", "page": "1"}
+    if year:
+        params["first_air_date_year"] = str(year)
+    try:
+        data = _get_json(f"{_TMDB_BASE}/search/tv?{urllib.parse.urlencode(params)}")
+    except RuntimeError as exc:
+        logger.error("TMDB anime search failed: %s", exc)
+        return []
+
+    results: list[MediaResult] = []
+    for item in (data.get("results") or []):
+        # Skip obvious non-anime (western live-action) to avoid false matches.
+        is_anime = item.get("original_language") == "ja" or 16 in (item.get("genre_ids") or [])
+        if not is_anime:
+            continue
+        tmdb_id = item.get("id")
+        name = item.get("name") or item.get("original_name") or "Unknown"
+        original = item.get("original_name") or ""
+        yr: int | None = None
+        fa = item.get("first_air_date") or ""
+        if len(fa) >= 4:
+            try:
+                yr = int(fa[:4])
+            except ValueError:
+                pass
+        results.append(MediaResult(
+            title=name, year=yr,
+            external_id=str(tmdb_id) if tmdb_id else "",
+            external_url=f"{_TMDB_TV_WEB}/{tmdb_id}" if tmdb_id else "",
+            media_type="anime",
+            overview=(item.get("overview") or "")[:200],
+            source="tmdb",
+            alt_titles=(original,) if original and original != name else (),
+        ))
+        if len(results) >= limit:
+            break
+    return results
+
+
 # ---------------------------------------------------------------------------
 # OMDB — alternate movie source. Used as an opt-in "try a different DB"
 # fallback when TMDB returned nothing useful.
@@ -480,23 +529,59 @@ def _jikan_throttle() -> None:
     _jikan_last_request = time.time()
 
 
-def _jikan_get(url: str) -> dict | None:
-    """GET a Jikan URL with throttling and exponential backoff on HTTP 429.
+_JIKAN_RETRY_RE = re.compile(r"HTTP (429|5\d\d)\b")
 
-    Returns the parsed dict, or None if it kept getting rate-limited / failed.
+# Circuit breaker: during a full Jikan outage, retrying every one of hundreds
+# of folders would take hours. After a few consecutive give-ups we "open" the
+# breaker and skip Jikan entirely for a cooldown, so the scan falls straight
+# through to the TMDB fallback instead of grinding.
+_JIKAN_FAIL_THRESHOLD = 3
+_JIKAN_COOLDOWN_S = 180.0
+_jikan_consecutive_failures = 0
+_jikan_circuit_until = 0.0
+
+
+def jikan_circuit_open() -> bool:
+    return time.time() < _jikan_circuit_until
+
+
+def _jikan_get(url: str) -> dict | None:
+    """GET a Jikan URL with throttling, exponential backoff on transient
+    failures (HTTP 429 + 5xx gateway errors + connection timeouts), and a
+    circuit breaker that stops hammering a down API. Returns the parsed dict,
+    or None if it did not succeed.
     """
+    global _jikan_consecutive_failures, _jikan_circuit_until
+
+    if jikan_circuit_open():
+        return None  # breaker tripped — skip Jikan, let the caller fall back
+
     for attempt in range(_JIKAN_MAX_RETRIES):
         _jikan_throttle()
         try:
-            return _get_json(url)
+            data = _get_json(url, timeout=20)
+            _jikan_consecutive_failures = 0  # a success clears the streak
+            return data
         except RuntimeError as exc:
-            if "429" in str(exc) and attempt < _JIKAN_MAX_RETRIES - 1:
-                backoff = 2.0 * (attempt + 1)
-                logger.info("Jikan 429 — backing off %.1fs (attempt %d)", backoff, attempt + 1)
+            msg = str(exc)
+            transient = bool(_JIKAN_RETRY_RE.search(msg)) or "Connection error" in msg
+            if transient and attempt < _JIKAN_MAX_RETRIES - 1:
+                backoff = 1.5 * (attempt + 1)
+                logger.info("Jikan transient error (%s) — retry in %.1fs (attempt %d/%d)",
+                            msg.split(" from ")[0], backoff, attempt + 1, _JIKAN_MAX_RETRIES)
                 time.sleep(backoff)
                 continue
-            logger.error("Jikan request failed: %s", exc)
-            return None
+            logger.warning("Jikan request gave up after %d attempt(s): %s", attempt + 1, exc)
+            break
+
+    _jikan_consecutive_failures += 1
+    if _jikan_consecutive_failures >= _JIKAN_FAIL_THRESHOLD:
+        _jikan_circuit_until = time.time() + _JIKAN_COOLDOWN_S
+        _jikan_consecutive_failures = 0
+        logger.warning(
+            "Jikan appears down — pausing Jikan calls for %.0fs and using fallbacks.",
+            _JIKAN_COOLDOWN_S,
+        )
     return None
 
 

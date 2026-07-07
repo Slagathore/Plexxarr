@@ -116,7 +116,7 @@ PLEX_TOKEN: str = os.getenv("PLEX_TOKEN", "").strip()
 PLEX_CLIENT_IDENTIFIER: str = os.getenv("PLEX_CLIENT_IDENTIFIER", "").strip()
 PLEX_VERIFY_SSL: bool = _env_bool("PLEX_VERIFY_SSL", False)
 PLEX_REQUEST_TIMEOUT_SECONDS: int = int(
-    os.getenv("PLEX_REQUEST_TIMEOUT_SECONDS", "10")
+    os.getenv("PLEX_REQUEST_TIMEOUT_SECONDS", "15")
 )
 PLEX_HISTORY_FETCH_LIMIT: int = int(os.getenv("PLEX_HISTORY_FETCH_LIMIT", "200"))
 APP_DB_PATH: str = os.getenv(

@@ -34,7 +34,7 @@ from media_lookup import (
     get_tmdb_next_air, get_tmdb_tv_episodes, get_tmdb_tv_status,
     get_tvdb_episodes, get_tvdb_series_status,
     resolve_tmdb_tv_id,
-    search_jikan_anime, search_tmdb_shows, search_tvdb_shows,
+    search_jikan_anime, search_tmdb_anime, search_tmdb_shows, search_tvdb_shows,
     title_similarity,
 )
 from torrent_routing import VIDEO_EXTENSIONS, parse_torrent_name
@@ -160,10 +160,15 @@ def _identify_folder(folder_name: str, media_type: str) -> MediaResult | None:
         # TVDB result must not block the correct TMDB one (old `or` bug).
         candidates = search_tvdb_shows(name, year) + search_tmdb_shows(name, year)
     elif media_type == "anime":
+        # Jikan is best for romaji titles but its public API 504s under load;
+        # fall back to (anime-biased) TMDB so an outage doesn't zero out anime.
         candidates = search_jikan_anime(name, explicit=False)
+        if not candidates:
+            candidates = search_tmdb_anime(name, year)
     elif media_type == "xanime":
         # Jikan (rating=rx) gives us MAL ids that can also sync episodes;
-        # AniDB stays a request-pipeline identification source only.
+        # AniDB stays a request-pipeline identification source only. TMDB has
+        # essentially no hentai, so there's no useful fallback here.
         candidates = search_jikan_anime(name, explicit=True)
         if not candidates:  # some hentai exists on MAL only as regular entries
             candidates = search_jikan_anime(name, explicit=False)
