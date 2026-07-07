@@ -30,12 +30,13 @@ import torrent_routing
 from media_lookup import (
     EpisodeInfo, MediaResult,
     best_title_similarity,
+    get_anilist_next_air, get_anilist_status,
     get_jikan_episodes, get_jikan_status,
     get_tmdb_next_air, get_tmdb_tv_episodes, get_tmdb_tv_status,
     get_tvdb_episodes, get_tvdb_series_status,
-    resolve_tmdb_tv_id,
-    search_jikan_anime, search_tmdb_anime, search_tmdb_shows, search_tvdb_shows,
-    title_similarity,
+    jikan_circuit_open, resolve_tmdb_tv_id,
+    search_anidb, search_anilist, search_jikan_anime,
+    search_tmdb_anime, search_tmdb_shows, search_tvdb_shows,
 )
 from torrent_routing import VIDEO_EXTENSIONS, parse_torrent_name
 
@@ -80,12 +81,14 @@ _FOLDER_YEAR_RE = re.compile(r"\((?P<year>(19|20)\d{2})\)")
 # ("[bonkai77] Title [WEB-DL][1080p][x265]"), which otherwise poisons search.
 _JUNK_WORD_RE = re.compile(
     r"\b(?:480p|720p|1080p|2160p|4k|x26[45]|h\.?26[45]|hevc|avc|10bit|8bit|"
-    r"web-?dl|web-?rip|bd(?:rip)?|blu-?ray|br-?rip|hdtv|dvd-?rip|remux|batch|"
-    r"complete|dual[\s._-]?audio|multi[\s._-]?sub|eng(?:lish)?[\s._-]?sub(?:bed)?|"
-    r"dub(?:bed)?|aac\d?|ac3|flac|opus|ddp?\d?(?:\.\d)?|hi10p?|uncensored|"
+    r"web-?dl|web-?rip|bd(?:rip)?|blu-?ray|br-?rip|hdtv|dvd(?:-?rip)?|remux|batch|"
+    r"complete|dual|audio|multi|eng(?:lish)?|subs?(?:bed)?|dub(?:bed)?|"
+    r"aac\d?|ac3|flac|opus|ddp?\d?(?:\.\d)?|hi10p?|uncensored|"
     r"censored|repack|proper|extended|remastered)\b",
     re.IGNORECASE,
 )
+# Codec tokens that get concatenated to other text ("HEVCx265", "10bitx265").
+_JUNK_CODEC_TOKEN_RE = re.compile(r"\b\w*(?:hevc|x26[45]|h26[45]|10bit)\w*\b", re.IGNORECASE)
 # A leading "[date - date]" or "[group]" bracket prefix (hentai folders).
 _LEADING_BRACKET_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)+")
 
@@ -129,6 +132,7 @@ def clean_show_folder_name(folder_name: str) -> tuple[str, int | None]:
     name = _LEADING_BRACKET_RE.sub("", name)      # drop leading [group]/[dates]
     name = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", name)  # drop remaining bracket groups
     name = name.replace("_", " ").replace(".", " ")
+    name = _JUNK_CODEC_TOKEN_RE.sub(" ", name)    # "HEVCx265"-style concatenations
     name = _JUNK_WORD_RE.sub(" ", name)
     # A season/part marker ends the title portion ("Title S2", "Title Season 3").
     name = re.split(r"\b(?:S\d{1,2}\b|Season\b|Part\b|Cour\b)", name, maxsplit=1,
@@ -159,24 +163,54 @@ def _identify_folder(folder_name: str, media_type: str) -> MediaResult | None:
         # Gather from BOTH sources and pick the best — a wrong-but-nonempty
         # TVDB result must not block the correct TMDB one (old `or` bug).
         candidates = search_tvdb_shows(name, year) + search_tmdb_shows(name, year)
-    elif media_type == "anime":
-        # Jikan is best for romaji titles but its public API 504s under load;
-        # fall back to (anime-biased) TMDB so an outage doesn't zero out anime.
-        candidates = search_jikan_anime(name, explicit=False)
-        if not candidates:
-            candidates = search_tmdb_anime(name, year)
-    elif media_type == "xanime":
-        # Jikan (rating=rx) gives us MAL ids that can also sync episodes;
-        # AniDB stays a request-pipeline identification source only. TMDB has
-        # essentially no hentai, so there's no useful fallback here.
-        candidates = search_jikan_anime(name, explicit=True)
-        if not candidates:  # some hentai exists on MAL only as regular entries
-            candidates = search_jikan_anime(name, explicit=False)
+        best, score = _score_candidates(name, candidates, year)
+    elif media_type in ("anime", "xanime"):
+        best, score = _best_anime_match(name, year, explicit=(media_type == "xanime"))
     else:
         return None
 
-    best, score = _score_candidates(name, candidates, year)
     return best if best is not None and score >= _IDENTIFY_THRESHOLD else None
+
+
+# Above this, take a source's match without consulting slower/less-reliable
+# sources — most folders resolve on the offline AniDB dump alone.
+_HIGH_CONFIDENCE = 0.90
+
+
+def _best_anime_match(name: str, year: int | None, *, explicit: bool
+                      ) -> tuple[MediaResult | None, float]:
+    """Cascade anime identification across sources, cheapest/most-reliable
+    first, stopping as soon as a confident match appears.
+
+    Order: AniDB offline dump (instant, no network, best romaji coverage) →
+    AniList (reliable live API) → Jikan (only if its breaker isn't open) →
+    TMDB (English-biased, regular anime only). This makes a full scan fast —
+    most folders never hit the network — and resilient to any one API being
+    down.
+    """
+    best: MediaResult | None = None
+    best_score = 0.0
+
+    def consider(candidates: list[MediaResult]) -> bool:
+        nonlocal best, best_score
+        b, s = _score_candidates(name, candidates, year)
+        if s > best_score:
+            best, best_score = b, s
+        return best_score >= _HIGH_CONFIDENCE
+
+    # 1. Offline AniDB dump — the workhorse. Covers most folders with no API call.
+    if consider(search_anidb(name, media_type="xanime" if explicit else "anime")):
+        return best, best_score
+    # 2. AniList — reliable live source, rich romaji/synonym titles.
+    if consider(search_anilist(name, explicit=explicit)):
+        return best, best_score
+    # 3. Jikan — skip entirely when its circuit breaker says it's down.
+    if not jikan_circuit_open() and consider(search_jikan_anime(name, explicit=explicit)):
+        return best, best_score
+    # 4. TMDB — last resort; it carries almost no hentai, so regular anime only.
+    if not explicit:
+        consider(search_tmdb_anime(name, year))
+    return best, best_score
 
 
 def scan_library_folders(media_types: tuple[str, ...] = ("tv", "anime", "xanime")) -> ScanResult:
@@ -267,31 +301,18 @@ def _scan_folders_for_episodes(folders: tuple[str, ...]) -> dict[tuple[int, int]
     return found
 
 
-def _sync_airing(show: shows_store.TrackedShow) -> EpisodeInfo | None:
-    """Fetch + store the next-episode-to-air for a show (TMDB is the only
-    source that reliably has it). Resolves a TMDB id for TVDB/Jikan-identified
-    shows. Returns the next EpisodeInfo, or None if nothing is scheduled."""
-    tmdb_id = show.tmdb_id
-    if not tmdb_id:
-        if show.source == "tmdb":
-            tmdb_id = show.external_id
-        else:
-            tmdb_id = resolve_tmdb_tv_id(
-                show.title, show.year,
-                prefer_anime=show.media_type in ("anime", "xanime"),
-            )
-        if tmdb_id:
-            shows_store.set_show_tmdb_id(show.show_id, tmdb_id)
-    if not tmdb_id:
-        return None
-    nxt = get_tmdb_next_air(tmdb_id)
-    shows_store.set_show_airing(
-        show.show_id,
-        next_air_date=nxt.air_date if nxt else None,
-        next_season=nxt.season if nxt else None,
-        next_episode=nxt.episode if nxt else None,
+def _ensure_tmdb_id(show: shows_store.TrackedShow) -> str | None:
+    """Return (and persist) a TMDB id for a show — its own id if TMDB-sourced,
+    else an anime-aware resolution by title. Used for the episode-list and
+    airing fallbacks that non-TMDB sources (anidb/anilist/jikan/tvdb) rely on."""
+    if show.tmdb_id:
+        return show.tmdb_id
+    tmdb_id = show.external_id if show.source == "tmdb" else resolve_tmdb_tv_id(
+        show.title, show.year, prefer_anime=show.media_type in ("anime", "xanime"),
     )
-    return nxt
+    if tmdb_id:
+        shows_store.set_show_tmdb_id(show.show_id, tmdb_id)
+    return tmdb_id
 
 
 def sync_show(show_id: int) -> str:
@@ -309,27 +330,47 @@ def _sync_show_impl(show_id: int) -> str:
 
     fetchers = EPISODE_FETCHERS.get(show.source)
     episodes: list[EpisodeInfo] = []
+    status = ""
     if fetchers is not None:
         fetch_episodes, fetch_status = fetchers
         episodes = fetch_episodes(show.external_id)
-        if episodes:
-            shows_store.replace_episodes(show_id, episodes)
-        shows_store.set_show_status(show_id, fetch_status(show.external_id))
+        status = fetch_status(show.external_id)
+    elif show.source == "anilist":
+        status = get_anilist_status(show.external_id)
+    if status:
+        shows_store.set_show_status(show_id, status)
 
-    # Airing schedule — always via TMDB's next_episode_to_air, since TVDB/
-    # Jikan episode lists are aired-only. Re-read the show so tmdb_id set on a
-    # prior pass is used.
+    # Episode-list fallback: anidb/anilist have no native episode API here, and
+    # Jikan may be down — fall back to TMDB's episode list so missing-episode
+    # detection still works for those shows.
     refreshed = shows_store.get_show(show_id) or show
-    nxt = _sync_airing(refreshed)
+    tmdb_id = _ensure_tmdb_id(refreshed)
+    if not episodes and tmdb_id:
+        episodes = get_tmdb_tv_episodes(tmdb_id)
+    if episodes:
+        shows_store.replace_episodes(show_id, episodes)
+
+    # Airing: prefer AniList's anime-native schedule (covers anime TMDB lacks),
+    # otherwise TMDB's next_episode_to_air.
+    nxt: EpisodeInfo | None = None
+    if show.source == "anilist":
+        nxt = get_anilist_next_air(show.external_id)
+    if nxt is None and tmdb_id:
+        nxt = get_tmdb_next_air(tmdb_id)
+    shows_store.set_show_airing(
+        show_id,
+        next_air_date=nxt.air_date if nxt else None,
+        next_season=nxt.season if nxt else None,
+        next_episode=nxt.episode if nxt else None,
+    )
 
     found = _scan_folders_for_episodes(show.folders)
     shows_store.update_file_state(show_id, found)
     missing = len(shows_store.missing_episodes(show_id))
 
     air_note = f", next airs {nxt.air_date} (S{nxt.season:02d}E{nxt.episode:02d})" if nxt else ""
-    src_note = "" if fetchers is not None else f" [no episode API for {show.source}]"
     return (f"{show.title}: {len(episodes)} episodes known, {len(found)} on disk, "
-            f"{missing} missing{air_note}{src_note}")
+            f"{missing} missing{air_note}")
 
 
 def sync_all() -> list[str]:

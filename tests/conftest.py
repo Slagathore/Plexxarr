@@ -18,16 +18,17 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _no_airing_network(monkeypatch):
-    """Stop show sync from hitting live TMDB for airing data by default.
+    """Stop show sync from hitting the network for airing/episode fallbacks.
 
-    sync_show() now resolves a TMDB id + next-episode-to-air over the network;
-    tests that care about airing override these explicitly.
+    sync_show() resolves a TMDB id + next-episode-to-air and can fall back to
+    TMDB episode lists or AniList airing — all over the network. Tests that
+    care override the specific call they exercise.
     """
     try:
         import show_tracker
     except Exception:
         return
-    monkeypatch.setattr(show_tracker, "resolve_tmdb_tv_id",
-                        lambda *a, **k: None, raising=False)
-    monkeypatch.setattr(show_tracker, "get_tmdb_next_air",
-                        lambda *a, **k: None, raising=False)
+    for name in ("resolve_tmdb_tv_id", "get_tmdb_next_air", "get_anilist_next_air"):
+        monkeypatch.setattr(show_tracker, name, lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(show_tracker, "get_tmdb_tv_episodes", lambda *a, **k: [], raising=False)
+    monkeypatch.setattr(show_tracker, "get_anilist_status", lambda *a, **k: "", raising=False)

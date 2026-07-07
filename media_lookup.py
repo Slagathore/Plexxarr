@@ -665,6 +665,9 @@ _ANIDB_CACHE_MAX_AGE_S = 24 * 3600
 
 # In-memory title index: title_lower → list of (display_title, aid_str)
 _anidb_index: dict[str, list[tuple[str, str]]] | None = None
+# aid → all titles for that anime (romaji, synonyms, official, …); [0] = primary.
+# Used so a synonym match still carries every title as alt_titles for scoring.
+_anidb_titles_by_aid: dict[str, list[str]] = {}
 _anidb_index_loaded_at: float = 0.0
 
 
@@ -696,8 +699,9 @@ def _refresh_anidb_cache() -> Path:
 
 
 def _load_anidb_index() -> dict[str, list[tuple[str, str]]]:
-    """Build or return the cached AniDB title index."""
-    global _anidb_index, _anidb_index_loaded_at
+    """Build or return the cached AniDB title index (title_lower → [(primary, aid)]),
+    and populate _anidb_titles_by_aid (aid → all titles)."""
+    global _anidb_index, _anidb_titles_by_aid, _anidb_index_loaded_at
 
     now = time.time()
     if _anidb_index is not None and (now - _anidb_index_loaded_at) < _ANIDB_CACHE_MAX_AGE_S:
@@ -709,7 +713,8 @@ def _load_anidb_index() -> dict[str, list[tuple[str, str]]]:
         _anidb_index = {}
         return {}
 
-    primary_titles: dict[str, str] = {}  # aid → primary title
+    primary_titles: dict[str, str] = {}       # aid → primary title
+    all_titles: dict[str, list[str]] = {}     # aid → [titles…]
     raw_index: dict[str, list[tuple[str, str]]] = {}  # title_lower → [(raw_title, aid)]
 
     try:
@@ -725,6 +730,9 @@ def _load_anidb_index() -> dict[str, list[tuple[str, str]]]:
 
                 if ttype == "1":
                     primary_titles[aid] = title
+                titles = all_titles.setdefault(aid, [])
+                if title not in titles:
+                    titles.append(title)
 
                 title_lower = title.casefold()
                 bucket = raw_index.setdefault(title_lower, [])
@@ -742,15 +750,29 @@ def _load_anidb_index() -> dict[str, list[tuple[str, str]]]:
             (primary_titles.get(aid, raw_title), aid) for raw_title, aid in pairs
         ]
 
+    # Ensure primary title sorts first in each aid's title list.
+    for aid, titles in all_titles.items():
+        primary = primary_titles.get(aid)
+        if primary and primary in titles:
+            titles.remove(primary)
+            titles.insert(0, primary)
+
     _anidb_index = final
+    _anidb_titles_by_aid = all_titles
     _anidb_index_loaded_at = now
-    logger.info("AniDB index loaded: %d title entries.", len(final))
+    logger.info("AniDB index loaded: %d title entries, %d anime.", len(final), len(all_titles))
     return final
 
 
-def search_anidb(title: str) -> list[MediaResult]:
+def search_anidb(title: str, *, media_type: str = "xanime") -> list[MediaResult]:
     """
-    Search AniDB for (typically explicit) anime titles using the local index.
+    Search AniDB's offline title dump — the most reliable anime matcher for
+    romaji folder names (it carries every romaji/synonym title, and works
+    fully offline so it never rate-limits or 504s).
+
+    media_type tags the results ("anime" or "xanime"). Each result carries ALL
+    of the anime's titles as alt_titles so a synonym match survives the
+    caller's re-scoring against the (possibly very different) primary title.
 
     Scoring:
         1.0 — exact match (case-insensitive)
@@ -799,16 +821,118 @@ def search_anidb(title: str) -> list[MediaResult]:
         if aid in seen_aids or len(results) >= 5:
             break
         seen_aids.add(aid)
+        all_titles = _anidb_titles_by_aid.get(aid, [display_title])
+        primary = all_titles[0] if all_titles else display_title
+        alt = tuple(t for t in all_titles if t != primary)
         results.append(MediaResult(
-            title=display_title,
+            title=primary,
             year=None,
             external_id=aid,
             external_url=f"{_ANIDB_ANIME_WEB}/{aid}",
-            media_type="xanime",
+            media_type=media_type,
             overview=f"AniDB ID: {aid}",
             source="anidb",
+            alt_titles=alt,
         ))
 
+    return results
+
+
+# ---------------------------------------------------------------------------
+# AniList — reliable live anime API (GraphQL). Better uptime than Jikan, rich
+# romaji/english/native + synonym titles, and native airing data. No API key;
+# just needs a real User-Agent (a bare urllib UA gets a 403 from Cloudflare).
+# ---------------------------------------------------------------------------
+
+_ANILIST_URL = "https://graphql.anilist.co"
+_ANILIST_WEB = "https://anilist.co/anime"
+_anilist_last_request: float = 0.0
+_ANILIST_RATE_LIMIT_S = 0.8  # AniList allows ~90/min; stay well under
+
+_ANILIST_SEARCH_QUERY = """
+query ($search: String, $adult: Boolean) {
+  Page(perPage: 5) {
+    media(search: $search, type: ANIME, isAdult: $adult) {
+      id
+      idMal
+      title { romaji english native }
+      synonyms
+      seasonYear
+      status
+      episodes
+      nextAiringEpisode { airingAt episode }
+    }
+  }
+}
+"""
+
+
+def _anilist_throttle() -> None:
+    global _anilist_last_request
+    wait = _ANILIST_RATE_LIMIT_S - (time.time() - _anilist_last_request)
+    if wait > 0:
+        time.sleep(wait)
+    _anilist_last_request = time.time()
+
+
+def _anilist_post(variables: dict) -> dict | None:
+    _anilist_throttle()
+    body = json.dumps({"query": _ANILIST_SEARCH_QUERY, "variables": variables}).encode("utf-8")
+    req = urllib.request.Request(
+        _ANILIST_URL, data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "User-Agent": _USER_AGENT},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:  # rate limited — one backoff then give up for this call
+            time.sleep(2.0)
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except Exception as exc2:
+                logger.warning("AniList retry failed: %s", exc2)
+                return None
+        logger.warning("AniList HTTP %s", exc.code)
+        return None
+    except Exception as exc:
+        logger.warning("AniList request failed: %s", exc)
+        return None
+
+
+def search_anilist(title: str, *, explicit: bool = False, limit: int = 5) -> list[MediaResult]:
+    """Search AniList for anime. Rich romaji/english/native/synonym titles are
+    all carried as alt_titles so folder names in any of them score correctly.
+    external_id is the AniList id; the MAL id is appended to overview so the
+    tracker can reuse it. Airing (nextAiringEpisode) rides along in overview
+    too, parsed later by the tracker."""
+    data = _anilist_post({"search": title, "adult": True if explicit else None})
+    if not data:
+        return []
+    media = (((data.get("data") or {}).get("Page") or {}).get("media")) or []
+
+    results: list[MediaResult] = []
+    for m in media[:limit]:
+        t = m.get("title") or {}
+        romaji, english, native = t.get("romaji"), t.get("english"), t.get("native")
+        primary = romaji or english or native or "Unknown"
+        alts = [x for x in (romaji, english, native, *(m.get("synonyms") or []))
+                if x and x != primary]
+        nxt = m.get("nextAiringEpisode") or {}
+        results.append(MediaResult(
+            title=primary,
+            year=m.get("seasonYear"),
+            external_id=str(m.get("id") or ""),
+            external_url=f"{_ANILIST_WEB}/{m.get('id')}" if m.get("id") else "",
+            media_type="xanime" if explicit else "anime",
+            overview=(f"mal:{m.get('idMal')}|status:{m.get('status')}"
+                      f"|next:{nxt.get('airingAt') or ''}:{nxt.get('episode') or ''}"),
+            source="anilist",
+            alt_titles=tuple(dict.fromkeys(alts)),  # dedupe, preserve order
+        ))
     return results
 
 
@@ -1315,3 +1439,58 @@ def get_tmdb_next_air(tv_id: str) -> EpisodeInfo | None:
         title=nxt.get("name") or "",
         air_date=nxt.get("air_date"),
     )
+
+
+# --- AniList airing (anime-native; covers anime TMDB doesn't have) ----------
+
+_ANILIST_MEDIA_QUERY = """
+query ($id: Int) {
+  Media(id: $id, type: ANIME) {
+    status
+    episodes
+    nextAiringEpisode { airingAt episode }
+  }
+}
+"""
+
+
+def _anilist_media(anilist_id: str) -> dict | None:
+    _anilist_throttle()
+    body = json.dumps({"query": _ANILIST_MEDIA_QUERY,
+                       "variables": {"id": int(anilist_id)}}).encode("utf-8")
+    req = urllib.request.Request(
+        _ANILIST_URL, data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "User-Agent": _USER_AGENT},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return (json.loads(resp.read().decode("utf-8")).get("data") or {}).get("Media")
+    except Exception as exc:
+        logger.warning("AniList media fetch failed for %s: %s", anilist_id, exc)
+        return None
+
+
+def get_anilist_next_air(anilist_id: str) -> EpisodeInfo | None:
+    """Next scheduled episode for an AniList id — anime-native airing, so it
+    works for currently-airing anime that TMDB doesn't carry."""
+    if not anilist_id or not anilist_id.isdigit():
+        return None
+    media = _anilist_media(anilist_id)
+    if not media:
+        return None
+    nxt = media.get("nextAiringEpisode") or {}
+    airing_at, episode = nxt.get("airingAt"), nxt.get("episode")
+    if not airing_at or not episode:
+        return None
+    from datetime import datetime, timezone
+    air_date = datetime.fromtimestamp(int(airing_at), tz=timezone.utc).date().isoformat()
+    return EpisodeInfo(season=1, episode=int(episode), title="", air_date=air_date)
+
+
+def get_anilist_status(anilist_id: str) -> str:
+    if not anilist_id or not anilist_id.isdigit():
+        return ""
+    media = _anilist_media(anilist_id)
+    return (media or {}).get("status") or ""  # RELEASING / FINISHED / NOT_YET_RELEASED
