@@ -412,8 +412,13 @@ def upcoming_episodes(*, days: int = 14) -> list[tuple[TrackedShow, EpisodeRow]]
 
     shows_by_id = {s.show_id: s for s in list_shows()}
     merged: dict[tuple[int, int, int], tuple[TrackedShow, EpisodeRow]] = {}
+    # (show_id, air_date) already covered — prevents listing the same episode
+    # twice when the stored next-air (AniList absolute numbering, e.g. S01E1169)
+    # and a TMDB future-episode row (season numbering, S23E1169) describe the
+    # same broadcast on the same day.
+    covered_dates: set[tuple[int, str]] = set()
 
-    # Stored next-air per show (the reliable signal).
+    # Stored next-air per show (the reliable signal) takes precedence.
     for show in shows_by_id.values():
         if (show.next_air_date and start <= show.next_air_date <= end
                 and show.next_season is not None and show.next_episode is not None):
@@ -422,11 +427,13 @@ def upcoming_episodes(*, days: int = 14) -> list[tuple[TrackedShow, EpisodeRow]]
                 0, show.show_id, show.next_season, show.next_episode, "",
                 show.next_air_date, False, None,
             ))
+            covered_dates.add((show.show_id, show.next_air_date))
 
-    # Future-dated episode rows (belt-and-suspenders for TVDB shows).
+    # Future-dated episode rows (belt-and-suspenders for TVDB shows), unless the
+    # show already has a stored next-air on that date.
     for r in ep_rows:
         show = shows_by_id.get(r[0])
-        if show is None:
+        if show is None or (r[0], r[4]) in covered_dates:
             continue
         key = (r[0], r[1], r[2])
         merged.setdefault(key, (show, EpisodeRow(0, r[0], r[1], r[2], r[3], r[4], bool(r[5]), r[6])))

@@ -99,3 +99,21 @@ def test_no_next_air_clears_field(airing_show, monkeypatch):
     show_tracker.sync_show(airing_show)
     show = shows_store.get_show(airing_show)
     assert show is not None and show.next_air_date is None
+
+
+def test_upcoming_dedupes_same_episode_across_numbering():
+    # AniList's absolute numbering (stored next-air S1E1169) and a TMDB future
+    # episode row (S23E1169) on the same date are the SAME broadcast — the
+    # Upcoming panel must show it once, not twice.
+    from datetime import date, timedelta
+    soon = (date.today() + timedelta(days=3)).isoformat()
+    sid = shows_store.upsert_show(title="Dedupe Show", media_type="anime",
+                                  source="anidb", external_id="dd-1")
+    shows_store.set_show_airing(sid, next_air_date=soon, next_season=1, next_episode=1169)
+    # A TMDB-style future episode row for the same broadcast, different numbering.
+    shows_store.replace_episodes(sid, [type("E", (), {
+        "season": 23, "episode": 1169, "title": "same ep", "air_date": soon})()])
+
+    hits = [(s.title, e.season, e.episode)
+            for s, e in shows_store.upcoming_episodes(days=14) if s.show_id == sid]
+    assert hits == [("Dedupe Show", 1, 1169)]  # exactly one, the stored next-air

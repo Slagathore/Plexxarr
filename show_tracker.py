@@ -30,7 +30,7 @@ import torrent_routing
 from media_lookup import (
     EpisodeInfo, MediaResult,
     best_title_similarity,
-    get_anilist_next_air, get_anilist_status,
+    get_anime_airing,
     get_jikan_episodes, get_jikan_status,
     get_tmdb_next_air, get_tmdb_tv_episodes, get_tmdb_tv_status,
     get_tvdb_episodes, get_tvdb_series_status,
@@ -335,14 +335,26 @@ def _sync_show_impl(show_id: int) -> str:
         fetch_episodes, fetch_status = fetchers
         episodes = fetch_episodes(show.external_id)
         status = fetch_status(show.external_id)
-    elif show.source == "anilist":
-        status = get_anilist_status(show.external_id)
+
+    # Airing + status for anime come from AniList by title (the most accurate
+    # anime airing source), covering every anime regardless of how it was
+    # identified — most are AniDB-identified, which has no airing of its own.
+    # xanime is skipped (hentai has no meaningful airing schedule and it's the
+    # bulk of the extra API calls). Shows already known to be finished are
+    # skipped on a re-sync (nothing new airs) so re-syncs stay fast; the first
+    # sync checks everything (status still blank).
+    already_finished = show.status in ("Ended", "Cancelled") and show.last_synced
+    nxt: EpisodeInfo | None = None
+    if show.media_type == "anime" and not already_finished:
+        nxt, anime_status = get_anime_airing(show.title)
+        if anime_status and not status:
+            status = anime_status
     if status:
         shows_store.set_show_status(show_id, status)
 
-    # Episode-list fallback: anidb/anilist have no native episode API here, and
+    # Episode-list fallback: anidb/anilist have no native episode API, and
     # Jikan may be down — fall back to TMDB's episode list so missing-episode
-    # detection still works for those shows.
+    # detection still works. TMDB is also where TV airing comes from.
     refreshed = shows_store.get_show(show_id) or show
     tmdb_id = _ensure_tmdb_id(refreshed)
     if not episodes and tmdb_id:
@@ -350,11 +362,7 @@ def _sync_show_impl(show_id: int) -> str:
     if episodes:
         shows_store.replace_episodes(show_id, episodes)
 
-    # Airing: prefer AniList's anime-native schedule (covers anime TMDB lacks),
-    # otherwise TMDB's next_episode_to_air.
-    nxt: EpisodeInfo | None = None
-    if show.source == "anilist":
-        nxt = get_anilist_next_air(show.external_id)
+    # TV airing (and anime not found on AniList) via TMDB's next_episode_to_air.
     if nxt is None and tmdb_id:
         nxt = get_tmdb_next_air(tmdb_id)
     shows_store.set_show_airing(

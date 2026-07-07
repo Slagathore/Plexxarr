@@ -849,10 +849,10 @@ _ANILIST_WEB = "https://anilist.co/anime"
 _anilist_last_request: float = 0.0
 _ANILIST_RATE_LIMIT_S = 0.8  # AniList allows ~90/min; stay well under
 
-_ANILIST_SEARCH_QUERY = """
-query ($search: String, $adult: Boolean) {
-  Page(perPage: 5) {
-    media(search: $search, type: ANIME, isAdult: $adult) {
+# NOTE: isAdult is included ONLY for explicit searches. Passing `isAdult: null`
+# (the obvious "no filter" value) actually makes AniList return ZERO results —
+# so the argument is omitted entirely for regular anime.
+_ANILIST_MEDIA_FIELDS = """
       id
       idMal
       title { romaji english native }
@@ -861,10 +861,15 @@ query ($search: String, $adult: Boolean) {
       status
       episodes
       nextAiringEpisode { airingAt episode }
-    }
-  }
-}
 """
+_ANILIST_SEARCH_REGULAR = (
+    "query ($search: String) { Page(perPage: 8) { media(search: $search, type: ANIME) {"
+    + _ANILIST_MEDIA_FIELDS + "} } }"
+)
+_ANILIST_SEARCH_ADULT = (
+    "query ($search: String) { Page(perPage: 8) { media(search: $search, type: ANIME, isAdult: true) {"
+    + _ANILIST_MEDIA_FIELDS + "} } }"
+)
 
 
 def _anilist_throttle() -> None:
@@ -875,9 +880,9 @@ def _anilist_throttle() -> None:
     _anilist_last_request = time.time()
 
 
-def _anilist_post(variables: dict) -> dict | None:
+def _anilist_query(query: str, variables: dict) -> dict | None:
     _anilist_throttle()
-    body = json.dumps({"query": _ANILIST_SEARCH_QUERY, "variables": variables}).encode("utf-8")
+    body = json.dumps({"query": query, "variables": variables}).encode("utf-8")
     req = urllib.request.Request(
         _ANILIST_URL, data=body,
         headers={"Content-Type": "application/json", "Accept": "application/json",
@@ -903,37 +908,68 @@ def _anilist_post(variables: dict) -> dict | None:
         return None
 
 
-def search_anilist(title: str, *, explicit: bool = False, limit: int = 5) -> list[MediaResult]:
-    """Search AniList for anime. Rich romaji/english/native/synonym titles are
-    all carried as alt_titles so folder names in any of them score correctly.
-    external_id is the AniList id; the MAL id is appended to overview so the
-    tracker can reuse it. Airing (nextAiringEpisode) rides along in overview
-    too, parsed later by the tracker."""
-    data = _anilist_post({"search": title, "adult": True if explicit else None})
+def _anilist_search_raw(title: str, explicit: bool) -> list[dict]:
+    """Raw AniList media dicts for a title (carries titles + nextAiringEpisode)."""
+    query = _ANILIST_SEARCH_ADULT if explicit else _ANILIST_SEARCH_REGULAR
+    data = _anilist_query(query, {"search": title})
     if not data:
         return []
-    media = (((data.get("data") or {}).get("Page") or {}).get("media")) or []
+    return (((data.get("data") or {}).get("Page") or {}).get("media")) or []
 
-    results: list[MediaResult] = []
-    for m in media[:limit]:
-        t = m.get("title") or {}
-        romaji, english, native = t.get("romaji"), t.get("english"), t.get("native")
-        primary = romaji or english or native or "Unknown"
-        alts = [x for x in (romaji, english, native, *(m.get("synonyms") or []))
-                if x and x != primary]
-        nxt = m.get("nextAiringEpisode") or {}
-        results.append(MediaResult(
-            title=primary,
-            year=m.get("seasonYear"),
-            external_id=str(m.get("id") or ""),
-            external_url=f"{_ANILIST_WEB}/{m.get('id')}" if m.get("id") else "",
-            media_type="xanime" if explicit else "anime",
-            overview=(f"mal:{m.get('idMal')}|status:{m.get('status')}"
-                      f"|next:{nxt.get('airingAt') or ''}:{nxt.get('episode') or ''}"),
-            source="anilist",
-            alt_titles=tuple(dict.fromkeys(alts)),  # dedupe, preserve order
-        ))
-    return results
+
+def _media_result_from_anilist(m: dict, explicit: bool) -> MediaResult:
+    t = m.get("title") or {}
+    romaji, english, native = t.get("romaji"), t.get("english"), t.get("native")
+    primary = romaji or english or native or "Unknown"
+    alts = [x for x in (romaji, english, native, *(m.get("synonyms") or []))
+            if x and x != primary]
+    return MediaResult(
+        title=primary,
+        year=m.get("seasonYear"),
+        external_id=str(m.get("id") or ""),
+        external_url=f"{_ANILIST_WEB}/{m.get('id')}" if m.get("id") else "",
+        media_type="xanime" if explicit else "anime",
+        overview=f"mal:{m.get('idMal')}|status:{m.get('status')}",
+        source="anilist",
+        alt_titles=tuple(dict.fromkeys(alts)),  # dedupe, preserve order
+    )
+
+
+def search_anilist(title: str, *, explicit: bool = False, limit: int = 5) -> list[MediaResult]:
+    """Search AniList for anime. Rich romaji/english/native/synonym titles are
+    all carried as alt_titles so folder names in any of them score correctly."""
+    media = _anilist_search_raw(title, explicit)
+    return [_media_result_from_anilist(m, explicit) for m in media[:limit]]
+
+
+def _anilist_status_label(status: str) -> str:
+    return {
+        "RELEASING": "Airing", "FINISHED": "Ended",
+        "NOT_YET_RELEASED": "Upcoming", "CANCELLED": "Cancelled",
+        "HIATUS": "Hiatus",
+    }.get(status or "", status or "")
+
+
+def get_anime_airing(title: str, *, explicit: bool = False) -> tuple["EpisodeInfo | None", str]:
+    """Best-effort (next-episode-to-air, status) for an anime, by title, via
+    AniList — the most accurate anime airing source. One network call: the
+    search response already carries nextAiringEpisode, so we pick the
+    best-matching entry and read its schedule directly."""
+    media = _anilist_search_raw(title, explicit)
+    if not media:
+        return None, ""
+    scored = [(_media_result_from_anilist(m, explicit), m) for m in media]
+    best_result, best_raw = max(scored, key=lambda pair: best_title_similarity(title, pair[0]))
+    if best_title_similarity(title, best_result) < 0.6:
+        return None, ""
+    status = _anilist_status_label(best_raw.get("status") or "")
+    nxt = best_raw.get("nextAiringEpisode") or {}
+    airing_at, episode = nxt.get("airingAt"), nxt.get("episode")
+    if not airing_at or not episode:
+        return None, status
+    from datetime import datetime, timezone
+    air_date = datetime.fromtimestamp(int(airing_at), tz=timezone.utc).date().isoformat()
+    return EpisodeInfo(season=1, episode=int(episode), title="", air_date=air_date), status
 
 
 # ---------------------------------------------------------------------------
@@ -1441,56 +1477,6 @@ def get_tmdb_next_air(tv_id: str) -> EpisodeInfo | None:
     )
 
 
-# --- AniList airing (anime-native; covers anime TMDB doesn't have) ----------
-
-_ANILIST_MEDIA_QUERY = """
-query ($id: Int) {
-  Media(id: $id, type: ANIME) {
-    status
-    episodes
-    nextAiringEpisode { airingAt episode }
-  }
-}
-"""
-
-
-def _anilist_media(anilist_id: str) -> dict | None:
-    _anilist_throttle()
-    body = json.dumps({"query": _ANILIST_MEDIA_QUERY,
-                       "variables": {"id": int(anilist_id)}}).encode("utf-8")
-    req = urllib.request.Request(
-        _ANILIST_URL, data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json",
-                 "User-Agent": _USER_AGENT},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return (json.loads(resp.read().decode("utf-8")).get("data") or {}).get("Media")
-    except Exception as exc:
-        logger.warning("AniList media fetch failed for %s: %s", anilist_id, exc)
-        return None
-
-
-def get_anilist_next_air(anilist_id: str) -> EpisodeInfo | None:
-    """Next scheduled episode for an AniList id — anime-native airing, so it
-    works for currently-airing anime that TMDB doesn't carry."""
-    if not anilist_id or not anilist_id.isdigit():
-        return None
-    media = _anilist_media(anilist_id)
-    if not media:
-        return None
-    nxt = media.get("nextAiringEpisode") or {}
-    airing_at, episode = nxt.get("airingAt"), nxt.get("episode")
-    if not airing_at or not episode:
-        return None
-    from datetime import datetime, timezone
-    air_date = datetime.fromtimestamp(int(airing_at), tz=timezone.utc).date().isoformat()
-    return EpisodeInfo(season=1, episode=int(episode), title="", air_date=air_date)
-
-
-def get_anilist_status(anilist_id: str) -> str:
-    if not anilist_id or not anilist_id.isdigit():
-        return ""
-    media = _anilist_media(anilist_id)
-    return (media or {}).get("status") or ""  # RELEASING / FINISHED / NOT_YET_RELEASED
+# AniList airing is handled by get_anime_airing (above), which reads
+# nextAiringEpisode straight from the search response — one call, by title, so
+# it works for every anime regardless of how it was identified.

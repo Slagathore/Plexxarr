@@ -28,7 +28,7 @@ def _no_airing_network(monkeypatch):
         import show_tracker
     except Exception:
         return
-    for name in ("resolve_tmdb_tv_id", "get_tmdb_next_air", "get_anilist_next_air"):
+    for name in ("resolve_tmdb_tv_id", "get_tmdb_next_air"):
         monkeypatch.setattr(show_tracker, name, lambda *a, **k: None, raising=False)
     monkeypatch.setattr(show_tracker, "get_tmdb_tv_episodes", lambda *a, **k: [], raising=False)
-    monkeypatch.setattr(show_tracker, "get_anilist_status", lambda *a, **k: "", raising=False)
+    monkeypatch.setattr(show_tracker, "get_anime_airing", lambda *a, **k: (None, ""), raising=False)

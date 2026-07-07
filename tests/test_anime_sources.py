@@ -20,13 +20,13 @@ def test_anidb_carries_all_synonyms_as_alt_titles(monkeypatch):
 
 
 def test_anilist_parses_titles_and_airing(monkeypatch):
-    canned = {"data": {"Page": {"media": [{
+    raw = [{
         "id": 123, "idMal": 456,
         "title": {"romaji": "Shingeki no Bahamut", "english": "Rage of Bahamut", "native": "神撃"},
         "synonyms": ["SnB"], "seasonYear": 2014, "status": "FINISHED",
         "episodes": 12, "nextAiringEpisode": None,
-    }]}}}
-    monkeypatch.setattr(media_lookup, "_anilist_post", lambda *a, **k: canned)
+    }]
+    monkeypatch.setattr(media_lookup, "_anilist_search_raw", lambda *a, **k: raw)
     results = media_lookup.search_anilist("Shingeki no Bahamut")
     assert len(results) == 1
     r = results[0]
@@ -34,6 +34,28 @@ def test_anilist_parses_titles_and_airing(monkeypatch):
     assert r.title == "Shingeki no Bahamut"
     assert "Rage of Bahamut" in r.alt_titles and "神撃" in r.alt_titles
     assert "mal:456" in r.overview
+
+
+def test_get_anime_airing_picks_best_and_reads_schedule(monkeypatch):
+    raw = [
+        {"id": 1, "title": {"romaji": "One Piece Movie", "english": None, "native": None},
+         "synonyms": [], "status": "FINISHED", "nextAiringEpisode": None},
+        {"id": 21, "title": {"romaji": "One Piece", "english": None, "native": None},
+         "synonyms": [], "status": "RELEASING",
+         "nextAiringEpisode": {"airingAt": 1783865760, "episode": 1169}},
+    ]
+    monkeypatch.setattr(media_lookup, "_anilist_search_raw", lambda *a, **k: raw)
+    nxt, status = media_lookup.get_anime_airing("One Piece")
+    assert status == "Airing"
+    assert nxt is not None and nxt.episode == 1169 and nxt.air_date == "2026-07-12"
+
+
+def test_get_anime_airing_none_when_not_airing(monkeypatch):
+    raw = [{"id": 5, "title": {"romaji": "Old Finished Show", "english": None, "native": None},
+            "synonyms": [], "status": "FINISHED", "nextAiringEpisode": None}]
+    monkeypatch.setattr(media_lookup, "_anilist_search_raw", lambda *a, **k: raw)
+    nxt, status = media_lookup.get_anime_airing("Old Finished Show")
+    assert nxt is None and status == "Ended"
 
 
 def test_cascade_short_circuits_on_confident_anidb_match(monkeypatch):
