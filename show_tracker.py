@@ -399,6 +399,28 @@ def _sync_show_impl(show_id: int) -> str:
     tmdb_id = _ensure_tmdb_id(refreshed)
     if not episodes and tmdb_id:
         episodes = get_tmdb_tv_episodes(tmdb_id)
+
+    # Ordering mismatch: many anime trackers number episodes absolutely
+    # (one long "season 1"), but Plex libraries are organised in Season NN
+    # folders. If the fetched list is single-season while the disk clearly
+    # uses multiple seasons, swap to TMDB's season-based list — otherwise
+    # every episode outside "Season 1" reads as missing.
+    found = _scan_folders_for_episodes(show.folders)
+    ordering_note = ""
+    disk_max_season = max((season for season, _ep in found), default=0)
+    fetched_max_season = max((e.season for e in episodes), default=0)
+    if (episodes and fetched_max_season <= 1 and disk_max_season >= 2
+            and show.media_type in ("anime", "xanime") and tmdb_id):
+        seasoned = get_tmdb_tv_episodes(tmdb_id)
+        if seasoned and max(e.season for e in seasoned) >= 2:
+            logger.info(
+                "'%s': tracker list is absolute-ordered but disk has %d seasons — "
+                "switching to TMDB season ordering.", show.title, disk_max_season,
+            )
+            shows_store.clear_episodes(show_id)
+            episodes = seasoned
+            ordering_note = " (switched to season ordering via TMDB)"
+
     if episodes:
         shows_store.replace_episodes(show_id, episodes)
 
@@ -412,13 +434,12 @@ def _sync_show_impl(show_id: int) -> str:
         next_episode=nxt.episode if nxt else None,
     )
 
-    found = _scan_folders_for_episodes(show.folders)
     shows_store.update_file_state(show_id, found)
     missing = len(shows_store.missing_episodes(show_id))
 
     air_note = f", next airs {nxt.air_date} (S{nxt.season:02d}E{nxt.episode:02d})" if nxt else ""
     return (f"{show.title}: {len(episodes)} episodes known, {len(found)} on disk, "
-            f"{missing} missing{air_note}")
+            f"{missing} missing{air_note}{ordering_note}")
 
 
 def sync_all(progress=None) -> list[str]:
@@ -506,8 +527,11 @@ def plan_for_episode(
             reason=f"season target rule for '{show.title}' S{season}",
         )
 
+    # No folder holds this season yet (e.g. a brand-new season): create it
+    # in the mapped folder on the drive with the most free space.
     folder = _folder_containing_season(show, season) or (
-        show.folders[0] if show.folders else None
+        torrent_routing.pick_root_by_free_space(list(show.folders))
+        or (show.folders[0] if show.folders else None)
     )
     if folder is None:
         return torrent_routing.RoutePlan(

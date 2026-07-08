@@ -86,6 +86,15 @@ class UnindexedFile:
 
 
 @dataclass
+class JunkFile:
+    """One cleanup candidate found by find_junk_files()."""
+    path: str
+    kind: str          # "file" | "dir"
+    reason: str        # human explanation ("sample video", "release notes", …)
+    size_bytes: int
+
+
+@dataclass
 class ShowInventory:
     """Per-show season/episode counts derived from the on-disk filenames."""
     title: str
@@ -559,6 +568,117 @@ def apply_sanitization(pairs: list[SanitizePair]) -> list[str]:
             errors.append(f"Rename failed for {src.name}: {exc}")
 
     return errors
+
+
+# ---------------------------------------------------------------------------
+# Junk cleanup — samples, release notes, screenshot jpgs, empty folders
+# ---------------------------------------------------------------------------
+
+# Plex extras folders — real bonus content lives here; never flag it.
+_EXTRAS_DIR_RE = re.compile(
+    r"^(?:extras?|featurettes?|behind the scenes|deleted scenes|interviews|"
+    r"scenes|shorts|trailers|other|specials?)$", re.IGNORECASE)
+
+# Plex artwork filenames to KEEP even though they're images.
+_PLEX_ART_RE = re.compile(
+    r"^(?:poster|fanart|cover|folder|background|banner|backdrop|logo|"
+    r"season\d*(?:-poster)?|theme)\d*$", re.IGNORECASE)
+
+_SAMPLE_RE = re.compile(r"(?:^|[\s._\-\[(])sample(?:[\s._\-\])]|$)", re.IGNORECASE)
+
+_JUNK_EXTENSIONS = {".txt", ".nfo", ".sfv", ".srr", ".exe", ".url", ".lnk",
+                    ".website", ".md5", ".torrent", ".jpg", ".jpeg", ".png",
+                    ".gif", ".bmp", ".webp"}
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+
+# A video smaller than this, next to one ≥10× its size, is almost certainly
+# a sample/excerpt even without "sample" in the name.
+_TINY_VIDEO_BYTES = 80 * 1024 * 1024
+
+
+def find_junk_files() -> list[JunkFile]:
+    """Cleanup candidates across all configured library paths.
+
+    Keeps: the main video(s), subtitles, Plex artwork (poster/fanart/…), and
+    anything inside Plex extras folders (Featurettes, Deleted Scenes, …).
+    Flags: sample videos (by name, or tiny next to a full-size sibling),
+    release-note .txt/.nfo/.sfv files, screenshot images, stray .exe/.url,
+    and recursively-empty folders.
+    """
+    video_exts = set(config.LIBRARY_INDEX_EXTENSIONS)
+    subtitle_exts = {".srt", ".ass", ".ssa", ".sub", ".vtt", ".idx"}
+    junk: list[JunkFile] = []
+
+    for lib_root in config.PLEX_LIBRARY_PATHS:
+        root = Path(lib_root)
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, names in os.walk(root):
+            # Never descend into Plex extras folders.
+            dirnames[:] = [d for d in dirnames if not _EXTRAS_DIR_RE.match(d.strip())]
+            here = Path(dirpath)
+            in_sample_dir = _SAMPLE_RE.search(here.name) is not None
+
+            videos: list[tuple[Path, int]] = []
+            others: list[tuple[Path, int]] = []
+            for name in names:
+                p = here / name
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    continue
+                suffix = p.suffix.lower()
+                if suffix in video_exts:
+                    videos.append((p, size))
+                elif suffix not in subtitle_exts:
+                    others.append((p, size))
+
+            biggest_video = max((s for _p, s in videos), default=0)
+
+            for p, size in videos:
+                if _SAMPLE_RE.search(p.stem) or in_sample_dir:
+                    if biggest_video > size * 4 or size < 200 * 1024 * 1024:
+                        junk.append(JunkFile(str(p), "file", "sample video (named)", size))
+                elif size < _TINY_VIDEO_BYTES and biggest_video >= size * 10:
+                    junk.append(JunkFile(
+                        str(p), "file",
+                        f"tiny video next to a {biggest_video // (1024*1024)} MB main file",
+                        size))
+
+            for p, size in others:
+                suffix = p.suffix.lower()
+                if suffix not in _JUNK_EXTENSIONS:
+                    continue
+                if suffix in _IMAGE_EXTENSIONS and _PLEX_ART_RE.match(p.stem.strip()):
+                    continue  # Plex artwork
+                reason = {
+                    ".txt": "release notes", ".nfo": "release info",
+                    ".sfv": "checksum file", ".srr": "rescene file",
+                    ".exe": "stray executable", ".url": "link file",
+                    ".lnk": "link file", ".website": "link file",
+                    ".md5": "checksum file", ".torrent": "torrent file",
+                }.get(suffix, "screenshot / junk image")
+                junk.append(JunkFile(str(p), "file", reason, size))
+
+    # Recursively-empty folders (deepest first so parents empty out too).
+    library_roots = {str(Path(p).resolve()) for p in config.PLEX_LIBRARY_PATHS if Path(p).is_dir()}
+    for lib_root in config.PLEX_LIBRARY_PATHS:
+        root = Path(lib_root)
+        if not root.is_dir():
+            continue
+        for dirpath, _dirnames, names in sorted(
+                os.walk(root), key=lambda t: -len(t[0])):
+            here = Path(dirpath)
+            try:
+                if str(here.resolve()) in library_roots:
+                    continue
+                if not names and not any(here.iterdir()):
+                    junk.append(JunkFile(str(here), "dir", "empty folder", 0))
+            except OSError:
+                continue
+
+    logger.info("find_junk_files: %d cleanup candidate(s).", len(junk))
+    return junk
 
 
 # ---------------------------------------------------------------------------

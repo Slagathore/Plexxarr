@@ -20,9 +20,14 @@
 
 import json
 import logging
+import re
 import shutil
 import subprocess
 import threading
+import time
+import urllib.parse
+import urllib.request
+from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any, Callable
 
@@ -95,6 +100,114 @@ def pick_best_result(results: list[TorrentResult], media_type: str) -> TorrentRe
 # Windows: suppress the console window for the Node subprocess.
 _CREATE_NO_WINDOW = 0x08000000
 
+# ---------------------------------------------------------------------------
+# Public tracker list — appended to every magnet before download. Poorly
+# announced magnets (one dead tracker) often go from 0 peers to dozens with
+# these. Refreshed daily from ngosang/trackerslist; the baked-in list is the
+# fallback when offline.
+# ---------------------------------------------------------------------------
+
+_TRACKERS_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
+_TRACKERS_CACHE = Path(config.APP_DIR) / "trackers_cache.txt"
+_TRACKERS_MAX_AGE_S = 24 * 3600
+
+_BUILTIN_TRACKERS = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.theoks.net:6969/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://opentracker.io:6969/announce",
+    "http://tracker.openbittorrent.com:80/announce",
+]
+
+
+def _public_trackers() -> list[str]:
+    """Current tracker list — cached download of trackers_best, else builtin."""
+    try:
+        if (not _TRACKERS_CACHE.is_file()
+                or time.time() - _TRACKERS_CACHE.stat().st_mtime > _TRACKERS_MAX_AGE_S):
+            req = urllib.request.Request(_TRACKERS_URL, headers={"User-Agent": "PlexResetButton"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                _TRACKERS_CACHE.write_bytes(resp.read())
+    except Exception as exc:
+        logger.debug("Tracker list refresh failed (using cache/builtin): %s", exc)
+    try:
+        if _TRACKERS_CACHE.is_file():
+            lines = [ln.strip() for ln in _TRACKERS_CACHE.read_text().splitlines()]
+            trackers = [ln for ln in lines if ln.startswith(("udp://", "http://", "https://"))]
+            if trackers:
+                return trackers
+    except OSError:
+        pass
+    return _BUILTIN_TRACKERS
+
+
+def add_public_trackers(magnet: str) -> str:
+    """Append the public tracker list to a magnet URI (skipping ones present)."""
+    if not magnet.startswith("magnet:"):
+        return magnet
+    existing = set(re.findall(r"tr=([^&]+)", magnet))
+    extra = ""
+    for tr in _public_trackers():
+        quoted = urllib.parse.quote(tr, safe="")
+        if quoted not in existing and tr not in existing:
+            extra += f"&tr={quoted}"
+    return magnet + extra
+
+
+class _QBitClient:
+    """Tiny qBittorrent Web API client (urllib only, cookie auth).
+
+    Used when QBITTORRENT_ENABLED is on — downloads are delegated to a
+    running qBittorrent instance instead of the built-in webtorrent runner.
+    """
+
+    def __init__(self) -> None:
+        self._base = config.QBITTORRENT_URL.rstrip("/")
+        jar = CookieJar()
+        self._opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(jar))
+
+    def _post(self, path: str, data: dict[str, str]) -> str:
+        body = urllib.parse.urlencode(data).encode()
+        req = urllib.request.Request(self._base + path, data=body)
+        with self._opener.open(req, timeout=15) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+
+    def _get_json(self, path: str) -> Any:
+        with self._opener.open(self._base + path, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    def login(self) -> None:
+        out = self._post("/api/v2/auth/login", {
+            "username": config.QBITTORRENT_USERNAME,
+            "password": config.QBITTORRENT_PASSWORD,
+        })
+        if "Ok" not in out:
+            raise RuntimeError("qBittorrent login failed — check URL/username/password in Settings.")
+
+    def add_magnet(self, magnet: str, save_path: str, tag: str) -> None:
+        self._post("/api/v2/torrents/add", {
+            "urls": magnet, "savepath": save_path, "tags": tag,
+            "sequentialDownload": "false",
+        })
+
+    def info_by_tag(self, tag: str) -> dict | None:
+        torrents = self._get_json(f"/api/v2/torrents/info?tag={urllib.parse.quote(tag)}")
+        return torrents[0] if torrents else None
+
+    def delete_by_tag(self, tag: str, *, delete_files: bool) -> None:
+        info = self.info_by_tag(tag)
+        if info is None:
+            return
+        self._post("/api/v2/torrents/delete", {
+            "hashes": info.get("hash", ""),
+            "deleteFiles": "true" if delete_files else "false",
+        })
+
 
 class DownloadManager:
     """Owns runner subprocesses and post-processing. One instance per app."""
@@ -104,6 +217,8 @@ class DownloadManager:
         # download's row changed — the desktop app marshals it to the UI.
         self._on_update = on_update
         self._processes: dict[int, subprocess.Popen] = {}
+        # download_id → qBittorrent tag, for cancel when delegating to qBit.
+        self._qbit_tags: dict[int, str] = {}
         self._lock = threading.Lock()
         downloads_store.initialize_downloads_db()
 
@@ -168,9 +283,19 @@ class DownloadManager:
     def cancel(self, download_id: int) -> bool:
         with self._lock:
             proc = self._processes.get(download_id)
-        if proc is None or proc.poll() is not None:
+            qbit_tag = self._qbit_tags.get(download_id)
+        if qbit_tag is not None:
+            try:
+                client = _QBitClient()
+                client.login()
+                client.delete_by_tag(qbit_tag, delete_files=True)
+            except Exception:
+                logger.exception("qBittorrent cancel failed for #%s", download_id)
+                return False
+        elif proc is None or proc.poll() is not None:
             return False
-        proc.kill()
+        else:
+            proc.kill()
         downloads_store.set_status(download_id, "cancelled", completed=True)
         downloads_store.add_history(download_id, "cancelled", before=None, after=None)
         self._notify(download_id)
@@ -314,6 +439,92 @@ class DownloadManager:
 
     def _run_download(self, download_id: int, magnet: str, staging: str,
                       request_title: str | None) -> None:
+        # Extra public trackers help poorly-announced magnets find peers.
+        magnet = add_public_trackers(magnet)
+        if config.QBITTORRENT_ENABLED:
+            self._run_download_qbit(download_id, magnet, staging, request_title)
+            return
+        self._run_download_node(download_id, magnet, staging, request_title)
+
+    def _run_download_qbit(self, download_id: int, magnet: str, staging: str,
+                           request_title: str | None) -> None:
+        """Delegate one download to qBittorrent and poll it to completion."""
+        tag = f"prb-{download_id}"
+        try:
+            client = _QBitClient()
+            client.login()
+            client.add_magnet(magnet, staging, tag)
+        except Exception as exc:
+            logger.exception("qBittorrent add failed.")
+            downloads_store.set_status(
+                download_id, "error", error=f"qBittorrent: {exc}", completed=True)
+            downloads_store.add_history(download_id, "error", before=None, after=str(exc))
+            self._notify(download_id)
+            return
+
+        with self._lock:
+            self._qbit_tags[download_id] = tag
+
+        error_message: str | None = None
+        last_progress_at = time.time()
+        last_progress = -1.0
+        try:
+            while True:
+                time.sleep(3)
+                row = downloads_store.get_download(download_id)
+                if row is None or row.status == "cancelled":
+                    return
+                info = client.info_by_tag(tag)
+                if info is None:
+                    # Torrent may take a moment to appear after add.
+                    if time.time() - last_progress_at > 60:
+                        error_message = "torrent never appeared in qBittorrent"
+                        break
+                    continue
+                progress = float(info.get("progress") or 0.0)
+                state = str(info.get("state") or "")
+                if progress > last_progress:
+                    last_progress = progress
+                    last_progress_at = time.time()
+                    downloads_store.set_progress(download_id, progress)
+                    self._notify(download_id)
+                if state in ("error", "missingFiles"):
+                    error_message = f"qBittorrent state: {state}"
+                    break
+                if progress >= 1.0 or state in ("uploading", "stalledUP", "pausedUP",
+                                                "queuedUP", "checkingUP", "stoppedUP"):
+                    break  # download complete (seeding states)
+                if time.time() - last_progress_at > config.TORRENT_STALL_TIMEOUT_SECONDS:
+                    error_message = "stalled — no progress within the timeout"
+                    break
+        except Exception as exc:
+            error_message = str(exc)
+        finally:
+            # Stop seeding + drop the torrent (files stay on disk).
+            try:
+                client.delete_by_tag(tag, delete_files=False)
+            except Exception:
+                logger.debug("qBittorrent post-download delete failed.", exc_info=True)
+            with self._lock:
+                self._qbit_tags.pop(download_id, None)
+
+        if error_message:
+            downloads_store.set_status(download_id, "error", error=error_message, completed=True)
+            downloads_store.add_history(download_id, "error", before=None, after=error_message)
+            self._notify(download_id)
+            return
+
+        downloads_store.set_progress(download_id, 1.0)
+        downloads_store.set_status(download_id, "downloaded", completed=True)
+        downloads_store.add_history(download_id, "downloaded", before=None,
+                                    after=f"{staging} (via qBittorrent)")
+        self._notify(download_id)
+        outcome = self._post_process(download_id, request_title=request_title)
+        logger.info("Download #%s post-process: %s", download_id, outcome)
+        self._notify(download_id)
+
+    def _run_download_node(self, download_id: int, magnet: str, staging: str,
+                           request_title: str | None) -> None:
         cmd = [
             config.NODE_PATH, str(_RUNNER_PATH), magnet, staging,
             str(config.TORRENT_STALL_TIMEOUT_SECONDS),

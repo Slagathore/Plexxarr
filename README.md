@@ -65,14 +65,13 @@ app_logging.py       Dual log handler: stderr stream + in-memory ring buffer
 What a new user needs, assuming they got a built EXE folder (`PlexResetButton/` from `dist\`):
 
 1. **Windows 10/11 (64-bit)** with **Plex Media Server** installed locally.
-2. **Create a Telegram bot**: message [@BotFather](https://t.me/BotFather), `/newbot`, copy the token.
-3. **First run**: put the app folder anywhere, run `PlexResetButton.exe` (accept the UAC prompt). It will complain that `TELEGRAM_BOT_TOKEN` is missing — create a `.env` file next to the EXE (copy `.env.example`) and paste your token. That is the **only required setting**.
+2. **First run**: put the app folder anywhere, run `PlexResetButton.exe` (accept the UAC prompt). With no bot token configured, the **Setup Wizard opens automatically** and walks you through everything below — including one-click winget installs of Node.js and Ollama, and validating your bot token against Telegram before saving it.
+3. **Telegram bot**: the wizard opens [@BotFather](https://t.me/BotFather) for you — send `/newbot`, paste the token back into the wizard. (Telegram requires a human to create the bot; there's no API for it.)
 4. **In the app**: Settings tab → add your library folders (tagged movie/tv/anime/…) → Save. Click **Get Plex Token** to run the browser PIN flow (persists automatically).
 5. **Optional — for request lookups**: free API keys for [TMDB](https://www.themoviedb.org/settings/api) and [TVDB](https://thetvdb.com/api-information) in Settings. Anime identification works offline out of the box (AniDB title dump downloads automatically).
-6. **Optional — for the Downloads tab**: install [Node.js 20+](https://nodejs.org), then run `npm install` once inside the `torrent_runner/` folder next to the EXE.
-7. **Optional — for smarter request understanding**: install [Ollama](https://ollama.com) and set `OLLAMA_MODEL`. Without it, everything still works via rapidfuzz matching.
-8. **Optional**: `setup_autostart.bat` to launch at login without UAC prompts.
-9. Message your bot on Telegram. Unknown users automatically file an access request you approve on the **Users** tab.
+6. **Optional — downloads**: the wizard can install Node.js and run `npm install` for the torrent runner. Prefer qBittorrent? Enable it in Settings (Web UI URL + login) and downloads delegate to it instead.
+7. **Optional**: `setup_autostart.bat` to launch at login without UAC prompts.
+8. Message your bot on Telegram. Unknown users automatically file an access request that appears instantly on the **Users** tab.
 
 Use the **Status tab → 🩺 Health Check** button to verify every dependency at once.
 

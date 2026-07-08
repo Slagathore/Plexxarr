@@ -15,6 +15,7 @@
 
 import logging
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,6 +35,43 @@ def sanitize_for_filesystem(name: str) -> str:
 
 # Confidence needed before we'll route into an existing show folder.
 _SHOW_MATCH_THRESHOLD = 0.85
+
+
+def pick_root_by_free_space(candidates: list[str]) -> str | None:
+    """Where NEW content should land, among the given candidate folders.
+
+    DOWNLOAD_ROOT_OVERRIDE (Settings) hard-pins the choice: an exact folder
+    wins outright; a drive-root-style override ("I:\\") narrows candidates
+    to that drive. Otherwise the folder on the drive with the most free
+    space wins — drive letters can shuffle, free space follows the disk.
+    """
+    dirs = [c for c in candidates if Path(c).is_dir()]
+    override = config.DOWNLOAD_ROOT_OVERRIDE
+    if override:
+        override_path = Path(override)
+        if override_path.is_dir() and not dirs:
+            return str(override_path)
+        for c in dirs:
+            if Path(c) == override_path:
+                return c
+        on_override_drive = [
+            c for c in dirs
+            if Path(c).drive.upper() == override_path.drive.upper()
+        ]
+        if on_override_drive:
+            dirs = on_override_drive
+        elif override_path.is_dir():
+            return str(override_path)
+    if not dirs:
+        return None
+
+    def free_bytes(path: str) -> int:
+        try:
+            return shutil.disk_usage(path).free
+        except OSError:
+            return -1
+
+    return max(dirs, key=free_bytes)
 
 # --- Episode / title parsing -------------------------------------------------
 
@@ -223,14 +261,16 @@ def plan_route(torrent_name: str, media_type: str, *, request_title: str | None 
             reason=f"show '{folder.name}' matched at {score:.0%}",
         )
 
-    # Movies (and other/unknown): route to the first configured movie root.
+    # Movies (and other/unknown): route to the movie root on the drive with
+    # the most free space (or the Settings override).
     roots = [p for p in config.media_paths_for_types("movie") if Path(p).is_dir()] \
         if media_type == "movie" else []
     if media_type == "movie" and roots:
+        chosen = pick_root_by_free_space(roots) or roots[0]
         return RoutePlan(
-            confident=True, dest_dir=roots[0], parsed=parsed,
-            library_root=roots[0],
-            reason=f"movie root ({Path(roots[0]).name})",
+            confident=True, dest_dir=chosen, parsed=parsed,
+            library_root=chosen,
+            reason=f"movie root ({Path(chosen).name}, most free space)",
             new_filename=None,  # movies keep their original filename
         )
     return RoutePlan(

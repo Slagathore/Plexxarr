@@ -69,7 +69,10 @@ def _env_bool(key: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-TELEGRAM_BOT_TOKEN: str = _require("TELEGRAM_BOT_TOKEN")
+# Optional at startup: when empty, the desktop app opens the Setup Wizard
+# instead of crashing, and the Telegram bot simply doesn't start until a
+# token is saved. (_require() kept for callers that need a hard guarantee.)
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 
 def _parse_id_list(raw: str) -> tuple[int, ...]:
@@ -226,6 +229,26 @@ TELEGRAM_HARD_RESET_ENABLED: bool = _env_bool("TELEGRAM_HARD_RESET_ENABLED", Fal
 
 # Support link shown in the desktop app header.
 KOFI_URL: str = "https://ko-fi.com/sparklemuffin"
+
+# Hover tooltips on buttons (toggle in Settings).
+TOOLTIPS_ENABLED: bool = _env_bool("TOOLTIPS_ENABLED", True)
+
+# ---------------------------------------------------------------------------
+# Optional qBittorrent delegation — when enabled, downloads go through a
+# running qBittorrent instance (Web UI API) instead of the built-in
+# webtorrent runner. Purely opt-in; nothing prompts for it.
+# ---------------------------------------------------------------------------
+QBITTORRENT_ENABLED: bool = _env_bool("QBITTORRENT_ENABLED", False)
+QBITTORRENT_URL: str = os.getenv("QBITTORRENT_URL", "http://127.0.0.1:8080").strip()
+QBITTORRENT_USERNAME: str = os.getenv("QBITTORRENT_USERNAME", "admin").strip()
+QBITTORRENT_PASSWORD: str = os.getenv("QBITTORRENT_PASSWORD", "").strip()
+
+# ---------------------------------------------------------------------------
+# Where NEW content lands. Empty = automatic: among the configured library
+# roots of the right type, pick the one on the drive with the most free
+# space. Set to a specific folder (or drive root like "I:\") to hard-pin.
+# ---------------------------------------------------------------------------
+DOWNLOAD_ROOT_OVERRIDE: str = os.getenv("DOWNLOAD_ROOT_OVERRIDE", "").strip()
 
 # ---------------------------------------------------------------------------
 # Preferred download size, in MB per minute of runtime, per media type.

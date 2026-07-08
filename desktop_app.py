@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -24,11 +25,11 @@ from plex_auth import (PlexPinSession, PlexTokenResult, launch_auth_browser,
                        wait_for_plex_token)
 from plex_control import get_status, hard_reset, is_plex_running, launch_plex
 from maintenance import (
-    DuplicateGroup, LibraryInventory, SanitizePair, ShowInventory,
+    DuplicateGroup, JunkFile, LibraryInventory, SanitizePair, ShowInventory,
     UnindexedFile, apply_sanitization, daily_library_check,
-    delete_files_with_cleanup, find_duplicates, find_missing_episodes,
-    find_unindexed_files, library_inventory, media_type_for_path,
-    sanitize_all, sanitize_filename,
+    delete_files_with_cleanup, find_duplicates, find_junk_files,
+    find_missing_episodes, find_unindexed_files, library_inventory,
+    media_type_for_path, sanitize_all, sanitize_filename,
 )
 from queue_store import (add_request, complete_request, find_duplicate_requests,
                           get_request, initialize_queue_db, list_requests,
@@ -45,7 +46,7 @@ from download_manager import DownloadManager
 from health import format_health_report
 from shows_tab import ShowsTab
 from torrent_search import TorrentResult, format_size, search_torrents
-from ui_helpers import make_sortable
+from ui_helpers import add_tooltip, make_sortable
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,9 @@ class DesktopApp:
         # Maintenance tab state
         self._maint_results: list[Any] = []
         self._maint_tool_name: str = ""
+        # Per-tool result cache: switching to another tool and back re-renders
+        # the last results instantly instead of re-running the walk.
+        self._maint_cache: dict[str, dict[str, Any]] = {}
         self._maint_tree: ttk.Treeview | None = None
         self._maint_check_vars: list[tk.BooleanVar] = []
         self._maint_status_var = tk.StringVar(value="Select a tool to run.")
@@ -232,18 +236,24 @@ class DesktopApp:
         walk(root_widget)
 
     def run(self) -> None:
-        try:
-            self.bot_service.start()
-            self.bot_status_var.set("Telegram bot: running")
-            self._bot_dot.configure(foreground=_DOT_GREEN)
-        except Exception as exc:
-            logger.exception("Failed to start Telegram bot service.")
-            self.bot_status_var.set(f"Telegram bot: failed ({exc})")
-            self._bot_dot.configure(foreground=_DOT_RED)
-            messagebox.showerror(
-                "Telegram bot failed",
-                f"Could not start the Telegram bot service.\n\n{exc}",
-            )
+        if not config.TELEGRAM_BOT_TOKEN:
+            # Fresh install: no crash, no bot — walk the user through setup.
+            self.bot_status_var.set("Telegram bot: not configured")
+            self._bot_dot.configure(foreground=_DOT_AMBER)
+            self.root.after(400, self.open_setup_wizard)
+        else:
+            try:
+                self.bot_service.start()
+                self.bot_status_var.set("Telegram bot: running")
+                self._bot_dot.configure(foreground=_DOT_GREEN)
+            except Exception as exc:
+                logger.exception("Failed to start Telegram bot service.")
+                self.bot_status_var.set(f"Telegram bot: failed ({exc})")
+                self._bot_dot.configure(foreground=_DOT_RED)
+                messagebox.showerror(
+                    "Telegram bot failed",
+                    f"Could not start the Telegram bot service.\n\n{exc}",
+                )
 
         self._tray_icon.run_detached()
         self.root.after(0, self._initialize_runtime_state)
@@ -305,22 +315,36 @@ class DesktopApp:
         kofi_row.grid(row=1, column=0, sticky="ew")
         kofi_label = ttk.Label(
             kofi_row,
-            text="☕ Enjoying this app? Buy me half a coffee on Ko-fi",
+            text=("😺 Like the app? You could help me get more catnip for my "
+                  "many, many cats — they NEED their zoomies! 🐈"),
             foreground="#ff5f5f", cursor="hand2",
-            font=("Segoe UI", 10, "underline"),
+            font=("Segoe UI", 12, "bold underline"),
         )
         kofi_label.pack(side=tk.LEFT)
         kofi_label.bind("<Button-1>", lambda _e: webbrowser.open_new_tab(config.KOFI_URL))
+        add_tooltip(kofi_label, "Opens my Ko-fi page (ko-fi.com/sparklemuffin). "
+                                "Zero pressure — the cats are fine. Probably. 😼")
 
         actions = ttk.Frame(self.root, padding=(16, 0, 16, 12))
         actions.grid(row=2, column=0, sticky="ew")
         for index in range(4):
             actions.columnconfigure(index, weight=1)
 
-        ttk.Button(actions, text="Launch Plex", style="Accent.TButton", command=lambda: self.run_action("Launch Plex", launch_plex)).grid(row=0, column=0, padx=4, sticky="ew")
-        ttk.Button(actions, text="⚠ Hard Reset", style="Danger.TButton", command=self.confirm_hard_reset).grid(row=0, column=1, padx=4, sticky="ew")
-        ttk.Button(actions, text="Refresh Status", command=self.refresh_status).grid(row=0, column=2, padx=4, sticky="ew")
-        ttk.Button(actions, text="Get Plex Token", command=self.authenticate_plex_account).grid(row=0, column=3, padx=4, sticky="ew")
+        for col, (text, style_name, command, tip) in enumerate((
+            ("Launch Plex", "Accent.TButton",
+             lambda: self.run_action("Launch Plex", launch_plex),
+             "Start Plex Media Server from its configured executable path."),
+            ("⚠ Hard Reset", "Danger.TButton", self.confirm_hard_reset,
+             "Force-kill every Plex process and relaunch. Interrupts anyone currently watching — asks for confirmation."),
+            ("Refresh Status", "", self.refresh_status,
+             "Re-check whether Plex is running and update the Status tab."),
+            ("Get Plex Token", "", self.authenticate_plex_account,
+             "Open the Plex PIN login in your browser and save the API token to .env automatically."),
+        )):
+            btn = (ttk.Button(actions, text=text, style=style_name, command=command)
+                   if style_name else ttk.Button(actions, text=text, command=command))
+            btn.grid(row=0, column=col, padx=4, sticky="ew")
+            add_tooltip(btn, tip)
 
         notebook = ttk.Notebook(self.root)
         notebook.grid(row=3, column=0, padx=16, pady=(0, 12), sticky="nsew")
@@ -348,6 +372,7 @@ class DesktopApp:
         self._notebook = notebook
         self._users_tab = users_tab
         self._downloads_tab = downloads_tab
+        self._maintenance_tab = maintenance_tab
         self._build_downloads_tab(downloads_tab)
         self._build_users_tab(users_tab)
         # Shows tab lives in its own module (shows_tab.py) — the first tab
@@ -370,12 +395,19 @@ class DesktopApp:
 
         status_toolbar = ttk.Frame(status_tab)
         status_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        ttk.Button(status_toolbar, text="🩺 Health Check",
-                   command=lambda: self.run_health_check(include_updates=False)).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(status_toolbar, text="⬆ Health + Update Check",
-                   command=lambda: self.run_health_check(include_updates=True)).grid(row=0, column=1, padx=(0, 6))
-        ttk.Button(status_toolbar, text="Plex Status",
-                   command=self.refresh_status).grid(row=0, column=2)
+        health_btn = ttk.Button(status_toolbar, text="🩺 Health Check",
+                                command=lambda: self.run_health_check(include_updates=False))
+        health_btn.grid(row=0, column=0, padx=(0, 6))
+        add_tooltip(health_btn, "Check every dependency: Plex, bot, API keys, Node, "
+                                "torrent runner, library paths, disk space, Ollama.")
+        update_btn = ttk.Button(status_toolbar, text="⬆ Health + Update Check",
+                                command=lambda: self.run_health_check(include_updates=True))
+        update_btn.grid(row=0, column=1, padx=(0, 6))
+        add_tooltip(update_btn, "Health check plus: is a newer Plex Media Server or app "
+                                "release available?")
+        plex_btn = ttk.Button(status_toolbar, text="Plex Status", command=self.refresh_status)
+        plex_btn.grid(row=0, column=2)
+        add_tooltip(plex_btn, "Show which Plex processes are running right now.")
 
         self.status_text = scrolledtext.ScrolledText(
             status_tab, wrap=tk.WORD, height=14, font=("Consolas", 10), state=tk.DISABLED,
@@ -490,17 +522,34 @@ class DesktopApp:
         # -----------------------------------------------------------------
         maint_toolbar = ttk.Frame(maintenance_tab)
         maint_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        for col in range(8):
+        maint_buttons: tuple[tuple[str, Any, str], ...] = (
+            ("Daily Check", self._run_daily_check,
+             "Scan open requests against the library and mark the ones that are now present."),
+            ("Library Inventory", self._run_library_inventory,
+             "Per-show season/episode counts and sizes from the files on disk."),
+            ("Find Duplicates", self._run_find_duplicates,
+             "Find files that look like the same movie/episode twice. You tick the copies to DELETE."),
+            ("Sanitize Names", self._run_sanitize,
+             "Preview Plex-friendly renames for messy filenames. You tick the rows to RENAME."),
+            ("Custom Rename...", self._open_custom_rename,
+             "Bulk-rename with find/replace, regex, case, prefix/suffix, and trim rules — previews first."),
+            ("Clean Junk", self._run_clean_junk,
+             "Find sample videos, release-note .txt/.nfo files, screenshot images, and empty folders. "
+             "You tick what to DELETE — subtitles, Plex artwork, and Extras folders are never flagged."),
+            ("Missing Episodes", self._run_missing_episodes,
+             "Detect numbering gaps inside seasons you already have files for."),
+            ("Unindexed Files", self._run_unindexed,
+             "Files on disk that aren't in the local search index yet — fix with Reindex."),
+            ("Reindex", self.rebuild_library_index_from_ui,
+             "Rebuild the local file index used by /search and the Library tab."),
+            ("Apply Selected", self._apply_maint_selection,
+             "Perform the action on the rows you've ticked (the checkbox column says what happens)."),
+        )
+        for col, (text, command, tip) in enumerate(maint_buttons):
             maint_toolbar.columnconfigure(col, weight=1)
-
-        ttk.Button(maint_toolbar, text="Daily Check",       command=self._run_daily_check).grid(row=0, column=0, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Library Inventory", command=self._run_library_inventory).grid(row=0, column=1, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Find Duplicates",   command=self._run_find_duplicates).grid(row=0, column=2, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Sanitize Names",    command=self._run_sanitize).grid(row=0, column=3, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Custom Rename...",  command=self._open_custom_rename).grid(row=0, column=4, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Missing Episodes",  command=self._run_missing_episodes).grid(row=0, column=5, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Unindexed Files",   command=self._run_unindexed).grid(row=0, column=6, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Apply Selected",    command=self._apply_maint_selection).grid(row=0, column=7, padx=2, sticky="ew")
+            btn = ttk.Button(maint_toolbar, text=text, command=command)
+            btn.grid(row=0, column=col, padx=2, sticky="ew")
+            add_tooltip(btn, tip)
 
         ttk.Label(maintenance_tab, textvariable=self._maint_status_var,
                   font=("Segoe UI", 11, "bold")).grid(row=1, column=0, sticky="w", pady=(0, 6))
@@ -1156,9 +1205,15 @@ class DesktopApp:
             toolbar, textvariable=self._dl_type_var, state="readonly", width=8,
             values=["movie", "tv", "anime", "xanime", "other"],
         ).grid(row=0, column=2, padx=(0, 6))
-        ttk.Button(toolbar, text="Search", command=self.search_torrents_from_ui).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(toolbar, text="⬇ Download Selected", style="Accent.TButton",
-                   command=self.download_selected_result).grid(row=0, column=4)
+        search_btn = ttk.Button(toolbar, text="Search", command=self.search_torrents_from_ui)
+        search_btn.grid(row=0, column=3, padx=(0, 6))
+        add_tooltip(search_btn, "Search torrent sources for this title "
+                                "(YTS/TPB for movies+TV, nyaa for anime, sukebei for xanime).")
+        dl_btn = ttk.Button(toolbar, text="⬇ Download Selected", style="Accent.TButton",
+                            command=self.download_selected_result)
+        dl_btn.grid(row=0, column=4)
+        add_tooltip(dl_btn, "Download the selected result to the staging folder; "
+                            "renamed/moved per the checkboxes below.")
 
         options = ttk.Frame(tab)
         options.grid(row=1, column=0, sticky="ew", pady=(0, 6))
@@ -1552,6 +1607,11 @@ class DesktopApp:
         ttk.Label(allowed_bar, text="Allowed users", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
         ttk.Button(allowed_bar, text="Revoke Selected", style="Danger.TButton",
                    command=self.revoke_selected_allowed_user).pack(side=tk.RIGHT)
+        history_btn = ttk.Button(allowed_bar, text="📺 Watch History…",
+                                 command=self.open_watch_history)
+        history_btn.pack(side=tk.RIGHT, padx=(6, 6))
+        add_tooltip(history_btn, "Who watched what on Plex, most recent first "
+                                 "(needs a Plex token).")
 
         allowed_tree = ttk.Treeview(
             tab, columns=("id", "user_id", "name", "username", "source", "claimed"),
@@ -1732,6 +1792,7 @@ class DesktopApp:
         col1: str = "Item",
         col2: str = "Detail",
         col3: str = "Extra",
+        check_label: str = "[/]",
         typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] | None = None,
     ) -> None:
         """
@@ -1741,12 +1802,17 @@ class DesktopApp:
         kept so existing tools that don't carry a media-type tag still work —
         they're treated as type "mixed" and never get filtered out.
 
+        check_label names the checkbox column with the ACTION Apply Selected
+        will take ("Delete?", "Rename?"), so there's no ambiguity about what
+        ticking a row means.
+
         New callers should pass `typed_rows` so the media-type filter
         checkboxes can hide/show entries without re-running the tool. Each
         typed row is (media_type_tag, (check, c1, c2, c3), action_payload).
         """
         if self._maint_tree is None:
             return
+        self._maint_tree.heading("check", text=check_label)
         self._maint_tree.heading("col1", text=col1)
         self._maint_tree.heading("col2", text=col2)
         self._maint_tree.heading("col3", text=col3)
@@ -1756,6 +1822,39 @@ class DesktopApp:
 
         self._maint_typed_rows = list(typed_rows)
         self._apply_maint_filter()
+
+        # Cache the render so switching tools and back is instant.
+        if self._maint_tool_name:
+            self._maint_cache[self._maint_tool_name] = {
+                "results": self._maint_results,
+                "typed_rows": self._maint_typed_rows,
+                "cols": (col1, col2, col3),
+                "check_label": check_label,
+                "status": self._maint_status_var.get(),
+                "at": datetime.datetime.now().strftime("%H:%M"),
+            }
+
+    def _maint_render_cached(self, tool: str) -> bool:
+        """Re-render a tool's cached results when SWITCHING to it. Clicking
+        the tool that's already displayed re-runs it fresh. Returns True if
+        the cache was rendered (caller should skip the run)."""
+        if self._maint_tool_name == tool:
+            return False
+        cached = self._maint_cache.get(tool)
+        if not cached:
+            return False
+        self._maint_tool_name = tool
+        self._maint_results = cached["results"]
+        col1, col2, col3 = cached["cols"]
+        # Note: _populate_maint_tree re-stores the cache — harmless.
+        self._populate_maint_tree(
+            [], col1=col1, col2=col2, col3=col3,
+            check_label=cached["check_label"], typed_rows=cached["typed_rows"],
+        )
+        self._maint_status_var.set(
+            f"{cached['status']}  (cached {cached['at']} — click the tool again to re-run)"
+        )
+        return True
 
     def _apply_maint_filter(self) -> None:
         """
@@ -1880,6 +1979,8 @@ class DesktopApp:
     # =====================================================================
 
     def _run_find_duplicates(self) -> None:
+        if self._maint_render_cached("find_duplicates"):
+            return
         if not self._maint_require_library_paths("Find Duplicates"):
             return
         self._maint_set_busy("Find Duplicates")
@@ -1910,7 +2011,8 @@ class DesktopApp:
         )
         self._maint_status_var.set(
             f"{len(results)} duplicate group(s) -- {self._fmt_bytes(total_size)} on disk, "
-            f"{self._fmt_bytes(recoverable)} recoverable if you keep one of each"
+            f"{self._fmt_bytes(recoverable)} recoverable. Tick the copies to DELETE "
+            "(keep at least one per group), then Apply Selected."
         )
 
         # One typed row per candidate file. The first row in each group shows
@@ -1929,7 +2031,7 @@ class DesktopApp:
 
         self._populate_maint_tree(
             [], col1="Normalized Title", col2="File Path", col3="File Size",
-            typed_rows=typed_rows,
+            check_label="Delete?", typed_rows=typed_rows,
         )
         self._show_info(
             "Find Duplicates",
@@ -1947,6 +2049,8 @@ class DesktopApp:
     # =====================================================================
 
     def _run_sanitize(self) -> None:
+        if self._maint_render_cached("sanitize"):
+            return
         if not self._maint_require_library_paths("Sanitize Names"):
             return
         self._maint_set_busy("Sanitize Names (preview)")
@@ -1970,7 +2074,8 @@ class DesktopApp:
             self._populate_maint_tree([], col1="Original Name", col2="Proposed Name", col3="Size")
             self._show_info("Sanitize Names", "All filenames are already Plex-friendly -- nothing to rename.")
             return
-        self._maint_status_var.set(f"{len(results)} rename(s) proposed -- check boxes then click Apply Selected")
+        self._maint_status_var.set(
+            f"{len(results)} rename(s) proposed -- tick the rows to RENAME, then Apply Selected")
         typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = [
             (
                 media_type_for_path(pair.original),
@@ -1981,7 +2086,7 @@ class DesktopApp:
         ]
         self._populate_maint_tree(
             [], col1="Original Name", col2="Proposed Name", col3="Size",
-            typed_rows=typed_rows,
+            check_label="Rename?", typed_rows=typed_rows,
         )
         self._show_info(
             "Sanitize Names",
@@ -1991,10 +2096,62 @@ class DesktopApp:
         )
 
     # =====================================================================
+    # Maintenance tab — junk cleanup (samples, release notes, empty folders)
+    # =====================================================================
+
+    def _run_clean_junk(self) -> None:
+        if self._maint_render_cached("clean_junk"):
+            return
+        if not self._maint_require_library_paths("Clean Junk"):
+            return
+        self._maint_set_busy("Clean Junk")
+
+        def worker() -> None:
+            try:
+                results = find_junk_files()
+            except Exception as exc:
+                logger.exception("find_junk_files failed.")
+                self._post_to_ui(lambda: self._maint_status_var.set(f"Clean Junk error: {exc}"))
+                return
+            self._post_to_ui(lambda: self._handle_junk_result(results))
+
+        threading.Thread(target=worker, name="maint-clean-junk", daemon=True).start()
+
+    def _handle_junk_result(self, results: list[JunkFile]) -> None:
+        self._maint_tool_name = "clean_junk"
+        self._maint_results = results
+        if not results:
+            self._maint_status_var.set("No junk found — your library is squeaky clean.")
+            self._populate_maint_tree([], col1="File / Folder", col2="Why", col3="Size",
+                                      check_label="Delete?")
+            self._show_info("Clean Junk", "No samples, release junk, or empty folders found.")
+            return
+        total = sum(j.size_bytes for j in results)
+        self._maint_status_var.set(
+            f"{len(results)} junk item(s) -- {self._fmt_bytes(total)} reclaimable. "
+            "Tick what to DELETE, then Apply Selected. Files go to the recycle bin."
+        )
+        typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = [
+            (
+                media_type_for_path(j.path),
+                ("", j.path, j.reason,
+                 self._fmt_bytes(j.size_bytes) if j.kind == "file" else "folder"),
+                (j.kind, j.path),
+            )
+            for j in results
+        ]
+        self._populate_maint_tree(
+            [], col1="File / Folder", col2="Why it's junk", col3="Size",
+            check_label="Delete?", typed_rows=typed_rows,
+        )
+
+    # =====================================================================
     # Maintenance tab — missing episodes
     # =====================================================================
 
     def _run_missing_episodes(self) -> None:
+        if self._maint_render_cached("missing_episodes"):
+            return
         if not self._maint_require_library_paths("Missing Episodes"):
             return
         self._maint_set_busy("Missing Episodes")
@@ -2084,6 +2241,8 @@ class DesktopApp:
     # =====================================================================
 
     def _run_unindexed(self) -> None:
+        if self._maint_render_cached("unindexed"):
+            return
         if not self._maint_require_library_paths("Unindexed Files"):
             return
         self._maint_set_busy("Unindexed Files")
@@ -2137,14 +2296,16 @@ class DesktopApp:
     # =====================================================================
 
     def _apply_maint_selection(self) -> None:
-        if self._maint_tool_name not in ("sanitize", "find_duplicates", "custom_rename"):
+        if self._maint_tool_name not in ("sanitize", "find_duplicates",
+                                         "custom_rename", "clean_junk"):
             self._show_info(
                 "Apply Selection",
                 "The current tool results have no applyable actions.\n\n"
                 "Tools that support Apply Selected:\n"
-                "  - Find Duplicates    -> deletes the checked files\n"
-                "  - Sanitize Names     -> renames the checked files\n"
-                "  - Custom Rename...   -> renames per your find/replace rules",
+                "  - Find Duplicates    -> DELETES the checked files\n"
+                "  - Clean Junk         -> DELETES the checked junk/empty folders\n"
+                "  - Sanitize Names     -> RENAMES the checked files\n"
+                "  - Custom Rename...   -> RENAMES per your rules",
             )
             return
 
@@ -2190,6 +2351,41 @@ class DesktopApp:
             if not paths_to_delete:
                 return
             self._confirm_and_delete_duplicates(paths_to_delete)
+            return
+
+        if self._maint_tool_name == "clean_junk":
+            # Payloads are (kind, path) — files recycle, empty dirs rmdir.
+            files = [p for kind, p in selected_payloads if kind == "file"]
+            dirs = [p for kind, p in selected_payloads if kind == "dir"]
+            if not files and not dirs:
+                return
+            if not self._ask_yes_no(
+                "Clean Junk",
+                f"Delete {len(files)} junk file(s) (to recycle bin) and remove "
+                f"{len(dirs)} empty folder(s)?",
+            ):
+                return
+            self._maint_status_var.set("Cleaning junk…")
+
+            def worker() -> None:
+                deleted, errors, empty_dirs = delete_files_with_cleanup(files)
+                removed_dirs, dir_errors = self._remove_empty_dirs(dirs + empty_dirs)
+                errors.extend(dir_errors)
+
+                def done() -> None:
+                    self._maint_status_var.set(
+                        f"Removed {len(deleted)} file(s) + {removed_dirs} folder(s)"
+                        + (f", {len(errors)} error(s)" if errors else "")
+                    )
+                    if errors:
+                        self._show_warning("Clean Junk",
+                                           "Some items failed:\n" + "\n".join(errors[:10]))
+                    self._maint_tool_name = ""  # force a fresh re-run next click
+                    self._maint_cache.pop("clean_junk", None)
+                    self._run_clean_junk()
+                self._post_to_ui(done)
+
+            threading.Thread(target=worker, name="maint-apply-junk", daemon=True).start()
             return
 
         if self._maint_tool_name == "custom_rename":
@@ -2325,7 +2521,7 @@ class DesktopApp:
         win = tk.Toplevel(self.root)
         win.title("Custom Rename")
         win.transient(self.root)
-        win.geometry("560x340")
+        win.geometry("640x520")
         win.columnconfigure(1, weight=1)
 
         ttk.Label(win, text="Find:").grid(row=0, column=0, sticky="w", padx=10, pady=(12, 2))
@@ -2347,9 +2543,33 @@ class DesktopApp:
             values=["none", "lower", "UPPER", "Title Case"],
         ).grid(row=3, column=1, sticky="w", padx=10, pady=2)
 
-        ttk.Label(win, text="Limit to media types:").grid(row=4, column=0, sticky="nw", padx=10, pady=(8, 2))
+        # --- Bulk-Rename-Utility-style extras -----------------------------
+        addrem = ttk.LabelFrame(win, text="Add / Remove", padding=8)
+        addrem.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 2))
+        addrem.columnconfigure(1, weight=1)
+        addrem.columnconfigure(3, weight=1)
+
+        ttk.Label(addrem, text="Prefix:").grid(row=0, column=0, sticky="w", pady=2)
+        prefix_var = tk.StringVar()
+        ttk.Entry(addrem, textvariable=prefix_var).grid(row=0, column=1, sticky="ew", padx=(4, 12), pady=2)
+        ttk.Label(addrem, text="Suffix (before extension):").grid(row=0, column=2, sticky="w", pady=2)
+        suffix_var = tk.StringVar()
+        ttk.Entry(addrem, textvariable=suffix_var).grid(row=0, column=3, sticky="ew", padx=(4, 0), pady=2)
+
+        ttk.Label(addrem, text="Remove first N chars:").grid(row=1, column=0, sticky="w", pady=2)
+        first_n_var = tk.StringVar(value="0")
+        ttk.Entry(addrem, textvariable=first_n_var, width=6).grid(row=1, column=1, sticky="w", padx=(4, 12), pady=2)
+        ttk.Label(addrem, text="Remove last N chars:").grid(row=1, column=2, sticky="w", pady=2)
+        last_n_var = tk.StringVar(value="0")
+        ttk.Entry(addrem, textvariable=last_n_var, width=6).grid(row=1, column=3, sticky="w", padx=(4, 0), pady=2)
+
+        collapse_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(addrem, text="Collapse repeated spaces/dots/underscores into one space",
+                        variable=collapse_var).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        ttk.Label(win, text="Limit to media types:").grid(row=5, column=0, sticky="nw", padx=10, pady=(8, 2))
         type_frame = ttk.Frame(win)
-        type_frame.grid(row=4, column=1, sticky="w", padx=10, pady=(8, 2))
+        type_frame.grid(row=5, column=1, sticky="w", padx=10, pady=(8, 2))
         type_vars: dict[str, tk.BooleanVar] = {}
         for tag, label in (("movie", "Movies"), ("tv", "TV"),
                             ("anime", "Anime"), ("xanime", "xAnime"),
@@ -2358,29 +2578,41 @@ class DesktopApp:
             type_vars[tag] = v
             ttk.Checkbutton(type_frame, text=label, variable=v).pack(side=tk.LEFT, padx=2)
 
-        status_var = tk.StringVar(value="")
-        ttk.Label(win, textvariable=status_var, foreground=_MUTED_TEXT,
+        status_var = tk.StringVar(value="Rules apply in order: find/replace → case → "
+                                        "remove first/last → prefix/suffix → collapse.")
+        ttk.Label(win, textvariable=status_var, foreground=_MUTED_TEXT, wraplength=600,
                   font=("Segoe UI", 9, "italic")).grid(
-            row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0)
+            row=6, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0)
         )
         self._apply_dark_widget_styles(win)
 
         button_bar = ttk.Frame(win)
-        button_bar.grid(row=6, column=0, columnspan=2, sticky="e", padx=10, pady=(10, 12))
+        button_bar.grid(row=7, column=0, columnspan=2, sticky="e", padx=10, pady=(10, 12))
 
         def do_preview() -> None:
             find = find_var.get()
-            replace = replace_var.get()
             use_regex = regex_var.get()
             case_mode = case_var.get()
+            try:
+                first_n = max(0, int(first_n_var.get() or 0))
+                last_n = max(0, int(last_n_var.get() or 0))
+            except ValueError:
+                self._show_warning("Custom Rename", "Remove first/last N must be numbers.")
+                return
+            rule = {
+                "find": find, "replace": replace_var.get(),
+                "case": case_mode, "prefix": prefix_var.get(),
+                "suffix": suffix_var.get(), "first_n": first_n,
+                "last_n": last_n, "collapse": collapse_var.get(),
+            }
             allowed_tags = {tag for tag, v in type_vars.items() if v.get()}
 
-            if not find and case_mode == "none":
+            if not any([find, case_mode != "none", rule["prefix"], rule["suffix"],
+                        first_n, last_n, rule["collapse"]]):
                 self._show_warning(
                     "Custom Rename",
-                    "Either 'Find' must be set, or pick a Case transform "
-                    "other than 'none'. Otherwise the rule wouldn't change "
-                    "any filenames.",
+                    "Set at least one rule (find/replace, case, prefix/suffix, "
+                    "remove N, or collapse) — otherwise nothing would change.",
                 )
                 return
 
@@ -2395,9 +2627,7 @@ class DesktopApp:
 
             def worker() -> None:
                 try:
-                    pairs = self._build_custom_rename_pairs(
-                        find, replace, pattern, case_mode, allowed_tags,
-                    )
+                    pairs = self._build_custom_rename_pairs(rule, pattern, allowed_tags)
                 except Exception as exc:
                     logger.exception("Custom rename preview failed.")
                     self._post_to_ui(lambda: status_var.set(f"Error: {exc}"))
@@ -2411,20 +2641,21 @@ class DesktopApp:
 
     def _build_custom_rename_pairs(
         self,
-        find: str,
-        replace: str,
+        rule: dict[str, Any],
         pattern: "re.Pattern[str] | None",
-        case_mode: str,
         allowed_tags: set[str],
     ) -> list[SanitizePair]:
         """
-        Walk every configured library path, apply the custom rule to each
-        media file's stem, and return SanitizePair entries for files whose
-        new name would actually differ from the current name. Runs on a
-        worker thread.
+        Walk every configured library path, apply the custom rule set to each
+        media file's stem (find/replace → case → remove first/last → prefix/
+        suffix → collapse separators), and return SanitizePair entries for
+        files whose new name would actually differ. Runs on a worker thread.
         """
         pairs: list[SanitizePair] = []
         extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
+        find = rule["find"]
+        replace = rule["replace"]
+        case_mode = rule["case"]
 
         for entry in config.MEDIA_LIBRARY_PATHS:
             if entry.media_type not in allowed_tags:
@@ -2449,7 +2680,14 @@ class DesktopApp:
                         new_stem = new_stem.upper()
                     elif case_mode == "Title Case":
                         new_stem = new_stem.title()
-                    if new_stem == stem:
+                    if rule["first_n"]:
+                        new_stem = new_stem[rule["first_n"]:]
+                    if rule["last_n"]:
+                        new_stem = new_stem[:-rule["last_n"]] if rule["last_n"] < len(new_stem) else ""
+                    new_stem = f"{rule['prefix']}{new_stem}{rule['suffix']}"
+                    if rule["collapse"]:
+                        new_stem = re.sub(r"[\s._]{2,}", " ", new_stem).strip()
+                    if not new_stem or new_stem == stem:
                         continue
                     full = Path(dirpath) / name
                     new_path = full.parent / f"{new_stem}{Path(name).suffix}"
@@ -2556,6 +2794,8 @@ class DesktopApp:
     # =====================================================================
 
     def _run_library_inventory(self) -> None:
+        if self._maint_render_cached("library_inventory"):
+            return
         if not self._maint_require_library_paths("Library Inventory"):
             return
         self._maint_set_busy("Library Inventory")
@@ -2652,7 +2892,14 @@ class DesktopApp:
         # Torrent pipeline
         ("TORRENT_DOWNLOAD_DIR", "Torrent staging folder", "path"),
         ("TORRENT_STALL_TIMEOUT_SECONDS", "Torrent stall timeout (seconds)", "int"),
+        ("DOWNLOAD_ROOT_OVERRIDE", "Force new downloads to folder/drive (blank = most free space)", "path"),
+        # qBittorrent (optional download engine)
+        ("QBITTORRENT_ENABLED", "Use qBittorrent instead of the built-in downloader", "bool"),
+        ("QBITTORRENT_URL", "qBittorrent Web UI URL", "text"),
+        ("QBITTORRENT_USERNAME", "qBittorrent username", "text"),
+        ("QBITTORRENT_PASSWORD", "qBittorrent password", "secret"),
         # Misc
+        ("TOOLTIPS_ENABLED", "Show hover tooltips on buttons", "bool"),
         ("LIBRARY_CHECK_HOUR", "Daily library check hour (0-23)", "int"),
         ("ADMIN_STATUS_REFRESH_SECONDS", "Status refresh interval (seconds)", "int"),
         ("LIBRARY_SEARCH_RESULT_LIMIT", "Library search result limit", "int"),
@@ -2820,10 +3067,12 @@ class DesktopApp:
 
         ttk.Label(button_bar, textvariable=self._settings_status_var,
                   font=("Segoe UI", 10, "italic"), foreground="#0a6").grid(row=0, column=0, sticky="w")
+        ttk.Button(button_bar, text="Setup Wizard…",
+                   command=self.open_setup_wizard).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(button_bar, text="Reload from .env",
-                   command=self._settings_reload_from_disk).grid(row=0, column=1, padx=(0, 6))
+                   command=self._settings_reload_from_disk).grid(row=0, column=2, padx=(0, 6))
         ttk.Button(button_bar, text="Save Settings",
-                   command=self._settings_save).grid(row=0, column=2)
+                   command=self._settings_save).grid(row=0, column=3)
 
         # Populate the path list from current config.
         self._settings_load_paths_from_config()
@@ -3087,6 +3336,265 @@ class DesktopApp:
             "The Telegram bot itself uses its token from startup, so if you "
             "changed TELEGRAM_BOT_TOKEN, restart the app for that one.",
         )
+
+    # =====================================================================
+    # Setup Wizard — first-run onboarding (also reachable from Settings)
+    # =====================================================================
+
+    def open_setup_wizard(self) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("Setup Wizard")
+        win.geometry("680x560")
+        win.transient(self.root)
+        win.columnconfigure(0, weight=1)
+
+        status_var = tk.StringVar(value="")
+
+        # --- Step 1: Telegram bot token --------------------------------
+        step1 = ttk.LabelFrame(win, text="1 · Telegram bot (required)", padding=10)
+        step1.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        step1.columnconfigure(1, weight=1)
+        ttk.Label(step1, wraplength=600, justify=tk.LEFT, text=(
+            "Telegram doesn't allow apps to create bots automatically — a human "
+            "has to ask @BotFather once. It takes about a minute:\n"
+            "  1. Click the button below to open @BotFather.\n"
+            "  2. Send /newbot, pick a display name and a unique username.\n"
+            "  3. Copy the token it gives you and paste it here."
+        )).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        ttk.Button(step1, text="Open @BotFather",
+                   command=lambda: webbrowser.open_new_tab("https://t.me/BotFather")
+                   ).grid(row=1, column=0, padx=(0, 8))
+        token_var = tk.StringVar(value=config.TELEGRAM_BOT_TOKEN)
+        ttk.Entry(step1, textvariable=token_var, show="•").grid(row=1, column=1, sticky="ew")
+        ttk.Button(step1, text="Validate && Save", style="Accent.TButton",
+                   command=lambda: self._wizard_validate_token(token_var.get().strip(), status_var)
+                   ).grid(row=1, column=2, padx=(8, 0))
+
+        # --- Step 2: library folders ------------------------------------
+        step2 = ttk.LabelFrame(win, text="2 · Library folders", padding=10)
+        step2.grid(row=1, column=0, sticky="ew", padx=12, pady=6)
+        ttk.Label(step2, wraplength=600, justify=tk.LEFT, text=(
+            "Tell the app where your media lives (tagged movie / tv / anime / …). "
+            "Everything — search, tracking, downloads — keys off these."
+        )).pack(anchor="w", pady=(0, 6))
+        ttk.Button(step2, text="Open Settings → Library Paths",
+                   command=lambda: self._notebook.select(8) if self._notebook else None
+                   ).pack(anchor="w")
+
+        # --- Step 3: optional components --------------------------------
+        step3 = ttk.LabelFrame(win, text="3 · Optional components", padding=10)
+        step3.grid(row=2, column=0, sticky="ew", padx=12, pady=6)
+        step3.columnconfigure(0, weight=1)
+        node_var = tk.BooleanVar(value=shutil.which(config.NODE_PATH) is None)
+        ollama_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(step3, variable=node_var,
+                        text="Install Node.js LTS (needed for the torrent Downloads tab)"
+                        ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(step3, variable=ollama_var,
+                        text=("Install Ollama + pull the default cloud model "
+                              "(smarter request understanding; app works fine without it)")
+                        ).grid(row=1, column=0, sticky="w")
+        btn_row = ttk.Frame(step3)
+        btn_row.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Button(btn_row, text="Install checked (via winget)",
+                   command=lambda: self._wizard_install(node_var.get(), ollama_var.get(), status_var)
+                   ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="npm install torrent runner",
+                   command=lambda: self._wizard_npm_install(status_var)).pack(side=tk.LEFT)
+
+        # --- Step 4: API keys --------------------------------------------
+        step4 = ttk.LabelFrame(win, text="4 · Free API keys (optional, recommended)", padding=10)
+        step4.grid(row=3, column=0, sticky="ew", padx=12, pady=6)
+        ttk.Label(step4, wraplength=600, justify=tk.LEFT, text=(
+            "TMDB and TVDB power request lookups and TV episode lists. Both are "
+            "free accounts — grab a key and paste it on the Settings tab. Anime "
+            "identification already works offline without any key."
+        )).pack(anchor="w", pady=(0, 6))
+        key_row = ttk.Frame(step4)
+        key_row.pack(anchor="w")
+        ttk.Button(key_row, text="Get TMDB key",
+                   command=lambda: webbrowser.open_new_tab("https://www.themoviedb.org/settings/api")
+                   ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(key_row, text="Get TVDB key",
+                   command=lambda: webbrowser.open_new_tab("https://thetvdb.com/api-information")
+                   ).pack(side=tk.LEFT)
+
+        bottom = ttk.Frame(win, padding=(12, 6))
+        bottom.grid(row=4, column=0, sticky="ew")
+        bottom.columnconfigure(0, weight=1)
+        ttk.Label(bottom, textvariable=status_var, wraplength=520,
+                  font=("Segoe UI", 9, "italic")).grid(row=0, column=0, sticky="w")
+        ttk.Button(bottom, text="Run Health Check",
+                   command=lambda: (win.destroy(), self.run_health_check())
+                   ).grid(row=0, column=1, padx=(8, 6))
+        ttk.Button(bottom, text="Close", command=win.destroy).grid(row=0, column=2)
+        self._apply_dark_widget_styles(win)
+
+    def _wizard_validate_token(self, token: str, status_var: tk.StringVar) -> None:
+        if not token:
+            status_var.set("Paste a bot token first.")
+            return
+        status_var.set("Checking token with Telegram…")
+
+        def worker() -> None:
+            import json as _json
+            import urllib.request as _rq
+            try:
+                with _rq.urlopen(f"https://api.telegram.org/bot{token}/getMe",
+                                 timeout=15) as resp:
+                    data = _json.loads(resp.read().decode())
+                username = data["result"]["username"]
+            except Exception:
+                self._post_to_ui(lambda: status_var.set(
+                    "Token rejected by Telegram — double-check you copied the whole thing."))
+                return
+
+            save_settings({"TELEGRAM_BOT_TOKEN": token}, config.DOTENV_PATH)
+            try:
+                reload_config_from_env(config.DOTENV_PATH)
+            except RuntimeError:
+                pass
+
+            def apply() -> None:
+                status_var.set(f"Token valid — bot is @{username}. Starting bot…")
+                if not self.bot_service.running:
+                    try:
+                        self.bot_service.start()
+                        self.bot_status_var.set("Telegram bot: running")
+                        self._bot_dot.configure(foreground=_DOT_GREEN)
+                        status_var.set(f"✔ Bot @{username} is up. Message it on Telegram to test!")
+                    except Exception as exc:
+                        status_var.set(f"Token saved, but the bot failed to start: {exc}")
+            self._post_to_ui(apply)
+
+        threading.Thread(target=worker, name="wizard-token", daemon=True).start()
+
+    def _wizard_install(self, node: bool, ollama: bool, status_var: tk.StringVar) -> None:
+        if not node and not ollama:
+            status_var.set("Nothing checked to install.")
+            return
+        status_var.set("Installing via winget — this can take a few minutes…")
+
+        def worker() -> None:
+            lines: list[str] = []
+            packages = ([("Node.js", "OpenJS.NodeJS.LTS")] if node else []) + \
+                       ([("Ollama", "Ollama.Ollama")] if ollama else [])
+            for label, pkg in packages:
+                try:
+                    result = subprocess.run(
+                        ["winget", "install", "--id", pkg, "-e", "--silent",
+                         "--accept-source-agreements", "--accept-package-agreements"],
+                        capture_output=True, text=True, timeout=900,
+                    )
+                    ok = result.returncode == 0 or "already installed" in (result.stdout or "").lower()
+                    lines.append(f"{label}: {'installed ✔' if ok else 'failed — see log'}")
+                    if not ok:
+                        logger.warning("winget %s failed: %s", pkg, result.stdout[-500:])
+                except Exception as exc:
+                    lines.append(f"{label}: failed ({exc})")
+            if ollama:
+                try:
+                    subprocess.run(["ollama", "pull", config.OLLAMA_MODEL],
+                                   capture_output=True, text=True, timeout=600)
+                    lines.append(f"Pulled model {config.OLLAMA_MODEL}")
+                except Exception:
+                    lines.append("Model pull skipped — run 'ollama pull "
+                                 f"{config.OLLAMA_MODEL}' after Ollama starts.")
+            self._post_to_ui(lambda: status_var.set(" · ".join(lines)))
+
+        threading.Thread(target=worker, name="wizard-install", daemon=True).start()
+
+    def _wizard_npm_install(self, status_var: tk.StringVar) -> None:
+        runner_dir = Path(config.APP_DIR) / "torrent_runner"
+        if not runner_dir.is_dir():
+            status_var.set(f"torrent_runner folder not found at {runner_dir}")
+            return
+        status_var.set("Running npm install in torrent_runner/…")
+
+        def worker() -> None:
+            try:
+                result = subprocess.run(
+                    ["npm", "install"], cwd=str(runner_dir), shell=True,
+                    capture_output=True, text=True, timeout=600,
+                )
+                msg = ("Torrent runner ready ✔" if result.returncode == 0
+                       else f"npm install failed: {result.stderr[-200:]}")
+            except Exception as exc:
+                msg = f"npm install failed: {exc}"
+            self._post_to_ui(lambda: status_var.set(msg))
+
+        threading.Thread(target=worker, name="wizard-npm", daemon=True).start()
+
+    # =====================================================================
+    # Cross-tab helpers
+    # =====================================================================
+
+    def open_sanitize_for_show(self, show: Any) -> None:
+        """Shows tab → Maintenance: preview sanitize renames for one show's
+        files. Nothing is renamed until the user ticks rows + Apply Selected."""
+        self._maint_set_busy(f"Sanitize preview for '{show.title}'")
+        if self._notebook is not None and self._maintenance_tab is not None:
+            self._notebook.select(self._maintenance_tab)
+
+        def worker() -> None:
+            extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
+            pairs: list[SanitizePair] = []
+            for folder in show.folders:
+                root = Path(folder)
+                if not root.is_dir():
+                    continue
+                for f in root.rglob("*"):
+                    if not f.is_file() or f.suffix.lower() not in extensions:
+                        continue
+                    try:
+                        pair = sanitize_filename(str(f), dry_run=True)
+                    except Exception:
+                        continue
+                    if pair.original != pair.sanitized:
+                        pairs.append(pair)
+            self._post_to_ui(lambda: self._handle_sanitize_result(pairs))
+
+        threading.Thread(target=worker, name="maint-sanitize-show", daemon=True).start()
+
+    def open_watch_history(self) -> None:
+        """Users tab → Plex watch history (who watched what, when)."""
+        win = tk.Toplevel(self.root)
+        win.title("Plex watch history")
+        win.geometry("720x480")
+        win.transient(self.root)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+
+        tree = ttk.Treeview(win, columns=("at", "user", "title"), show="headings")
+        for col, text, width in (("at", "When", 130), ("user", "User", 140),
+                                 ("title", "Watched", 400)):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor=tk.W)
+        tree.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        scroll = ttk.Scrollbar(win, orient=tk.VERTICAL, command=tree.yview)
+        scroll.grid(row=0, column=1, sticky="ns", pady=10)
+        tree.configure(yscrollcommand=scroll.set)
+        make_sortable(tree)
+        status = ttk.Label(win, text="Loading history from Plex…",
+                           font=("Segoe UI", 9, "italic"))
+        status.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 10))
+
+        def worker() -> None:
+            try:
+                from plex_api import get_watch_history
+                rows = get_watch_history(limit=config.PLEX_HISTORY_FETCH_LIMIT)
+            except Exception as exc:
+                self._post_to_ui(lambda: status.configure(
+                    text=f"History unavailable: {exc} (Plex token required)"))
+                return
+
+            def render() -> None:
+                for r in rows:
+                    tree.insert("", "end", values=(r.at, r.user, r.title))
+                status.configure(text=f"{len(rows)} plays (most recent first)")
+            self._post_to_ui(render)
+
+        threading.Thread(target=worker, name="ui-watch-history", daemon=True).start()
 
     # =====================================================================
     # Shutdown

@@ -237,6 +237,14 @@ def list_shows() -> list[TrackedShow]:
     ]
 
 
+def clear_episodes(show_id: int) -> None:
+    """Drop a show's episode rows — used when switching numbering schemes
+    (absolute ↔ seasons), where stale rows would double-count."""
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute("DELETE FROM episodes WHERE show_id = ?", (show_id,))
+        conn.commit()
+
+
 def replace_episodes(show_id: int, episodes: list) -> None:
     """Upsert the authoritative episode list from the tracker (keeps has_file)."""
     with _SHOWS_LOCK, db.connect() as conn:
@@ -278,6 +286,46 @@ def rename_show(show_id: int, title: str) -> None:
     with _SHOWS_LOCK, db.connect() as conn:
         conn.execute("UPDATE tracked_shows SET title = ? WHERE id = ?", (title, show_id))
         conn.commit()
+
+
+def reidentify_show(
+    show_id: int, *, title: str, source: str, external_id: str,
+    external_url: str | None, year: int | None, media_type: str | None = None,
+) -> tuple[str, int]:
+    """Point a tracked show at a different tracker entry ("fix match").
+
+    Episode rows are cleared (the new identity's numbering may differ) and
+    airing/status/tmdb caches reset — the caller should re-sync afterwards.
+    If ANOTHER row already has that (source, external_id), the two rows are
+    merged instead (folders move there; this row is deleted).
+
+    Returns ("updated", show_id) or ("merged", surviving_id).
+    """
+    with _SHOWS_LOCK, db.connect() as conn:
+        existing = conn.execute(
+            "SELECT id FROM tracked_shows WHERE source = ? AND external_id = ? AND id != ?",
+            (source, external_id, show_id),
+        ).fetchone()
+    if existing is not None:
+        surviving = int(existing[0])
+        merge_shows(surviving, [show_id])
+        return ("merged", surviving)
+
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute(
+            """
+            UPDATE tracked_shows SET
+                title = ?, source = ?, external_id = ?, external_url = ?,
+                year = ?, media_type = COALESCE(?, media_type),
+                status = '', tmdb_id = NULL, last_synced = NULL,
+                next_air_date = NULL, next_season = NULL, next_episode = NULL
+            WHERE id = ?
+            """,
+            (title, source, external_id, external_url, year, media_type, show_id),
+        )
+        conn.execute("DELETE FROM episodes WHERE show_id = ?", (show_id,))
+        conn.commit()
+    return ("updated", show_id)
 
 
 def merge_shows(primary_id: int, duplicate_ids: list[int]) -> int:

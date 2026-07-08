@@ -290,6 +290,30 @@ def _account_name_map() -> dict[int, str]:
     return mapping
 
 
+@dataclass(frozen=True)
+class WatchHistoryEntry:
+    at: str        # local "YYYY-MM-DD HH:MM"
+    user: str
+    title: str     # "Show - S01E02 - Episode Title" or movie title
+
+
+def get_watch_history(limit: int = 200) -> list[WatchHistoryEntry]:
+    """Recent plays across all users — for the Users tab history viewer."""
+    from datetime import datetime
+    names = _account_name_map()
+    rows: list[WatchHistoryEntry] = []
+    for item in _history_entries(limit):
+        viewed = _safe_int(item.get("viewedAt"))
+        at = (datetime.fromtimestamp(viewed).strftime("%Y-%m-%d %H:%M")
+              if viewed else "")
+        rows.append(WatchHistoryEntry(
+            at=at,
+            user=_session_user_label(item, account_names=names),
+            title=_playback_title(item),
+        ))
+    return rows
+
+
 def _library_sections() -> list[dict[str, Any]]:
     payload = _request_json("/library/sections")
     return [

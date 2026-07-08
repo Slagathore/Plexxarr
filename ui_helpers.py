@@ -13,17 +13,20 @@ import re
 import tkinter as tk
 from tkinter import ttk
 
-_NUMERIC_RE = re.compile(r"^\s*-?\d+(?:\.\d+)?\s*$")
+import config
+
+_NUMERIC_RE = re.compile(r"^\s*-?\d+(?:\.\d+)?\s*%?\s*$")   # "42", "3.5", "17%"
 _FRACTION_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")  # "123/321" have-counts
 
 
 def _sort_key(value: str):
-    """Key that sorts numbers numerically and everything else case-folded."""
+    """Key that sorts numbers (including percentages and fractions)
+    numerically and everything else case-folded."""
     m = _FRACTION_RE.match(value)
     if m:
         return (0, int(m.group(1)))
     if _NUMERIC_RE.match(value):
-        return (0, float(value))
+        return (0, float(value.replace("%", "").strip()))
     return (1, value.casefold())
 
 
@@ -57,6 +60,57 @@ def make_sortable(tree: ttk.Treeview, *, on_sorted=None) -> None:
     for col in columns:
         # Default arg binds the current column name.
         tree.heading(col, command=lambda c=col: sort_by(c))
+
+
+def add_tooltip(widget: tk.Misc, text: str, *, delay_ms: int = 500) -> None:
+    """Hover tooltip for any widget. Honours config.TOOLTIPS_ENABLED at
+    show time, so the Settings toggle applies without a restart."""
+    state: dict = {"after_id": None, "tip": None}
+
+    def show() -> None:
+        state["after_id"] = None
+        if not getattr(config, "TOOLTIPS_ENABLED", True) or state["tip"] is not None:
+            return
+        try:
+            x = widget.winfo_rootx() + 12
+            y = widget.winfo_rooty() + widget.winfo_height() + 6
+            tip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x}+{y}")
+            tip.attributes("-topmost", True)
+            tk.Label(
+                tip, text=text, justify=tk.LEFT, wraplength=340,
+                bg="#2b2b2b", fg="#e8e8e8", relief=tk.SOLID, borderwidth=1,
+                font=("Segoe UI", 9), padx=8, pady=4,
+            ).pack()
+            state["tip"] = tip
+        except tk.TclError:
+            state["tip"] = None
+
+    def schedule(_e=None) -> None:
+        cancel()
+        try:
+            state["after_id"] = widget.after(delay_ms, show)
+        except tk.TclError:
+            pass
+
+    def cancel(_e=None) -> None:
+        if state["after_id"] is not None:
+            try:
+                widget.after_cancel(state["after_id"])
+            except tk.TclError:
+                pass
+            state["after_id"] = None
+        if state["tip"] is not None:
+            try:
+                state["tip"].destroy()
+            except tk.TclError:
+                pass
+            state["tip"] = None
+
+    widget.bind("<Enter>", schedule, add="+")
+    widget.bind("<Leave>", cancel, add="+")
+    widget.bind("<ButtonPress>", cancel, add="+")
 
 
 class Spinner:

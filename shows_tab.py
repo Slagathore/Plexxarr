@@ -21,12 +21,13 @@ import logging
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, ttk
 
 import config
 import show_tracker
 import shows_store
-from ui_helpers import Spinner, make_sortable
+from ui_helpers import Spinner, add_tooltip, make_sortable
 
 logger = logging.getLogger(__name__)
 
@@ -50,19 +51,35 @@ class ShowsTab:
 
         toolbar = ttk.Frame(parent)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Button(toolbar, text="Scan Folders", command=self.scan_folders).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="Sync Episodes", command=self.sync_all).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="Refresh", command=self.refresh).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="Untrack", command=self.untrack_selected).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="Merge Selected", command=self.merge_selected).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="Silenced…", command=self.open_silenced_dialog).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="Fix Titles (English)", command=self.fix_titles).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="⬇ Grab Missing Now", command=self.grab_missing_now).pack(side=tk.LEFT, padx=(0, 6))
+        for text, command, tip in (
+            ("Scan Folders", self.scan_folders,
+             "Walk your tv/anime/xanime library folders and identify any new show folders against the trackers."),
+            ("Sync Episodes", self.sync_all,
+             "Refresh episode lists, air dates, and on-disk state for every tracked show. Can take a while."),
+            ("Refresh", self.refresh, "Redraw this tab from the database (no network calls)."),
+            ("Untrack", self.untrack_selected,
+             "Stop tracking the selected show(s). Files on disk are never touched."),
+            ("Merge Selected", self.merge_selected,
+             "Ctrl-click rows that are actually the same show, then merge them into the top-most one."),
+            ("Silenced…", self.open_silenced_dialog,
+             "List shows whose releases you've silenced, and restore them."),
+            ("Fix Titles (English)", self.fix_titles,
+             "Rename AniDB-identified shows to their official English titles (offline, safe to re-run)."),
+            ("⬇ Grab Missing Now", self.grab_missing_now,
+             "Search torrents for missing episodes right now (respects your size preference)."),
+        ):
+            btn = ttk.Button(toolbar, text=text, command=command)
+            btn.pack(side=tk.LEFT, padx=(0, 6))
+            add_tooltip(btn, tip)
         self._auto_grab_var = tk.BooleanVar(value=config.SHOWS_AUTO_GRAB)
-        ttk.Checkbutton(
+        auto_cb = ttk.Checkbutton(
             toolbar, text="Auto-grab missing", variable=self._auto_grab_var,
             command=lambda: self.app._persist_dl_toggle("SHOWS_AUTO_GRAB", self._auto_grab_var),
-        ).pack(side=tk.LEFT, padx=(0, 6))
+        )
+        auto_cb.pack(side=tk.LEFT, padx=(0, 6))
+        add_tooltip(auto_cb, "Every 6 hours, automatically search and download missing episodes "
+                             "for ALL tracked shows. Individual shows can also be marked "
+                             "auto-download from the Upcoming boxes.")
         spinner_label = ttk.Label(toolbar, text="", font=("Segoe UI", 9))
         spinner_label.pack(side=tk.LEFT, padx=(10, 0))
         self._spinner = Spinner(spinner_label)
@@ -123,15 +140,17 @@ class ShowsTab:
         shows_tree_frame.rowconfigure(0, weight=1)
         shows = ttk.Treeview(
             shows_tree_frame,
-            columns=("id", "title", "type", "status", "have", "missing", "next", "flags", "folders"),
+            columns=("id", "title", "type", "status", "have", "missing", "misspct",
+                     "next", "flags", "folders"),
             show="headings", selectmode="extended",
         )
         for col, text, width, stretch in (
-            ("id", "#", 40, False), ("title", "Title", 260, True),
+            ("id", "#", 40, False), ("title", "Title", 250, True),
             ("type", "Type", 60, False), ("status", "Status", 100, False),
             ("have", "Have", 70, False), ("missing", "Missing", 60, False),
+            ("misspct", "% Missing", 70, False),
             ("next", "Next air", 90, False), ("flags", "Flags", 60, False),
-            ("folders", "Folders", 240, True),
+            ("folders", "Folders", 220, True),
         ):
             shows.heading(col, text=text)
             shows.column(col, width=width, anchor=tk.W, stretch=stretch)
@@ -140,6 +159,7 @@ class ShowsTab:
         shows_scroll.grid(row=0, column=1, sticky="ns")
         shows.configure(yscrollcommand=shows_scroll.set)
         shows.bind("<<TreeviewSelect>>", lambda _e: self._show_selected_missing())
+        shows.bind("<Button-3>", self._on_show_right_click)
         make_sortable(shows)
         self._shows_tree = shows
 
@@ -205,11 +225,13 @@ class ShowsTab:
                 continue
             folders = "; ".join(s.folders) if s.folders else "—"
             flags = ("🔕" if s.silenced else "") + ("⬇" if s.auto_grab else "")
+            miss_pct = (f"{s.missing_count / s.episode_count * 100:.0f}%"
+                        if s.episode_count else "")
             self._shows_tree.insert(
                 "", "end", iid=str(s.show_id),
                 values=(s.show_id, s.title, s.media_type, s.status or "?",
                         f"{s.have_count}/{s.episode_count}", s.missing_count,
-                        s.next_air_date or "", flags, folders),
+                        miss_pct, s.next_air_date or "", flags, folders),
             )
             if s.show_id in selected:
                 self._shows_tree.selection_add(str(s.show_id))
@@ -247,9 +269,18 @@ class ShowsTab:
                 listbox.insert(tk.END, f"{marker}{show.title}  S{ep.season:02d}E{ep.episode:02d}{have}")
                 meta.append((show.show_id, f"{show.title} S{ep.season:02d}E{ep.episode:02d}"))
             listbox.bind("<Button-3>", self._on_upcoming_right_click)
+            listbox.bind("<Button-1>", self._on_upcoming_left_click)
             self._upcoming_boxes.append((listbox, meta))
         if hasattr(self.app, "_apply_dark_widget_styles"):
             self.app._apply_dark_widget_styles(self._upcoming_inner)
+
+    def _on_upcoming_left_click(self, event) -> None:
+        """Clicking an already-selected upcoming entry unselects it."""
+        listbox = event.widget
+        index = listbox.nearest(event.y)
+        if index >= 0 and index in listbox.curselection():
+            # The class binding re-selects after us — clear just after it runs.
+            listbox.after(1, lambda: listbox.selection_clear(index))
 
     def _on_upcoming_right_click(self, event) -> None:
         listbox = event.widget
@@ -284,6 +315,148 @@ class ShowsTab:
             command=lambda: self.app.open_downloads_search(query, show.media_type),
         )
         menu.tk_popup(event.x_root, event.y_root)
+
+    # ------------------------------------------------------------------
+    # Tracked-shows right-click menu
+    # ------------------------------------------------------------------
+
+    def _on_show_right_click(self, event) -> None:
+        iid = self._shows_tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in self._shows_tree.selection():
+            self._shows_tree.selection_set(iid)
+        show = shows_store.get_show(int(iid))
+        if show is None:
+            return
+
+        menu = tk.Menu(self._shows_tree, tearoff=0)
+        menu.add_command(label="🔧 Fix match…",
+                         command=lambda: self.open_fix_match_dialog(show.show_id))
+        if show.external_url:
+            import webbrowser
+            menu.add_command(label="🌐 Open DB link",
+                             command=lambda u=show.external_url: webbrowser.open_new_tab(u))
+        menu.add_separator()
+        menu.add_command(
+            label=("🔔 Unsilence releases" if show.silenced else "🔕 Silence releases"),
+            command=lambda: (shows_store.set_show_silenced(show.show_id, not show.silenced),
+                             self.refresh()),
+        )
+        menu.add_command(
+            label=("Stop auto-downloading" if show.auto_grab else "⬇ Auto-download new episodes"),
+            command=lambda: (shows_store.set_show_auto_grab(show.show_id, not show.auto_grab),
+                             self.refresh()),
+        )
+        menu.add_separator()
+        menu.add_command(label="🧹 Send files to Sanitize (Maintenance tab)",
+                         command=lambda: self.app.open_sanitize_for_show(show))
+        menu.add_command(label="Sync this show",
+                         command=self.sync_selected)
+        menu.add_command(label="Untrack", command=self.untrack_selected)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def open_fix_match_dialog(self, show_id: int) -> None:
+        """Re-identify a mismatched show against the trackers by hand."""
+        show = shows_store.get_show(show_id)
+        if show is None:
+            return
+
+        win = tk.Toplevel(self._shows_tree)
+        win.title(f"Fix match — {show.title}")
+        win.geometry("640x420")
+        win.transient(self._shows_tree.winfo_toplevel())
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(2, weight=1)
+
+        folder_hint = Path(show.folders[0]).name if show.folders else show.title
+        ttk.Label(win, text=(f"Currently matched to: {show.title} "
+                             f"({show.source}:{show.external_id})\n"
+                             f"Folder: {folder_hint}"),
+                  justify=tk.LEFT).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+
+        bar = ttk.Frame(win)
+        bar.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        bar.columnconfigure(0, weight=1)
+        query_var = tk.StringVar(value=show_tracker.clean_show_folder_name(folder_hint)[0]
+                                 or show.title)
+        entry = ttk.Entry(bar, textvariable=query_var)
+        entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        status_var = tk.StringVar(value="Search the trackers for the correct match.")
+
+        results_tree = ttk.Treeview(
+            win, columns=("title", "year", "source", "id"),
+            show="headings", selectmode="browse",
+        )
+        for col, text, width in (("title", "Title", 330), ("year", "Year", 60),
+                                 ("source", "Source", 80), ("id", "ID", 90)):
+            results_tree.heading(col, text=text)
+            results_tree.column(col, width=width, anchor=tk.W)
+        results_tree.grid(row=2, column=0, sticky="nsew", padx=10)
+        candidates: list = []
+
+        def do_search() -> None:
+            query = query_var.get().strip()
+            if not query:
+                return
+            status_var.set("Searching trackers…")
+
+            def worker() -> None:
+                from media_lookup import (search_anidb, search_anilist,
+                                          search_tmdb_shows, search_tvdb_shows)
+                found = []
+                try:
+                    if show.media_type == "tv":
+                        found = search_tvdb_shows(query, None) + search_tmdb_shows(query, None)
+                    else:
+                        found = search_anidb(
+                            query, media_type=show.media_type,
+                        ) + search_anilist(query, explicit=(show.media_type == "xanime"))
+                except Exception as exc:
+                    self.app._post_to_ui(lambda: status_var.set(f"Search failed: {exc}"))
+                    return
+                self.app._post_to_ui(lambda: render(found))
+
+            threading.Thread(target=worker, name="fix-match-search", daemon=True).start()
+
+        def render(found) -> None:
+            candidates.clear()
+            candidates.extend(found)
+            for item in results_tree.get_children():
+                results_tree.delete(item)
+            for idx, r in enumerate(found):
+                results_tree.insert("", "end", iid=str(idx),
+                                    values=(r.title, r.year or "", r.source, r.external_id))
+            status_var.set(f"{len(found)} candidate(s) — pick one and click Use Selected.")
+
+        def use_selected() -> None:
+            sel = results_tree.selection()
+            if not sel:
+                return
+            r = candidates[int(sel[0])]
+            outcome, final_id = shows_store.reidentify_show(
+                show.show_id, title=r.title, source=r.source,
+                external_id=r.external_id, external_url=r.external_url or None,
+                year=r.year,
+            )
+            win.destroy()
+            note = ("merged into the existing tracked row"
+                    if outcome == "merged" else f"re-matched to '{r.title}'")
+            self._status_var.set(f"{show.title}: {note} — syncing…")
+            self.refresh()
+            self._run_guarded("Sync show", "shows-fix-match-sync", "Syncing new match…",
+                              lambda: show_tracker.sync_show(final_id), lambda msg: msg)
+
+        ttk.Button(bar, text="Search", command=do_search).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(bar, text="Use Selected", style="Accent.TButton",
+                   command=use_selected).grid(row=0, column=2)
+        entry.bind("<Return>", lambda _e: do_search())
+        ttk.Label(win, textvariable=status_var,
+                  font=("Segoe UI", 9, "italic")).grid(row=3, column=0, sticky="w",
+                                                       padx=10, pady=(4, 10))
+        if hasattr(self.app, "_apply_dark_widget_styles"):
+            self.app._apply_dark_widget_styles(win)
+        do_search()
 
     def open_silenced_dialog(self) -> None:
         """List silenced shows with a Restore button each."""
