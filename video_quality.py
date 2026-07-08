@@ -77,8 +77,41 @@ def _init_probe_cache() -> None:
         conn.commit()
 
 
+_ffprobe_path: str | None = None
+_ffprobe_resolved = False
+
+
+def _find_ffprobe() -> str | None:
+    """ffprobe from PATH, or the usual install spots (choco/winget/scoop/
+    C:\\ffmpeg) — plenty of users have ffmpeg installed but not on PATH."""
+    global _ffprobe_path, _ffprobe_resolved
+    if _ffprobe_resolved:
+        return _ffprobe_path
+    _ffprobe_resolved = True
+
+    found = shutil.which("ffprobe")
+    if found is None:
+        import glob
+        import os
+        candidates = [
+            r"C:\ffmpeg\bin\ffprobe.exe",
+            r"C:\ProgramData\chocolatey\bin\ffprobe.exe",
+            os.path.expandvars(r"%USERPROFILE%\scoop\shims\ffprobe.exe"),
+        ]
+        candidates += glob.glob(os.path.expandvars(
+            r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\*FFmpeg*\**\bin\ffprobe.exe"),
+            recursive=True)
+        found = next((c for c in candidates if Path(c).is_file()), None)
+    if found:
+        logger.info("ffprobe found at %s — exact runtimes enabled.", found)
+    else:
+        logger.info("ffprobe not found — movie runtimes assume 2 h.")
+    _ffprobe_path = found
+    return found
+
+
 def _ffprobe_minutes(path: str) -> float | None:
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = _find_ffprobe()
     if ffprobe is None:
         return None
     try:

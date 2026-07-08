@@ -296,16 +296,19 @@ OMDB_API_KEY: str = os.getenv("OMDB_API_KEY", "").strip()
 
 # ---------------------------------------------------------------------------
 # Ollama — used for fuzzy title matching and 'Other' request categorization
-# Default is a small LOCAL model (llama3.2:3b, ~2 GB) because it works for a
-# brand-new Ollama install with NO account: ":cloud" model tags relay
-# inference through ollama.com and require `ollama signin` first. If you have
-# an Ollama account and prefer cloud inference (no local GPU/CPU load), set a
-# ":cloud" tag — note request text then leaves this machine and is processed
-# by ollama.com under their privacy policy.
+# Default is gemma3:1b: ~815 MB, runs on CPU or ≤1 GB VRAM, so the app never
+# makes a modest machine crawl — and Ollama unloads idle models after ~5 min
+# anyway. The LLM's jobs here are tiny (pick a title from a list, classify a
+# request), and rapidfuzz covers for it when it's absent or wrong.
+# Quality ladder if the box can afford more:
+#   qwen2.5:0.5b (~400 MB, ultra-light) < gemma3:1b (default) <
+#   llama3.2:3b (~2 GB) < any ":cloud" tag (no local load, but requires a
+#   free ollama.com account + `ollama signin`, and request text leaves the
+#   machine — processed by ollama.com under their privacy policy).
 # OLLAMA_HOST defaults to http://localhost:11434 (standard Ollama install).
 # ---------------------------------------------------------------------------
 OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
-OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.2:3b").strip()
+OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemma3:1b").strip()
 
 # ---------------------------------------------------------------------------
 # AniDB — used for xAnime (explicit anime) title lookup

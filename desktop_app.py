@@ -3809,8 +3809,9 @@ class DesktopApp:
                         text="Install Node.js LTS (needed for the torrent Downloads tab)"
                         ).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(step3, variable=ollama_var,
-                        text=("Install Ollama + pull the default cloud model "
-                              "(smarter request understanding; app works fine without it)")
+                        text=("Install Ollama + pull a small local model (~800 MB, "
+                              "CPU-friendly) for smarter request understanding — "
+                              "the app works fine without it")
                         ).grid(row=1, column=0, sticky="w")
         btn_row = ttk.Frame(step3)
         btn_row.grid(row=2, column=0, sticky="w", pady=(6, 0))

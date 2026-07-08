@@ -11,7 +11,7 @@
 #      title, reasoning, and an adult-content flag.
 #
 # Ollama must be running locally (default: http://localhost:11434).
-# Pull the desired model first:  ollama pull gemini2.0-flash
+# Pull the desired model first, e.g.:  ollama pull gemma3:1b
 #
 # All functions are synchronous (blocking).  Call them from a thread executor
 # so the async Telegram event loop is never stalled.
