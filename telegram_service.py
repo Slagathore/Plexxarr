@@ -12,12 +12,22 @@ import config
 from bot import (cmd_button_handler, hardreset_confirm_handler,
                  hardreset_handler, help_handler, launch_handler,
                  libraries_handler, metrics_handler, reindex_handler,
-                 request_handler, requests_handler, reset_handler,
+                 request_handler, requests_handler,
                  search_handler, start_handler, status_handler,
                  welcome_fallback_handler)
 from request_flow import REQUEST_CONV_HANDLER
 
 logger = logging.getLogger(__name__)
+
+# Called (from the bot thread) whenever a NEW access request is filed, so the
+# desktop app can refresh its Users tab immediately instead of waiting for the
+# next poll. Set via set_on_access_request(); must be thread-safe.
+_on_access_request = None
+
+
+def set_on_access_request(callback) -> None:
+    global _on_access_request
+    _on_access_request = callback
 
 
 async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -52,6 +62,11 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
         "Blocked Telegram user id=%s name=%r username=%r (access request: %s)",
         user.id, display_name, user.username, status,
     )
+    if status == "pending" and _on_access_request is not None:
+        try:
+            _on_access_request()
+        except Exception:
+            logger.exception("Access-request notification callback failed.")
     if status == "pending":
         reply = (
             "👋 You're not on this bot's user list yet, so I've sent an "
@@ -100,7 +115,6 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("requests", requests_handler)) # shows queue (no names)
     app.add_handler(CommandHandler("search", search_handler))
     app.add_handler(CommandHandler("reindex", reindex_handler))
-    app.add_handler(CommandHandler("reset", reset_handler))
     app.add_handler(CommandHandler("hardreset", hardreset_handler))
     app.add_handler(CommandHandler("status", status_handler))
     app.add_handler(CallbackQueryHandler(hardreset_confirm_handler, pattern="^hardreset_"))

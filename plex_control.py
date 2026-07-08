@@ -7,11 +7,8 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 import psutil
-import pyautogui
 
 import config
-from icon_finder import (find_exit_menu_item, find_icon,
-                         find_plex_taskbar_icon, find_plex_tray_icon)
 
 logger = logging.getLogger(__name__)
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -232,71 +229,6 @@ def _lingering_plex_processes() -> list[str]:
     return names
 
 
-def _wait_for_plex_exit() -> str | None:
-    """
-    Poll until Plex is gone.
-    Checks immediately (t=0), then waits PLEX_EXIT_GRACE seconds before the
-    first timed poll, then polls every PLEX_EXIT_WAIT seconds up to
-    MAX_EXIT_RETRIES more times.
-    Returns None on success, or an error string if Plex never stopped.
-    """
-    # Immediate check — catches the case where Plex closes in under a second
-    if _is_plex_gone():
-        logger.info("Plex confirmed stopped immediately after exit.")
-        return None
-
-    # Short grace period to let Plex begin its shutdown sequence
-    logger.info(
-        "Plex still running; waiting %.1fs grace period before polling…",
-        config.PLEX_EXIT_GRACE,
-    )
-    time.sleep(config.PLEX_EXIT_GRACE)
-
-    for attempt in range(1, config.MAX_EXIT_RETRIES + 1):
-        if _is_plex_gone():
-            logger.info("Plex confirmed stopped on poll %d.", attempt)
-            return None
-        lingering = _lingering_plex_processes()
-        logger.warning(
-            "Plex still running after poll %d/%d. Processes: %s",
-            attempt,
-            config.MAX_EXIT_RETRIES,
-            lingering,
-        )
-        time.sleep(config.PLEX_EXIT_WAIT)
-
-    lingering = _lingering_plex_processes()
-    return (
-        f"Plex did not shut down after {config.MAX_EXIT_RETRIES} polls "
-        f"({config.PLEX_EXIT_GRACE}s grace + {config.PLEX_EXIT_WAIT}s intervals). "
-        f"Still running: {', '.join(lingering) if lingering else 'unknown'}. "
-        "Please check manually."
-    )
-
-
-def _launch_plex_from_taskbar() -> str:
-    """Click the pinned Plex taskbar icon to launch Plex."""
-    existing_server_pids = _list_primary_plex_server_pids()
-    pos = find_plex_taskbar_icon()
-    if pos is None:
-        return (
-            "Could not find the Plex taskbar icon. "
-            "Ensure assets/taskbar_icon.png is set up correctly."
-        )
-    pyautogui.click(*pos)
-    logger.info(
-        "Clicked taskbar icon at %s. Waiting %.1fs for Plex to start.",
-        pos,
-        config.PLEX_LAUNCH_WAIT,
-    )
-    if _wait_for_plex_start(existing_server_pids):
-        return "Plex launched successfully."
-    return (
-        "Clicked the Plex taskbar icon, but Plex did not appear to start. "
-        "Check the pinned taskbar shortcut manually."
-    )
-
-
 def _wait_for_plex_start(previous_server_pids: set[int] | None = None) -> bool:
     """Wait for the main Plex Media Server executable to appear or restart."""
     existing = previous_server_pids or set()
@@ -344,13 +276,11 @@ def _launch_plex_from_executable() -> str | None:
     )
 
 
-def _launch_plex(allow_taskbar_fallback: bool = True) -> str:
-    """Launch Plex, preferring the configured executable path first."""
+def _launch_plex() -> str:
+    """Launch Plex from the configured executable path."""
     direct_result = _launch_plex_from_executable()
     if direct_result is not None:
         return direct_result
-    if allow_taskbar_fallback:
-        return _launch_plex_from_taskbar()
     return (
         f"Plex executable was not found at '{config.PLEX_MEDIA_SERVER_PATH}'. "
         "Update PLEX_MEDIA_SERVER_PATH in your .env file."
@@ -374,80 +304,6 @@ def _run_exclusive_action(action_name: str, action) -> str:
         return action()
     finally:
         _ACTION_LOCK.release()
-
-
-def _soft_reset_impl() -> str:
-    """
-    Soft reset: right-click tray icon → click Exit → verify stopped → relaunch.
-    Mimics what you'd do manually; least disruptive.
-    """
-    logger.info("Starting soft reset.")
-
-    pos = find_plex_tray_icon()
-    if pos is None:
-        running = not _is_plex_gone()
-        if running:
-            return (
-                "Could not find the Plex tray icon, but Plex IS detected running. "
-                "The tray_icon.png asset likely needs to be recaptured at your current DPI. "
-                "See assets/README.txt for instructions. Try /hardreset as an alternative."
-            )
-        return (
-            "Could not find the Plex tray icon, and Plex does not appear to be running. "
-            "Ensure Plex is started and assets/tray_icon.png is captured. "
-            "See assets/README.txt for instructions."
-        )
-
-    logger.info("Right-clicking tray icon at %s.", pos)
-    pyautogui.rightClick(*pos)
-    time.sleep(0.5)
-
-    exit_pos = find_exit_menu_item()
-    if exit_pos is None:
-        pyautogui.press("escape")
-        return (
-            "Could not find 'Exit Plex Media Server' in the context menu. "
-            "Check assets/exit_menu_item.png."
-        )
-
-    logger.info("Clicking Exit menu item at %s.", exit_pos)
-    pyautogui.click(*exit_pos)
-
-    # Build a narrow region centred on where we found the icon (±100px wide, ±40px tall).
-    # This prevents the taskbar icon from being mistaken for the tray icon still being present.
-    icon_x, icon_y = pos
-    icon_region = (
-        max(0, icon_x - 100),
-        max(0, icon_y - 40),
-        200,   # width
-        80,    # height
-    )
-    logger.info(
-        "Watching region %s for tray icon to disappear (up to 5s)…", icon_region
-    )
-
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        time.sleep(0.5)
-        # locateOnScreen inside find_icon always takes a fresh screenshot each call
-        still_there = find_icon(
-            config.TRAY_ICON_PATH,
-            confidence=config.TRAY_ICON_CONFIDENCE,
-            timeout=0.1,   # single fast attempt per poll
-            region=icon_region,
-        )
-        if still_there is None:
-            logger.info("Tray icon gone from region — Plex has closed.")
-            return _launch_plex()
-
-    return (
-        "Plex tray icon was still visible after 5s. "
-        "Plex may not have fully closed. Try /hardreset."
-    )
-
-
-def soft_reset() -> str:
-    return _run_exclusive_action("Soft reset", _soft_reset_impl)
 
 
 def _hard_reset_impl() -> str:
@@ -522,7 +378,7 @@ def hard_reset() -> str:
 def _launch_plex_impl() -> str:
     """Launch Plex without performing any reset."""
     logger.info("Starting direct Plex launch request.")
-    return _launch_plex(allow_taskbar_fallback=False)
+    return _launch_plex()
 
 
 def launch_plex() -> str:
@@ -552,7 +408,7 @@ def get_status() -> str:
     """
     Return a plain-text diagnostic summary:
     - Which Plex processes (if any) are currently running.
-    - Whether each required image asset file exists on disk.
+    - Whether the configured Plex executable exists on disk.
     """
     # --- process check ---
     plex_procs: list[str] = []
@@ -573,19 +429,6 @@ def get_status() -> str:
     else:
         proc_line = "Plex is NOT running"
 
-    # --- asset check ---
-    asset_checks = [
-        ("Tray icon    ", config.TRAY_ICON_PATH),
-        ("Taskbar icon ", config.TASKBAR_ICON_PATH),
-        ("Tray arrow   ", config.TRAY_EXPAND_ARROW_PATH),
-        ("Exit menu    ", config.EXIT_MENU_ITEM_PATH),
-    ]
-    asset_lines = []
-    for label, path in asset_checks:
-        exists = Path(path).is_file()
-        mark = "OK" if exists else "MISSING"
-        asset_lines.append(f"  [{mark}] {label}: {path}")
-
     plex_exe_path = Path(config.PLEX_MEDIA_SERVER_PATH)
     plex_exe_mark = "OK" if plex_exe_path.is_file() else "MISSING"
 
@@ -595,14 +438,5 @@ def get_status() -> str:
         proc_line,
         "",
         f"Plex executable: [{plex_exe_mark}] {plex_exe_path}",
-        "",
-        "Image assets:",
-        *asset_lines,
-        "",
-        "If any asset is MISSING, screenshot it with Win+Shift+S and save to assets/.",
-        "See assets/README.txt for capture instructions.",
     ]
     return "\n".join(parts)
-
-    # #todo: add a live on-screen test (pyautogui.locateOnScreen) so /status can
-    #        report whether the tray icon is *visible right now*, not just on disk.

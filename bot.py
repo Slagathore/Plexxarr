@@ -2,15 +2,14 @@
 # PlexResetButton — bot.py
 # =============================================================================
 # Mission: Provide a Telegram bot interface for remotely controlling Plex Media
-# Server on a Windows machine. Goals: graceful soft reset via tray icon,
-# forceful hard reset via process kill, live status reporting, and a friendly
+# Server on a Windows machine. Goals: launch, optional hard reset (admin-gated
+# via TELEGRAM_HARD_RESET_ENABLED), live status reporting, and a friendly
 # welcome/help menu so any household member can use the bot without knowing
 # Telegram command syntax.
 #
 # This module owns all Telegram handler logic. It is intentionally decoupled
-# from the Plex control machinery (plex_control.py) and the OS interaction
-# layer (icon_finder.py). Blocking Plex calls are offloaded to a thread
-# executor so the async event loop is never stalled.
+# from the Plex control machinery (plex_control.py). Blocking Plex calls are
+# offloaded to a thread executor so the async event loop is never stalled.
 # =============================================================================
 
 import asyncio
@@ -23,7 +22,8 @@ from library_index import (format_library_summary_message,
                            format_reindex_result_message,
                            format_search_results_message, rebuild_library_index)
 from metrics_report import format_combined_metrics_message
-from plex_control import control_busy, get_status, hard_reset, launch_plex, soft_reset
+import config
+from plex_control import control_busy, get_status, hard_reset, launch_plex
 from queue_store import add_request, format_requests_message, format_requests_message_user
 
 logger = logging.getLogger(__name__)
@@ -32,15 +32,19 @@ logger = logging.getLogger(__name__)
 # Welcome text and shared keyboard shown by /start
 # ---------------------------------------------------------------------------
 
-_WELCOME_TEXT = (
+_WELCOME_BASE = (
     "Hey! I'm your <b>Plex Reset Bot</b>. — Here to keep movie night running smooth.\n\n"
     "<b>Commands:</b>\n"
     "▶️ <b>Launch Plex</b> — Starts Plex Media Server directly from its configured "
     "Windows executable path.\n\n"
-    "🔄 <b>Soft Reset</b> — Gracefully exits Plex via the system "
-    "tray icon and relaunches it. Use this first; least disruptive.\n\n"
+)
+
+_WELCOME_HARD_RESET = (
     "☠️ <b>Hard Reset</b> — Force-kills ALL Plex processes and relaunches. "
-    "Use this if soft reset fails. <i>Will interrupt anyone currently watching.</i>\n\n"
+    "<i>Will interrupt anyone currently watching.</i>\n\n"
+)
+
+_WELCOME_REST = (
     "📝 <b>Request Queue</b> — Use <code>/request &lt;what you want&gt;</code> to add something "
     "to the queue, and <code>/requests</code> to see what is waiting.\n\n"
     "🔎 <b>Library Search</b> — Use <code>/search &lt;title&gt;</code> to search indexed library "
@@ -48,30 +52,34 @@ _WELCOME_TEXT = (
     "Use <code>/reindex</code> for the fallback folder index.\n\n"
     "📈 <b>Metrics</b> — Use <code>/metrics</code> for indexed file counts, Plex usage stats, "
     "and Plex library section counts.\n\n"
-    "📊 <b>Status</b> — Shows whether Plex is currently running and "
-    "whether the image assets the bot uses for screen matching are in place.\n\n"
+    "📊 <b>Status</b> — Shows whether Plex is currently running.\n\n"
     "Tap a button below or type the command:"
 )
 
-_MAIN_KEYBOARD = InlineKeyboardMarkup(
-    [
+
+def _welcome_text() -> str:
+    hard = _WELCOME_HARD_RESET if config.TELEGRAM_HARD_RESET_ENABLED else ""
+    return _WELCOME_BASE + hard + _WELCOME_REST
+
+
+def _main_keyboard() -> InlineKeyboardMarkup:
+    """Built per-message so the hard-reset button honours the live setting."""
+    top_row = [InlineKeyboardButton("▶️ Launch Plex", callback_data="cmd_launch")]
+    if config.TELEGRAM_HARD_RESET_ENABLED:
+        top_row.append(InlineKeyboardButton("☠️ Hard Reset", callback_data="cmd_hardreset"))
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("▶️ Launch Plex", callback_data="cmd_launch"),
-        ],
-        [
-            InlineKeyboardButton("🔄 Soft Reset", callback_data="cmd_reset"),
-            InlineKeyboardButton("☠️ Hard Reset", callback_data="cmd_hardreset"),
-        ],
-        [
-            InlineKeyboardButton("📝 Requests", callback_data="cmd_requests"),
-            InlineKeyboardButton("📊 Status", callback_data="cmd_status"),
-        ],
-        [
-            InlineKeyboardButton("🔎 Library", callback_data="cmd_libraries"),
-            InlineKeyboardButton("📈 Metrics", callback_data="cmd_metrics"),
-        ],
-    ]
-)
+            top_row,
+            [
+                InlineKeyboardButton("📝 Requests", callback_data="cmd_requests"),
+                InlineKeyboardButton("📊 Status", callback_data="cmd_status"),
+            ],
+            [
+                InlineKeyboardButton("🔎 Library", callback_data="cmd_libraries"),
+                InlineKeyboardButton("📈 Metrics", callback_data="cmd_metrics"),
+            ],
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +89,7 @@ _MAIN_KEYBOARD = InlineKeyboardMarkup(
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
-    await update.message.reply_html(_WELCOME_TEXT, reply_markup=_MAIN_KEYBOARD)
+    await update.message.reply_html(_welcome_text(), reply_markup=_main_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +248,8 @@ async def cmd_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if query.data == "cmd_help":
         await context.bot.send_message(
-            chat_id=chat_id, text=_WELCOME_TEXT,
-            reply_markup=_MAIN_KEYBOARD, parse_mode="HTML",
+            chat_id=chat_id, text=_welcome_text(),
+            reply_markup=_main_keyboard(), parse_mode="HTML",
         )
         return
 
@@ -256,18 +264,12 @@ async def cmd_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         result = await loop.run_in_executor(None, launch_plex)
         await context.bot.send_message(chat_id=chat_id, text=result)
 
-    elif query.data == "cmd_reset":
-        if control_busy():
+    elif query.data == "cmd_hardreset":
+        if not config.TELEGRAM_HARD_RESET_ENABLED:
             await context.bot.send_message(
-                chat_id=chat_id, text="A Plex action is already in progress. Please wait."
+                chat_id=chat_id, text="Hard reset via Telegram is disabled by the admin."
             )
             return
-        await context.bot.send_message(chat_id=chat_id, text="🔄 Starting soft reset...")
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, soft_reset)
-        await context.bot.send_message(chat_id=chat_id, text=result)
-
-    elif query.data == "cmd_hardreset":
         if control_busy():
             await context.bot.send_message(
                 chat_id=chat_id, text="A Plex action is already in progress. Please wait."
@@ -334,30 +336,14 @@ async def launch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ---------------------------------------------------------------------------
-# /reset — soft reset
-# ---------------------------------------------------------------------------
-
-async def reset_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
-        return
-    if control_busy():
-        await update.message.reply_text("A Plex action is already in progress. Please wait.")
-        return
-
-    await update.message.reply_text("Starting soft reset...")
-
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, soft_reset)
-
-    await update.message.reply_text(result)
-
-
-# ---------------------------------------------------------------------------
 # /hardreset — confirmation prompt then hard reset
 # ---------------------------------------------------------------------------
 
 async def hardreset_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
+        return
+    if not config.TELEGRAM_HARD_RESET_ENABLED:
+        await update.message.reply_text("Hard reset via Telegram is disabled by the admin.")
         return
     if control_busy():
         await update.message.reply_text("A Plex action is already in progress. Please wait.")
@@ -392,6 +378,9 @@ async def hardreset_confirm_handler(
         return
 
     if query.data == "hardreset_confirm":
+        if not config.TELEGRAM_HARD_RESET_ENABLED:
+            await query.edit_message_text("Hard reset via Telegram is disabled by the admin.")
+            return
         if control_busy():
             await query.edit_message_text("A Plex action is already in progress. Please wait.")
             return

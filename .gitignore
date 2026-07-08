@@ -51,3 +51,4 @@ downloads/
 *.swo
 Thumbs.db
 .DS_Store
+anidb_titles.dat.gz

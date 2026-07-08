@@ -8,7 +8,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 spec_file = globals().get("__file__")
 project_dir = Path(spec_file).resolve().parent if spec_file else Path.cwd().resolve()
 
-datas = [(str(project_dir / "assets"), "assets")]
+datas = []
 # sv-ttk ships its Sun Valley theme as Tcl data files; without collecting them
 # the dark theme silently falls back to the stock gray ttk look in the EXE.
 datas += collect_data_files("sv_ttk")
@@ -23,15 +23,11 @@ for _rf in ("download.mjs", "package.json", "package-lock.json", "diag.mjs"):
 
 hiddenimports = (
     collect_submodules("telegram")
-    + collect_submodules("pyautogui")
     + collect_submodules("pystray")
-    + collect_submodules("mouseinfo")
-    + collect_submodules("pyscreeze")
-    + collect_submodules("pygetwindow")
     # New modules are imported dynamically enough that we pin them explicitly.
     + ["sv_ttk", "send2trash", "shows_tab", "shows_store", "show_tracker",
        "downloads_store", "download_manager", "torrent_search", "torrent_routing",
-       "auth_store", "db"]
+       "auth_store", "db", "ui_helpers", "health"]
 )
 
 

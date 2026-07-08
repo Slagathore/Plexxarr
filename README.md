@@ -1,6 +1,8 @@
 # PlexResetButton
 
-A Windows system-tray application and Telegram bot that lets you remotely **launch, soft-reset, hard-reset, monitor, and manage Plex Media Server** from your phone — without ever touching the server.
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-half%20a%20coffee%20%E2%98%95-ff5f5f)](https://ko-fi.com/sparklemuffin)
+
+A Windows system-tray application and Telegram bot that lets you remotely **launch, hard-reset, monitor, and manage Plex Media Server** from your phone — plus a Sonarr/Radarr-style request queue, show tracker, and torrent download pipeline, all in one app.
 
 ```
 Phone (Telegram) ──► Telegram Bot API ──► PlexResetButton.exe ──► Plex Media Server
@@ -12,12 +14,13 @@ Phone (Telegram) ──► Telegram Bot API ──► PlexResetButton.exe ──
 
 | Category             | Details                                                                                                      |
 | -------------------- | ------------------------------------------------------------------------------------------------------------ |
-| **Telegram control** | Inline keyboard + slash commands: Launch, Soft Reset, Hard Reset, Status, Metrics                            |
-| **Soft reset**       | Gracefully exits Plex via system-tray icon automation (pyautogui image matching) then relaunches             |
+| **Telegram control** | Inline keyboard + slash commands: Launch, Status, Metrics, Requests. Hard Reset is opt-in (Settings tab).    |
 | **Hard reset**       | Force-kills every Plex process tree via `taskkill /F` (runs elevated; never fails silently)                  |
-| **UAC elevation**    | EXE requests admin at launch via `uac_admin=True`; Python script self-elevates with `ShellExecuteW("runas")` |
-| **System tray**      | Lives in the Windows notification area; hides to tray on close                                               |
-| **Request queue**    | Users interacting with the telegram bot are guideed through a library aware and db linking request daemon    |
+| **Request queue**    | Telegram users are guided through a library-aware, DB-linked request flow (TMDB/TVDB/AniDB/AniList)          |
+| **Shows tracker**    | Sonarr-style: scan library folders, identify shows, track episodes/air dates, auto-grab missing episodes     |
+| **Downloads**        | In-app torrent search (YTS/TPB/nyaa/sukebei), webtorrent downloads, automatic rename + routing to libraries  |
+| **Users**            | Telegram allowlist with in-app approval of access requests (updates live when a request arrives)             |
+| **Health**           | One-click server health check, Plex + app update check, dependency and disk-space issues surfaced            |
 | **Library index**    | Indexes your media folders to SQLite for fast search; fallback to Plex API search                            |
 | **Play metrics**     | Per-user play counts, watch time, active sessions, and library section inventory                             |
 | **Plex PIN auth**    | Built-in browser-based PIN flow to obtain and persist your Plex token                                        |
@@ -33,10 +36,10 @@ main.py              Entry point — UAC elevation gate → starts desktop_app
 desktop_app.py       Tkinter GUI + pystray tray icon; owns the app lifecycle
 bot.py               All Telegram command/callback handlers (async)
 telegram_service.py  Runs the python-telegram-bot Application on a background thread
-plex_control.py      Soft reset (pyautogui), hard reset (taskkill), launch, status
-icon_finder.py       pyautogui screen-image search helpers (tray icon, exit menu)
+plex_control.py      Hard reset (taskkill), launch, status
 plex_api.py          Plex HTTP API client — metrics, sessions, library inventory
 plex_auth.py         Plex PIN/token authentication flow (urllib, no extra deps)
+health.py            Health checks + Plex/app update checks (Status tab)
 library_index.py     SQLite-backed filesystem media indexer and searcher
 metrics_report.py    Formats combined metrics message for bot and desktop
 queue_store.py       SQLite request queue — add, complete, list, count
@@ -50,79 +53,61 @@ torrent_runner/      Headless Node webtorrent downloader (npm install once)
 shows_store.py       Tracked-show inventory: shows, folders, episode air dates
 show_tracker.py      Folder scan → tracker identify → episode sync → missing
 shows_tab.py         Shows tab UI (Sonarr-style; first split-out tab module)
+ui_helpers.py        Shared Tk helpers: sortable tree columns, busy spinner
 config.py            Centralised config: reads .env, validates required keys
 app_logging.py       Dual log handler: stderr stream + in-memory ring buffer
-diagnose.py          Standalone DPI/asset diagnostic tool (read-only, safe to run)
 ```
 
 ---
 
-## Prerequisites
+## Setting up on a fresh computer
 
-- **Windows 10 or 11** (64-bit)
-- **Python 3.11+** (if running from source)
-- **Plex Media Server** installed locally (default path auto-detected)
-- A **Telegram bot token** from [@BotFather](https://t.me/BotFather)
+What a new user needs, assuming they got a built EXE folder (`PlexResetButton/` from `dist\`):
 
----
+1. **Windows 10/11 (64-bit)** with **Plex Media Server** installed locally.
+2. **Create a Telegram bot**: message [@BotFather](https://t.me/BotFather), `/newbot`, copy the token.
+3. **First run**: put the app folder anywhere, run `PlexResetButton.exe` (accept the UAC prompt). It will complain that `TELEGRAM_BOT_TOKEN` is missing — create a `.env` file next to the EXE (copy `.env.example`) and paste your token. That is the **only required setting**.
+4. **In the app**: Settings tab → add your library folders (tagged movie/tv/anime/…) → Save. Click **Get Plex Token** to run the browser PIN flow (persists automatically).
+5. **Optional — for request lookups**: free API keys for [TMDB](https://www.themoviedb.org/settings/api) and [TVDB](https://thetvdb.com/api-information) in Settings. Anime identification works offline out of the box (AniDB title dump downloads automatically).
+6. **Optional — for the Downloads tab**: install [Node.js 20+](https://nodejs.org), then run `npm install` once inside the `torrent_runner/` folder next to the EXE.
+7. **Optional — for smarter request understanding**: install [Ollama](https://ollama.com) and set `OLLAMA_MODEL`. Without it, everything still works via rapidfuzz matching.
+8. **Optional**: `setup_autostart.bat` to launch at login without UAC prompts.
+9. Message your bot on Telegram. Unknown users automatically file an access request you approve on the **Users** tab.
 
-## Installation (from source)
+Use the **Status tab → 🩺 Health Check** button to verify every dependency at once.
+
+### Running from source instead
 
 ```powershell
-git clone https://github.com/<you>/PlexResetButton.git
+git clone https://github.com/Slagathore/PlexResetButton.git
 cd PlexResetButton
-
-python -m pip install -r requirements.txt
-
-# Copy the example config and fill in your values
-Copy-Item .env.example .env
-notepad .env
+python -m pip install -r requirements.txt   # Python 3.11+
+Copy-Item .env.example .env ; notepad .env  # paste your bot token
+python main.py
 ```
 
 ---
 
 ## Configuration — `.env`
 
-Copy `.env.example` to `.env` and edit the values. The `.env` file is git-ignored; it never leaves your machine.
+Copy `.env.example` to `.env` and edit the values. The `.env` file is git-ignored; it never leaves your machine. Everything except the bot token can also be edited from the **Settings tab**, which writes back to `.env`.
 
 | Variable                       | Required | Default                                                         | Description                                                 |
 | ------------------------------ | -------- | --------------------------------------------------------------- | ----------------------------------------------------------- |
 | `TELEGRAM_BOT_TOKEN`           | **Yes**  | —                                                               | Bot token from @BotFather                                   |
-| `TELEGRAM_ALLOWED_USER_IDS`    | No       | —                                                               | Comma-separated Telegram user IDs always allowed to use the bot (see Security Notes) |
+| `TELEGRAM_ALLOWED_USER_IDS`    | No       | —                                                               | Comma-separated Telegram user IDs always allowed            |
+| `TELEGRAM_HARD_RESET_ENABLED`  | No       | `false`                                                         | Show the Hard Reset button/command in the Telegram bot      |
 | `PLEX_MEDIA_SERVER_PATH`       | No       | `C:\Program Files\Plex\Plex Media Server\Plex Media Server.exe` | Full path to the Plex executable                            |
 | `PLEX_SERVER_URL`              | No       | `http://127.0.0.1:32400`                                        | Local Plex server URL                                       |
 | `PLEX_TOKEN`                   | No       | —                                                               | Plex authentication token (obtain via the in-app auth flow) |
-| `PLEX_CLIENT_IDENTIFIER`       | No       | —                                                               | Stable client UUID for Plex API requests                    |
-| `PLEX_VERIFY_SSL`              | No       | `false`                                                         | Verify Plex TLS certificate                                 |
-| `PLEX_REQUEST_TIMEOUT_SECONDS` | No       | `10`                                                            | HTTP timeout for Plex API calls                             |
-| `PLEX_HISTORY_FETCH_LIMIT`     | No       | `200`                                                           | Max history records to fetch for metrics                    |
-| `APP_DB_PATH`                  | No       | `plex_reset_button.db`                                          | Path to the SQLite database                                 |
-| `PLEX_LIBRARY_PATHS`           | No       | —                                                               | Semicolon-separated media root paths for local indexing     |
-| `LIBRARY_INDEX_EXTENSIONS`     | No       | `.mkv;.mp4;…`                                                   | File extensions to index                                    |
-| `LIBRARY_SEARCH_RESULT_LIMIT`  | No       | `25`                                                            | Max search results returned                                 |
-| `PLEX_EXIT_WAIT`               | No       | `3`                                                             | Seconds between each "did Plex exit?" poll                  |
-| `PLEX_EXIT_GRACE`              | No       | `3`                                                             | Initial grace period before polling starts                  |
-| `PLEX_LAUNCH_WAIT`             | No       | `5`                                                             | Seconds to wait after launching Plex                        |
-| `MAX_EXIT_RETRIES`             | No       | `10`                                                            | Poll attempts before giving up on soft reset                |
-| `TRAY_ICON_CONFIDENCE`         | No       | `0.85`                                                          | pyautogui confidence for tray icon match                    |
-| `TASKBAR_ICON_CONFIDENCE`      | No       | `0.85`                                                          | pyautogui confidence for taskbar icon match                 |
-| `ADMIN_STATUS_REFRESH_SECONDS` | No       | `15`                                                            | How often the desktop UI polls Plex status                  |
+| `MEDIA_LIBRARY_PATHS`          | No       | —                                                               | Typed library folders (edit via Settings tab)               |
+| `TMDB_API_KEY` / `TVDB_API_KEY`| No       | —                                                               | Free keys for movie/TV request lookups                      |
+| `OLLAMA_HOST` / `OLLAMA_MODEL` | No       | `localhost:11434`                                               | Optional LLM for request categorization                     |
+| `TORRENT_DOWNLOAD_DIR`         | No       | `downloads/`                                                    | Torrent staging folder                                      |
+| `SIZE_PREF_MB_PER_MIN_*`       | No       | `0`                                                             | Preferred download size per type (MB per minute; 0 = off)   |
+| `SHOWS_AUTO_GRAB`              | No       | `false`                                                         | Auto-download missing episodes of tracked shows             |
 
----
-
-## Running
-
-### Option A — Python script (development)
-
-```powershell
-python main.py
-```
-
-On first run the app will trigger a UAC prompt to request administrator privileges. This is required to reliably force-kill Plex processes. Accept it once; subsequent runs will also prompt (or configure auto-start below).
-
-### Option B — Compiled EXE
-
-See **Building the EXE** below. The EXE requests elevation automatically at launch via its embedded manifest (`uac_admin=True` in the PyInstaller spec).
+(Plus timing/limit knobs — see `.env.example` for the full annotated list.)
 
 ---
 
@@ -144,17 +129,7 @@ Requirements: `python -m pip install -r requirements-build.txt` (just PyInstalle
 setup_autostart.bat
 ```
 
-Registers a Windows Task Scheduler entry that:
-
-- Triggers on every login (`/sc onlogon`)
-- Runs at **highest privilege** (`/rl highest`) — no UAC prompt on startup
-- Prefers the compiled EXE; falls back to `pythonw.exe main.py`
-
-To remove:
-
-```bat
-remove_autostart.bat
-```
+Registers a Windows Task Scheduler entry that triggers on login, runs at highest privilege (no UAC prompt), prefers the compiled EXE, and falls back to `pythonw.exe main.py`. Remove with `remove_autostart.bat`.
 
 ---
 
@@ -164,29 +139,14 @@ remove_autostart.bat
 | ----------------- | ----------------------------------------------------------------------------- |
 | `/start`          | Show welcome message and inline keyboard                                      |
 | `/launch`         | Start Plex Media Server                                                       |
-| `/reset`          | Soft reset (graceful tray exit + relaunch)                                    |
-| `/hardreset`      | Hard reset (force-kill all Plex processes + relaunch) — asks for confirmation |
-| `/status`         | Show whether Plex is running and asset health                                 |
+| `/hardreset`      | Hard reset (force-kill + relaunch) — only if enabled in Settings; confirms first |
+| `/status`         | Show whether Plex is running                                                  |
 | `/request <text>` | Add a watch request to the queue                                              |
 | `/requests`       | List all open requests                                                        |
 | `/search <title>` | Search the media library                                                      |
 | `/reindex`        | Rebuild the local filesystem library index                                    |
 | `/libraries`      | Show library summary                                                          |
 | `/metrics`        | Show play counts, watch time, sessions, library counts                        |
-
----
-
-## Screen-Matching Assets (`assets/`)
-
-The soft-reset flow uses `pyautogui.locateOnScreen` to find the Plex tray icon and exit menu item. The reference images in `assets/` must match your screen's DPI and theme.
-
-If the soft reset fails to find the tray icon, run the diagnostic tool:
-
-```powershell
-python diagnose.py
-```
-
-It captures a screenshot, reports your DPI/scale factor, and saves a cropped tray region to `debug_tray_corner.png` so you can re-capture a matching reference image.
 
 ---
 
@@ -204,20 +164,23 @@ To enable API-based features (metrics, library search, session data) you need a 
 
 ## Security Notes
 
-- **The bot only answers allowlisted Telegram users.** The allowlist lives in
-  the app database (`allowed_users` table), seeded on first run from everyone
-  who previously filed a request; each seeded name is pinned to a numeric
-  Telegram ID the first time that user messages the bot. Denied users are
-  shown their numeric ID — add it to `TELEGRAM_ALLOWED_USER_IDS` in `.env`
-  (or via the Settings tab) to let them in.
-- Your `.env` file is git-ignored and never committed
-- The Telegram bot token grants full control of the bot — treat it like a password
-- The Plex token is stored locally in `.env` only
-- The app only responds to Telegram updates delivered to your bot; no ports are opened
+- **The bot only answers allowlisted Telegram users.** Unknown users file an
+  access request that appears instantly on the desktop app's Users tab for
+  approval or denial. The allowlist lives in the app database.
+- **Hard reset via Telegram is off by default** — enable it in Settings only
+  if you're comfortable with remote users force-killing Plex mid-stream.
+- Your `.env` file is git-ignored and never committed.
+- The Telegram bot token grants full control of the bot — treat it like a password.
+- The Plex token is stored locally in `.env` only.
+- The app only responds to Telegram updates delivered to your bot; no ports are opened.
 - Note: the default `OLLAMA_MODEL` ends in `:cloud`, which relays request text
   through Ollama's hosted service. Use a local model tag to keep inference on-box.
 
 ---
+
+## Support
+
+If this app keeps your movie nights running, consider [buying me half a coffee](https://ko-fi.com/sparklemuffin). ☕
 
 ## Acknowledgements
 

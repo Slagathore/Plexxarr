@@ -15,9 +15,24 @@ def test_parse_episode_standard_forms():
 
 
 def test_parse_episode_absolute_anime_numbering():
-    assert _parse_episode_from_file("[SubsPlease] Frieren - 12 (1080p) [ABCD].mkv") == (1, 12)
+    # Season None = "not in the filename"; the folder scanner derives it from
+    # the parent "Season NN" folder, defaulting to 1 for flat folders.
+    assert _parse_episode_from_file("[SubsPlease] Frieren - 12 (1080p) [ABCD].mkv") == (None, 12)
     # Resolution and year tokens must not be mistaken for episode numbers.
-    assert _parse_episode_from_file("[Group] Show - 03 [720p][2023].mkv") == (1, 3)
+    assert _parse_episode_from_file("[Group] Show - 03 [720p][2023].mkv") == (None, 3)
+
+
+def test_parse_episode_word_form():
+    # DVD-rip style "Episode NN - Title" (season comes from the folder).
+    assert _parse_episode_from_file("Episode 05 - Stan of Arabia - Part 1.mp4") == (None, 5)
+
+
+def test_scan_derives_season_from_folder(tmp_path):
+    show = tmp_path / "Folder Show"
+    (show / "Season 02").mkdir(parents=True)
+    (show / "Season 02" / "Episode 03 - Some Title.mp4").write_bytes(b"x")
+    found = show_tracker._scan_folders_for_episodes((str(show),))
+    assert (2, 3) in found
 
 
 def test_parse_episode_no_number():

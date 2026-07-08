@@ -22,7 +22,7 @@ from metrics_report import format_combined_metrics_message
 from plex_auth import (PlexPinSession, PlexTokenResult, launch_auth_browser,
                        save_plex_credentials, start_plex_pin_login,
                        wait_for_plex_token)
-from plex_control import get_status, hard_reset, is_plex_running, launch_plex, soft_reset
+from plex_control import get_status, hard_reset, is_plex_running, launch_plex
 from maintenance import (
     DuplicateGroup, LibraryInventory, SanitizePair, ShowInventory,
     UnindexedFile, apply_sanitization, daily_library_check,
@@ -39,10 +39,13 @@ from telegram_service import TelegramBotService
 
 import auth_store
 import downloads_store
+import telegram_service
 import torrent_routing
 from download_manager import DownloadManager
+from health import format_health_report
 from shows_tab import ShowsTab
 from torrent_search import TorrentResult, format_size, search_torrents
+from ui_helpers import make_sortable
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +176,7 @@ class DesktopApp:
         self._downloads_tab: ttk.Frame | None = None
         # Settings tab state — declared in _build_settings_tab
         self._settings_vars: dict[str, tk.Variable] = {}
+        self._size_pref_keys: list[str] = []
         self._settings_paths: list[tuple[str, str]] = []  # (path, media_type)
         self._settings_paths_tree: ttk.Treeview | None = None
         self._settings_status_var = tk.StringVar(value="")
@@ -187,6 +191,11 @@ class DesktopApp:
 
         self._build_ui()
         self._apply_dark_widget_styles(self.root)
+        # New Telegram access requests refresh the Users tab immediately (the
+        # callback fires on the bot thread; marshal to the UI thread).
+        telegram_service.set_on_access_request(
+            lambda: self._post_to_ui(self.refresh_users_tab)
+        )
 
     def _apply_dark_widget_styles(self, root_widget: tk.Misc) -> None:
         """Restyle plain-tk widgets (Text/ScrolledText/Canvas) for the dark theme.
@@ -207,6 +216,14 @@ class DesktopApp:
                         insertbackground="#e8e8e8",
                         selectbackground="#264f78",
                         relief=tk.FLAT, borderwidth=1,
+                    )
+                elif isinstance(child, tk.Listbox):
+                    child.configure(
+                        bg="#1e1e1e", fg="#e8e8e8",
+                        selectbackground="#264f78",
+                        selectforeground="#ffffff",
+                        relief=tk.FLAT, borderwidth=1,
+                        highlightthickness=0,
                     )
                 elif isinstance(child, tk.Canvas):
                     child.configure(bg="#1c1c1c", highlightthickness=0)
@@ -253,8 +270,7 @@ class DesktopApp:
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(2, weight=1)
-        self.root.rowconfigure(4, weight=1)
+        self.root.rowconfigure(3, weight=1)
 
         header = ttk.Frame(self.root, padding=16)
         header.grid(row=0, column=0, sticky="ew")
@@ -284,19 +300,30 @@ class DesktopApp:
         ttk.Label(header, textvariable=self.queue_var).grid(row=4, column=0, sticky="w", pady=(4, 0))
         ttk.Label(header, textvariable=self.library_var).grid(row=5, column=0, sticky="w", pady=(4, 0))
 
+        # Ko-fi support link — sits above the action buttons.
+        kofi_row = ttk.Frame(self.root, padding=(16, 0, 16, 4))
+        kofi_row.grid(row=1, column=0, sticky="ew")
+        kofi_label = ttk.Label(
+            kofi_row,
+            text="☕ Enjoying this app? Buy me half a coffee on Ko-fi",
+            foreground="#ff5f5f", cursor="hand2",
+            font=("Segoe UI", 10, "underline"),
+        )
+        kofi_label.pack(side=tk.LEFT)
+        kofi_label.bind("<Button-1>", lambda _e: webbrowser.open_new_tab(config.KOFI_URL))
+
         actions = ttk.Frame(self.root, padding=(16, 0, 16, 12))
-        actions.grid(row=1, column=0, sticky="ew")
-        for index in range(5):
+        actions.grid(row=2, column=0, sticky="ew")
+        for index in range(4):
             actions.columnconfigure(index, weight=1)
 
         ttk.Button(actions, text="Launch Plex", style="Accent.TButton", command=lambda: self.run_action("Launch Plex", launch_plex)).grid(row=0, column=0, padx=4, sticky="ew")
-        ttk.Button(actions, text="Soft Reset", command=lambda: self.run_action("Soft Reset", soft_reset)).grid(row=0, column=1, padx=4, sticky="ew")
-        ttk.Button(actions, text="⚠ Hard Reset", style="Danger.TButton", command=self.confirm_hard_reset).grid(row=0, column=2, padx=4, sticky="ew")
-        ttk.Button(actions, text="Refresh Status", command=self.refresh_status).grid(row=0, column=3, padx=4, sticky="ew")
-        ttk.Button(actions, text="Get Plex Token", command=self.authenticate_plex_account).grid(row=0, column=4, padx=4, sticky="ew")
+        ttk.Button(actions, text="⚠ Hard Reset", style="Danger.TButton", command=self.confirm_hard_reset).grid(row=0, column=1, padx=4, sticky="ew")
+        ttk.Button(actions, text="Refresh Status", command=self.refresh_status).grid(row=0, column=2, padx=4, sticky="ew")
+        ttk.Button(actions, text="Get Plex Token", command=self.authenticate_plex_account).grid(row=0, column=3, padx=4, sticky="ew")
 
         notebook = ttk.Notebook(self.root)
-        notebook.grid(row=2, column=0, padx=16, pady=(0, 12), sticky="nsew")
+        notebook.grid(row=3, column=0, padx=16, pady=(0, 12), sticky="nsew")
 
         status_tab = ttk.Frame(notebook, padding=12)
         requests_tab = ttk.Frame(notebook, padding=12)
@@ -328,7 +355,7 @@ class DesktopApp:
         self.shows_tab = ShowsTab(shows_tab, self)
 
         status_tab.columnconfigure(0, weight=1)
-        status_tab.rowconfigure(0, weight=1)
+        status_tab.rowconfigure(1, weight=1)
         requests_tab.columnconfigure(0, weight=1)
         requests_tab.rowconfigure(1, weight=1)
         requests_tab.rowconfigure(2, weight=0)
@@ -341,10 +368,19 @@ class DesktopApp:
         logs_tab.columnconfigure(0, weight=1)
         logs_tab.rowconfigure(0, weight=1)
 
+        status_toolbar = ttk.Frame(status_tab)
+        status_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Button(status_toolbar, text="🩺 Health Check",
+                   command=lambda: self.run_health_check(include_updates=False)).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(status_toolbar, text="⬆ Health + Update Check",
+                   command=lambda: self.run_health_check(include_updates=True)).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(status_toolbar, text="Plex Status",
+                   command=self.refresh_status).grid(row=0, column=2)
+
         self.status_text = scrolledtext.ScrolledText(
             status_tab, wrap=tk.WORD, height=14, font=("Consolas", 10), state=tk.DISABLED,
         )
-        self.status_text.grid(row=0, column=0, sticky="nsew")
+        self.status_text.grid(row=1, column=0, sticky="nsew")
 
         requests_toolbar = ttk.Frame(requests_tab)
         requests_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -526,7 +562,7 @@ class DesktopApp:
         self.log_text.grid(row=0, column=0, sticky="nsew")
 
         summary = ttk.Frame(self.root, padding=(16, 0, 16, 16))
-        summary.grid(row=3, column=0, sticky="ew")
+        summary.grid(row=4, column=0, sticky="ew")
         ttk.Label(summary, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
 
     # =====================================================================
@@ -538,7 +574,6 @@ class DesktopApp:
         menu = Menu(
             MenuItem("Show Admin", lambda icon, item: self.show_window()),
             MenuItem("Launch Plex", lambda icon, item: self.run_action("Launch Plex", launch_plex)),
-            MenuItem("Soft Reset", lambda icon, item: self.run_action("Soft Reset", soft_reset)),
             MenuItem("Hard Reset", lambda icon, item: self.confirm_hard_reset(from_tray=True)),
             MenuItem("Refresh Status", lambda icon, item: self.refresh_status()),
             MenuItem("Get Plex Token", lambda icon, item: self.authenticate_plex_account()),
@@ -547,20 +582,6 @@ class DesktopApp:
         return Icon("PlexResetButton", image, "Plex Reset Button", menu)
 
     def _create_tray_image(self) -> PillowImage:
-        asset_path = Path(config.TASKBAR_ICON_PATH)
-        if asset_path.is_file():
-            try:
-                base = Image.open(asset_path).convert("RGBA")
-                icon = Image.new("RGBA", (64, 64), (24, 28, 36, 255))
-                resized = base.copy()
-                resized.thumbnail((44, 44))
-                left = (64 - resized.width) // 2
-                top = (64 - resized.height) // 2
-                icon.paste(resized, (left, top), resized)
-                return icon
-            except OSError:
-                logger.warning("Could not load %s for tray icon; using fallback image.", asset_path)
-
         icon = Image.new("RGBA", (64, 64), (24, 28, 36, 255))
         draw = ImageDraw.Draw(icon)
         draw.rounded_rectangle((8, 8, 56, 56), radius=12, fill=(227, 88, 51, 255))
@@ -690,10 +711,25 @@ class DesktopApp:
             lines.append("[PENDING]  Not yet checked against library")
 
         detail = "\n".join(lines)
-        self.request_detail_text.configure(state=tk.NORMAL)
-        self.request_detail_text.delete("1.0", tk.END)
-        self.request_detail_text.insert("1.0", detail)
-        self.request_detail_text.configure(state=tk.DISABLED)
+        text = self.request_detail_text
+        text.configure(state=tk.NORMAL)
+        text.delete("1.0", tk.END)
+        text.insert("1.0", detail)
+        # Make the DB link an actual hyperlink (blue, hand cursor, click to open).
+        if req.external_url:
+            start = text.search(req.external_url, "1.0", tk.END)
+            if start:
+                end = f"{start}+{len(req.external_url)}c"
+                url = req.external_url
+                text.tag_add("dblink", start, end)
+                text.tag_configure("dblink", foreground="#4da3ff", underline=True)
+                text.tag_bind("dblink", "<Button-1>",
+                              lambda _e, u=url: webbrowser.open_new_tab(u))
+                text.tag_bind("dblink", "<Enter>",
+                              lambda _e: text.configure(cursor="hand2"))
+                text.tag_bind("dblink", "<Leave>",
+                              lambda _e: text.configure(cursor=""))
+        text.configure(state=tk.DISABLED)
 
     def add_request_from_ui(self) -> None:
         requester = self.requester_var.get().strip() or "Admin"
@@ -838,6 +874,18 @@ class DesktopApp:
     def refresh_status(self) -> None:
         self._update_plex_indicator()
         self.run_action("Refresh Status", get_status, show_popup=False, update_status_only=True)
+
+    def run_health_check(self, *, include_updates: bool = False) -> None:
+        """Render the health (and optionally update) report into the Status tab."""
+        label = "Health + Update Check" if include_updates else "Health Check"
+        self.status_var.set(f"Running {label.lower()}…")
+        bot_running = self.bot_service.running
+        self.run_action(
+            label,
+            lambda: format_health_report(bot_running=bot_running,
+                                         include_updates=include_updates),
+            show_popup=False, update_status_only=True,
+        )
 
     def _update_plex_indicator(self) -> None:
         """Refresh the header's Plex ● dot from a cheap process scan."""
@@ -1095,9 +1143,7 @@ class DesktopApp:
 
     def _build_downloads_tab(self, tab: ttk.Frame) -> None:
         tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(2, weight=2)
-        tab.rowconfigure(5, weight=2)
-        tab.rowconfigure(7, weight=1)
+        tab.rowconfigure(2, weight=1)
 
         toolbar = ttk.Frame(tab)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -1131,9 +1177,16 @@ class DesktopApp:
         ttk.Label(options, textvariable=self._dl_plan_var, foreground=_MUTED_TEXT,
                   font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT, padx=(8, 0))
 
+        panes = ttk.PanedWindow(tab, orient=tk.VERTICAL)
+        panes.grid(row=2, column=0, sticky="nsew")
+
+        results_frame = ttk.LabelFrame(panes, text="Search results", padding=4)
+        panes.add(results_frame, weight=2)
+        results_frame.columnconfigure(0, weight=1)
+        results_frame.rowconfigure(0, weight=1)
         results_tree = ttk.Treeview(
-            tab, columns=("title", "size", "seeders", "source"),
-            show="headings", height=7, selectmode="browse",
+            results_frame, columns=("title", "size", "seeders", "source"),
+            show="headings", selectmode="browse",
         )
         results_tree.heading("title", text="Title")
         results_tree.heading("size", text="Size")
@@ -1143,23 +1196,31 @@ class DesktopApp:
         results_tree.column("size", width=90, anchor=tk.E, stretch=False)
         results_tree.column("seeders", width=70, anchor=tk.E, stretch=False)
         results_tree.column("source", width=80, anchor=tk.W, stretch=False)
-        results_tree.grid(row=2, column=0, sticky="nsew")
+        results_tree.grid(row=0, column=0, sticky="nsew")
+        results_scroll = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=results_tree.yview)
+        results_scroll.grid(row=0, column=1, sticky="ns")
+        results_tree.configure(yscrollcommand=results_scroll.set)
         results_tree.bind("<<TreeviewSelect>>", lambda _e: self._preview_route_for_selected_result())
         results_tree.bind("<Double-1>", lambda _e: self.download_selected_result())
+        make_sortable(results_tree)
         self._dl_results_tree = results_tree
 
-        dl_bar = ttk.Frame(tab)
-        dl_bar.grid(row=3, column=0, sticky="ew", pady=(10, 4))
-        ttk.Label(dl_bar, text="Downloads", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
-        ttk.Label(dl_bar, textvariable=self._dl_status_var, foreground=_MUTED_TEXT).pack(side=tk.LEFT, padx=(10, 0))
+        downloads_frame = ttk.LabelFrame(panes, text="Downloads", padding=4)
+        panes.add(downloads_frame, weight=2)
+        downloads_frame.columnconfigure(0, weight=1)
+        downloads_frame.rowconfigure(1, weight=1)
+
+        dl_bar = ttk.Frame(downloads_frame)
+        dl_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        ttk.Label(dl_bar, textvariable=self._dl_status_var, foreground=_MUTED_TEXT).pack(side=tk.LEFT)
         ttk.Button(dl_bar, text="Open Staging Folder", command=self.open_staging_folder).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(dl_bar, text="Cancel", command=self.cancel_selected_download).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(dl_bar, text="Apply Route", command=self.apply_route_to_selected_download).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(dl_bar, text="Refresh", command=self.refresh_downloads).pack(side=tk.RIGHT, padx=(6, 0))
 
         downloads_tree = ttk.Treeview(
-            tab, columns=("id", "title", "status", "progress", "route"),
-            show="headings", height=7, selectmode="browse",
+            downloads_frame, columns=("id", "title", "status", "progress", "route"),
+            show="headings", selectmode="browse",
         )
         for col, text, width, anchor, stretch in (
             ("id", "ID", 40, tk.E, False),
@@ -1170,14 +1231,21 @@ class DesktopApp:
         ):
             downloads_tree.heading(col, text=text)
             downloads_tree.column(col, width=width, anchor=cast(Any, anchor), stretch=stretch)
-        downloads_tree.grid(row=5, column=0, sticky="nsew")
+        downloads_tree.grid(row=1, column=0, sticky="nsew")
+        downloads_scroll = ttk.Scrollbar(downloads_frame, orient=tk.VERTICAL, command=downloads_tree.yview)
+        downloads_scroll.grid(row=1, column=1, sticky="ns")
+        downloads_tree.configure(yscrollcommand=downloads_scroll.set)
+        make_sortable(downloads_tree)
         self._dl_downloads_tree = downloads_tree
 
-        ttk.Label(tab, text="History (downloads / renames / moves — before → after)",
-                  font=("Segoe UI", 10, "bold")).grid(row=6, column=0, sticky="w", pady=(10, 4))
+        history_frame = ttk.LabelFrame(
+            panes, text="History (downloads / renames / moves — before → after)", padding=4)
+        panes.add(history_frame, weight=1)
+        history_frame.columnconfigure(0, weight=1)
+        history_frame.rowconfigure(0, weight=1)
         history_tree = ttk.Treeview(
-            tab, columns=("at", "action", "before", "after"),
-            show="headings", height=5, selectmode="browse",
+            history_frame, columns=("at", "action", "before", "after"),
+            show="headings", selectmode="browse",
         )
         for col, text, width, anchor, stretch in (
             ("at", "When", 130, tk.W, False),
@@ -1187,7 +1255,11 @@ class DesktopApp:
         ):
             history_tree.heading(col, text=text)
             history_tree.column(col, width=width, anchor=cast(Any, anchor), stretch=stretch)
-        history_tree.grid(row=7, column=0, sticky="nsew")
+        history_tree.grid(row=0, column=0, sticky="nsew")
+        history_scroll = ttk.Scrollbar(history_frame, orient=tk.VERTICAL, command=history_tree.yview)
+        history_scroll.grid(row=0, column=1, sticky="ns")
+        history_tree.configure(yscrollcommand=history_scroll.set)
+        make_sortable(history_tree)
         self._dl_history_tree = history_tree
 
     def _on_download_update(self, download_id: int) -> None:
@@ -1598,6 +1670,7 @@ class DesktopApp:
         self.refresh_requests()
         self.refresh_library_summary()
         self.refresh_library_metrics()
+        self.refresh_users_tab()  # keep the pending-request badge current
         self._schedule_status_refresh()
 
     def _refresh_logs(self) -> None:
@@ -2561,6 +2634,7 @@ class DesktopApp:
         # Telegram
         ("TELEGRAM_BOT_TOKEN", "Bot Token", "secret"),
         ("TELEGRAM_ALLOWED_USER_IDS", "Allowed Telegram user IDs (comma-sep)", "text"),
+        ("TELEGRAM_HARD_RESET_ENABLED", "Show Hard Reset button in the Telegram bot", "bool"),
         # Plex API
         ("PLEX_SERVER_URL", "Plex Server URL", "text"),
         ("PLEX_TOKEN", "Plex Auth Token", "secret"),
@@ -2736,9 +2810,12 @@ class DesktopApp:
 
             self._settings_vars[key] = var
 
+        # ---- Download size preferences --------------------------------------
+        self._build_size_pref_section(inner)
+
         # ---- Save / Reload bar ---------------------------------------------
         button_bar = ttk.Frame(inner)
-        button_bar.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        button_bar.grid(row=3, column=0, sticky="ew", pady=(4, 0))
         button_bar.columnconfigure(0, weight=1)
 
         ttk.Label(button_bar, textvariable=self._settings_status_var,
@@ -2750,6 +2827,60 @@ class DesktopApp:
 
         # Populate the path list from current config.
         self._settings_load_paths_from_config()
+
+    # Size preference: (env key, label, minutes of runtime for the total-size
+    # preview). Movies preview against a 2 h runtime; episodic content 30 min.
+    _SIZE_PREF_FIELDS: tuple[tuple[str, str, int], ...] = (
+        ("SIZE_PREF_MB_PER_MIN_MOVIE", "Movies", 120),
+        ("SIZE_PREF_MB_PER_MIN_TV", "TV shows", 30),
+        ("SIZE_PREF_MB_PER_MIN_ANIME", "Anime", 30),
+        ("SIZE_PREF_MB_PER_MIN_XANIME", "Hentai / xAnime", 30),
+    )
+
+    def _build_size_pref_section(self, inner: ttk.Frame) -> None:
+        """Per-type preferred download size sliders.
+
+        MB/min is the real metric the downloader follows; the total shown
+        next to it (2 h for movies, 30 min for episodes) is just a guideline
+        so the number is easy to feel out. 0 = no preference.
+        """
+        frame = ttk.LabelFrame(inner, text="Preferred download size (0 = no preference)", padding=10)
+        frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            frame,
+            text=("Drag to set a target bitrate per media type. MB/min is what the "
+                  "downloader matches against; the ≈ total is what that works out "
+                  "to for a typical runtime (movies 2 h, episodes 30 min)."),
+            wraplength=720, foreground=_MUTED_TEXT,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
+        for row, (key, label, minutes) in enumerate(self._SIZE_PREF_FIELDS, start=1):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
+            var = tk.DoubleVar(value=float(getattr(config, key, 0.0)))
+            readout = tk.StringVar()
+
+            def update_readout(_v: str = "", *, var=var, readout=readout, minutes=minutes) -> None:
+                mb_min = round(float(var.get()) * 2) / 2  # snap to 0.5 steps
+                var.set(mb_min)
+                if mb_min <= 0:
+                    readout.set("no preference")
+                    return
+                total_mb = mb_min * minutes
+                total = (f"{total_mb / 1024:.1f} GB" if total_mb >= 1024
+                         else f"{total_mb:.0f} MB")
+                runtime = "2 h movie" if minutes == 120 else "30 min episode"
+                readout.set(f"{mb_min:.1f} MB/min  ≈  {total} per {runtime}")
+
+            scale = ttk.Scale(frame, from_=0.0, to=60.0, variable=var,
+                              command=update_readout)
+            scale.grid(row=row, column=1, sticky="ew", pady=3)
+            ttk.Label(frame, textvariable=readout, width=34).grid(
+                row=row, column=2, sticky="w", padx=(10, 0), pady=3)
+            update_readout()
+            self._settings_vars[key] = var
+            self._size_pref_keys.append(key)
 
     # ---- Settings helpers ---------------------------------------------------
 
@@ -2845,6 +2976,11 @@ class DesktopApp:
             value = current_values.get(key, self._format_config_value(getattr(config, key, "")))
             if isinstance(var, tk.BooleanVar):
                 var.set(value.strip().lower() in {"1", "true", "yes", "on"})
+            elif isinstance(var, tk.DoubleVar):
+                try:
+                    var.set(float(value) if value.strip() else 0.0)
+                except ValueError:
+                    var.set(0.0)
             else:
                 var.set(value)
         self._settings_load_paths_from_config()
@@ -2873,6 +3009,15 @@ class DesktopApp:
                     errors.append(f"{key} must be an integer (got '{raw}')")
                     continue
             updates[key] = raw
+
+        # Size-preference sliders (DoubleVars registered by
+        # _build_size_pref_section; "0" means no preference → drop the key).
+        for key in self._size_pref_keys:
+            var = self._settings_vars.get(key)
+            if var is None:
+                continue
+            value = float(var.get())
+            updates[key] = f"{value:g}" if value > 0 else ""
 
         # Encode the path list. Always write MEDIA_LIBRARY_PATHS, and clear
         # PLEX_LIBRARY_PATHS so we don't keep a stale legacy fallback active.

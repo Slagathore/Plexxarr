@@ -76,6 +76,11 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("tracked_shows", "next_air_date", "TEXT"),
     ("tracked_shows", "next_season", "INTEGER"),
     ("tracked_shows", "next_episode", "INTEGER"),
+    # Per-show release controls: silenced hides the show from Upcoming;
+    # auto_grab downloads its episodes on release even when the global
+    # Shows auto-grab toggle is off.
+    ("tracked_shows", "silenced", "INTEGER NOT NULL DEFAULT 0"),
+    ("tracked_shows", "auto_grab", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -106,6 +111,8 @@ class TrackedShow:
     next_season: int | None = None
     next_episode: int | None = None
     tmdb_id: str | None = None
+    silenced: bool = False
+    auto_grab: bool = False
 
 
 @dataclass(frozen=True)
@@ -205,7 +212,7 @@ def list_shows() -> list[TrackedShow]:
                    COALESCE(s.next_air_date,
                             (SELECT MIN(e.air_date) FROM episodes e WHERE e.show_id = s.id
                                  AND e.air_date IS NOT NULL AND e.air_date > ?)),
-                   s.next_season, s.next_episode, s.tmdb_id
+                   s.next_season, s.next_episode, s.tmdb_id, s.silenced, s.auto_grab
             FROM tracked_shows s ORDER BY s.title COLLATE NOCASE
             """,
             (today, today),
@@ -224,7 +231,7 @@ def list_shows() -> list[TrackedShow]:
             folders=tuple(folders.get(r[0], [])),
             episode_count=r[10], have_count=r[11], missing_count=r[12],
             next_air_date=r[13], next_season=r[14], next_episode=r[15],
-            tmdb_id=r[16],
+            tmdb_id=r[16], silenced=bool(r[17]), auto_grab=bool(r[18]),
         )
         for r in rows
     ]
@@ -249,6 +256,68 @@ def replace_episodes(show_id: int, episodes: list) -> None:
             (show_id,),
         )
         conn.commit()
+
+
+def set_show_silenced(show_id: int, silenced: bool) -> None:
+    """Silence/unsilence a show's releases (hidden from Upcoming when on)."""
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute("UPDATE tracked_shows SET silenced = ? WHERE id = ?",
+                     (1 if silenced else 0, show_id))
+        conn.commit()
+
+
+def set_show_auto_grab(show_id: int, auto_grab: bool) -> None:
+    """Mark a show for automatic download when its episodes release."""
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute("UPDATE tracked_shows SET auto_grab = ? WHERE id = ?",
+                     (1 if auto_grab else 0, show_id))
+        conn.commit()
+
+
+def rename_show(show_id: int, title: str) -> None:
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute("UPDATE tracked_shows SET title = ? WHERE id = ?", (title, show_id))
+        conn.commit()
+
+
+def merge_shows(primary_id: int, duplicate_ids: list[int]) -> int:
+    """Merge duplicate tracked-show rows into one ("these shows are the same").
+
+    Folders, season targets, and on-disk episode state move to the primary;
+    the duplicate rows are deleted. Episode lists are NOT merged wholesale
+    (each source numbers seasons differently) — only has_file markers carry
+    over where (season, episode) lines up. Returns how many rows were merged.
+    """
+    merged = 0
+    with _SHOWS_LOCK, db.connect() as conn:
+        for dup_id in duplicate_ids:
+            if dup_id == primary_id:
+                continue
+            conn.execute("UPDATE show_folders SET show_id = ? WHERE show_id = ?",
+                         (primary_id, dup_id))
+            conn.execute(
+                "INSERT OR IGNORE INTO season_targets (show_id, season, path) "
+                "SELECT ?, season, path FROM season_targets WHERE show_id = ?",
+                (primary_id, dup_id))
+            # Carry over on-disk markers for matching episode numbers.
+            for season, episode, path in conn.execute(
+                "SELECT season, episode, file_path FROM episodes "
+                "WHERE show_id = ? AND has_file = 1", (dup_id,)
+            ).fetchall():
+                conn.execute(
+                    """
+                    INSERT INTO episodes (show_id, season, episode, has_file, file_path)
+                    VALUES (?, ?, ?, 1, ?)
+                    ON CONFLICT(show_id, season, episode) DO UPDATE SET
+                        has_file = 1, file_path = COALESCE(episodes.file_path, excluded.file_path)
+                    """,
+                    (primary_id, season, episode, path))
+            conn.execute("DELETE FROM episodes WHERE show_id = ?", (dup_id,))
+            conn.execute("DELETE FROM season_targets WHERE show_id = ?", (dup_id,))
+            conn.execute("DELETE FROM tracked_shows WHERE id = ?", (dup_id,))
+            merged += 1
+        conn.commit()
+    return merged
 
 
 def set_show_status(show_id: int, status: str) -> None:
@@ -388,7 +457,8 @@ def clear_season_target(show_id: int, season: int) -> None:
         conn.commit()
 
 
-def upcoming_episodes(*, days: int = 14) -> list[tuple[TrackedShow, EpisodeRow]]:
+def upcoming_episodes(*, days: int = 14,
+                      include_silenced: bool = False) -> list[tuple[TrackedShow, EpisodeRow]]:
     """Episodes airing between today and today+days across all tracked shows.
 
     Primary source is each show's stored next-episode-to-air (TMDB); we also
@@ -410,7 +480,10 @@ def upcoming_episodes(*, days: int = 14) -> list[tuple[TrackedShow, EpisodeRow]]
             (start, end),
         ).fetchall()
 
-    shows_by_id = {s.show_id: s for s in list_shows()}
+    shows_by_id = {
+        s.show_id: s for s in list_shows()
+        if include_silenced or not s.silenced
+    }
     merged: dict[tuple[int, int, int], tuple[TrackedShow, EpisodeRow]] = {}
     # (show_id, air_date) already covered — prevents listing the same episode
     # twice when the stored next-air (AniList absolute numbering, e.g. S01E1169)

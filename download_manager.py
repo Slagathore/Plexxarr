@@ -60,6 +60,38 @@ def _resolve_runner_path() -> Path:
 
 _RUNNER_PATH = _resolve_runner_path()
 
+
+def pick_best_result(results: list[TorrentResult], media_type: str) -> TorrentResult:
+    """Best auto-grab candidate honouring the admin's size preference.
+
+    With no preference set (0), the top-seeded result wins as before. With a
+    MB/min target, prefer the result whose size lands closest to the target
+    (2 h for movies, 30 min for episodes) on a log scale, using seeders as
+    the tie-breaker — a 4 GB episode shouldn't win over an 800 MB one just
+    because it has three more seeders.
+    """
+    pref = {
+        "movie": config.SIZE_PREF_MB_PER_MIN_MOVIE,
+        "tv": config.SIZE_PREF_MB_PER_MIN_TV,
+        "anime": config.SIZE_PREF_MB_PER_MIN_ANIME,
+        "xanime": config.SIZE_PREF_MB_PER_MIN_XANIME,
+    }.get(media_type, 0.0)
+    if pref <= 0 or not results:
+        return results[0]
+
+    minutes = 120 if media_type == "movie" else 30
+    target_bytes = pref * minutes * 1024 * 1024
+
+    import math
+
+    def sort_key(r: TorrentResult):
+        if not r.size_bytes:
+            return (99.0, -r.seeders)
+        distance = abs(math.log2(r.size_bytes / target_bytes))
+        return (distance, -r.seeders)
+
+    return sorted(results, key=sort_key)[0]
+
 # Windows: suppress the console window for the Node subprocess.
 _CREATE_NO_WINDOW = 0x08000000
 
@@ -179,7 +211,7 @@ class DownloadManager:
                 continue
             if not results:
                 continue
-            best = results[0]  # already sorted by seeders
+            best = pick_best_result(results, media_type)
             if best.seeders <= 0:
                 continue
             download_id = self.grab(
@@ -221,6 +253,10 @@ class DownloadManager:
         for show in shows_store.list_shows():
             if len(started) >= limit:
                 break
+            # Global toggle grabs for every show; otherwise only shows the
+            # admin marked auto-grab (e.g. from the Upcoming boxes).
+            if not (config.SHOWS_AUTO_GRAB or show.auto_grab):
+                continue
             # Re-sync stale shows so "missing" reflects reality.
             stale = True
             if show.last_synced:
@@ -261,7 +297,7 @@ class DownloadManager:
                 if not results:
                     continue
                 download_id = self.grab(
-                    results[0],
+                    pick_best_result(results, show.media_type),
                     episode_context=(show.show_id, ep.season, ep.episode),
                     auto_rename=True, auto_move=True,
                 )
@@ -428,12 +464,29 @@ class DownloadManager:
         if not files:
             return "no media files found in staging for this download"
 
+        # Canonical show name for renames: the tracked show's title for
+        # episode-linked grabs, else the matched library folder's name.
+        show_name = None
+        if row.show_id is not None:
+            show = shows_store.get_show(row.show_id)
+            if show is not None:
+                show_name = show.title
+        if show_name is None and plan.show_folder:
+            show_name = Path(plan.show_folder).name
+
+        video_files = [f for f in files if f.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS]
+
         dest_dir = Path(plan.dest_dir)
         moved_any = False
         for src in files:
             target_name = src.name
-            if do_rename and plan.new_filename and src.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS:
-                target_name = f"{plan.new_filename}{src.suffix.lower()}"
+            if do_rename and src.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS:
+                new_stem = self._episode_stem_for_file(
+                    src, show_name=show_name, plan=plan,
+                    single_video=(len(video_files) == 1),
+                )
+                if new_stem:
+                    target_name = f"{new_stem}{src.suffix.lower()}"
                 if target_name != src.name:
                     downloads_store.add_history(
                         download_id, "renamed", before=src.name, after=target_name,
@@ -466,12 +519,38 @@ class DownloadManager:
             if row.show_id is not None and row.season is not None and row.episode is not None:
                 moved_video = next(
                     (h.after_value for h in downloads_store.list_history(limit=20)
-                     if h.download_id == download_id and h.action == "moved"),
+                     if h.download_id == download_id and h.action == "moved"
+                     and h.after_value),
                     str(dest_dir),
-                )
+                ) or str(dest_dir)
                 shows_store.set_episode_file(row.show_id, row.season, row.episode, moved_video)
             return f"moved to {dest_dir}"
         return f"processed (no move) — planned: {plan.describe()}"
+
+    @staticmethod
+    def _episode_stem_for_file(
+        src: Path, *, show_name: str | None,
+        plan: torrent_routing.RoutePlan, single_video: bool,
+    ) -> str | None:
+        """Canonical stem ("Show - S01E05") for one video file.
+
+        Season packs are the reason this parses PER FILE: the pack-level plan
+        only knows the season, so renaming every file to the same plan-level
+        name would collide (and previously they were left unrenamed). A file
+        whose own name parses to an episode gets its own SxxEyy; otherwise a
+        lone video can still use the plan's single-episode name."""
+        if show_name:
+            parsed = torrent_routing.parse_torrent_name(src.name)
+            if parsed.episode is not None:
+                season = parsed.season
+                if season is None:
+                    season = (plan.parsed.season if plan.parsed and plan.parsed.season else 1)
+                return torrent_routing.sanitize_for_filesystem(
+                    f"{show_name} - S{season:02d}E{parsed.episode:02d}"
+                )
+        if plan.new_filename and single_video:
+            return plan.new_filename
+        return None
 
     def _cleanup_staging_leftovers(self, row: downloads_store.DownloadRow) -> None:
         """Remove the download's now-empty (or junk-only) staging folder."""

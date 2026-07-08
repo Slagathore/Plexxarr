@@ -97,6 +97,14 @@ _LEADING_BRACKET_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)+")
 _ABS_EP_RE = re.compile(r"(?:^|[\s._-])(\d{1,4})(?=[\s._-]|$)")
 _NOT_EPISODE = re.compile(r"^(?:19|20)\d{2}$|^(?:480|720|1080|2160)$")
 
+# "Episode 01 - Title.mp4" / "Ep 5.mkv" — common DVD-rip naming with no
+# season token in the filename (the season lives in the parent folder name).
+_EP_WORD_RE = re.compile(r"\b(?:Episode|Ep)[\s._-]*(\d{1,4})\b", re.IGNORECASE)
+
+# Parent folder names that carry the season: "Season 02", "Season 2", "S02".
+_SEASON_DIR_RE = re.compile(r"^(?:Season|S)[\s._-]*(\d{1,3})$", re.IGNORECASE)
+_SPECIALS_DIR_RE = re.compile(r"^specials?$", re.IGNORECASE)
+
 
 @dataclass(frozen=True)
 class ScanResult:
@@ -269,20 +277,46 @@ EPISODE_FETCHERS: dict[str, tuple] = {
 }
 
 
-def _parse_episode_from_file(name: str) -> tuple[int, int] | None:
-    """(season, episode) from a filename; absolute-numbered anime → season 1."""
+def _parse_episode_from_file(name: str) -> tuple[int | None, int] | None:
+    """(season_or_None, episode) from a filename.
+
+    season is None when the filename itself carries no season token — the
+    caller then derives it from the parent "Season NN" folder (files like
+    "Episode 05 - Title.mp4" live inside per-season folders; assuming season
+    1 for them was the bug that marked whole shows as missing when their
+    seasons were organised in folders)."""
     parsed = parse_torrent_name(name)
     if parsed.episode is not None:
-        return (parsed.season or 1, parsed.episode)
+        return (parsed.season, parsed.episode)
+
+    stem = Path(name).stem
+    m = _EP_WORD_RE.search(stem)
+    if m:
+        return (None, int(m.group(1)))
 
     # Fallback: strip bracket groups, then take the LAST plausible number.
-    cleaned = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", Path(name).stem)
+    cleaned = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", stem)
     candidates = [
         tok for tok in _ABS_EP_RE.findall(cleaned)
         if not _NOT_EPISODE.match(tok)
     ]
     if candidates:
-        return (1, int(candidates[-1]))
+        return (None, int(candidates[-1]))
+    return None
+
+
+def _season_from_parents(file_path: Path, root: Path) -> int | None:
+    """Season number from the nearest ancestor "Season NN"/"SNN"/"Specials"
+    folder between the file and the show root (root itself excluded)."""
+    for parent in file_path.parents:
+        if parent == root:
+            break
+        name = parent.name.strip()
+        m = _SEASON_DIR_RE.match(name)
+        if m:
+            return int(m.group(1))
+        if _SPECIALS_DIR_RE.match(name):
+            return 0
     return None
 
 
@@ -296,8 +330,14 @@ def _scan_folders_for_episodes(folders: tuple[str, ...]) -> dict[tuple[int, int]
             if not f.is_file() or f.suffix.lower() not in VIDEO_EXTENSIONS:
                 continue
             key = _parse_episode_from_file(f.name)
-            if key is not None:
-                found.setdefault(key, str(f))
+            if key is None:
+                continue
+            season, episode = key
+            if season is None:
+                season = _season_from_parents(f, root)
+            if season is None:
+                season = 1  # flat folder, absolute numbering
+            found.setdefault((season, episode), str(f))
     return found
 
 
@@ -381,13 +421,44 @@ def _sync_show_impl(show_id: int) -> str:
             f"{missing} missing{air_note}")
 
 
-def sync_all() -> list[str]:
+def sync_all(progress=None) -> list[str]:
     """Sync every tracked show. Guarded; runs shows serially (holds the lock
-    the whole time) so it never overlaps another scan/sync."""
-    return run_exclusive(
-        "Sync all",
-        lambda: [_sync_show_impl(s.show_id) for s in shows_store.list_shows()],
-    )
+    the whole time) so it never overlaps another scan/sync.
+
+    progress(done, total, title), when given, is called before each show —
+    the Shows tab uses it for its status line + time-remaining estimate."""
+    def impl() -> list[str]:
+        shows = shows_store.list_shows()
+        results: list[str] = []
+        for i, s in enumerate(shows):
+            if progress is not None:
+                try:
+                    progress(i, len(shows), s.title)
+                except Exception:
+                    pass
+            results.append(_sync_show_impl(s.show_id))
+        return results
+
+    return run_exclusive("Sync all", impl)
+
+
+def backfill_english_titles() -> int:
+    """Rename AniDB-identified shows to their official English title.
+
+    The AniDB dump stores a romaji "main" title (why 'Witch Hat Atelier'
+    was tracked as 'Tongari Boushi no Atelier'); this swaps in the official
+    English title where the dump has one. Returns the number renamed."""
+    from media_lookup import anidb_english_title
+    renamed = 0
+    for show in shows_store.list_shows():
+        if show.source != "anidb":
+            continue
+        english = anidb_english_title(show.external_id)
+        if english and english.strip().casefold() != show.title.strip().casefold():
+            shows_store.rename_show(show.show_id, english.strip())
+            logger.info("Renamed '%s' → '%s' (AniDB %s)", show.title, english, show.external_id)
+            renamed += 1
+    return renamed
 
 
 # ---------------------------------------------------------------------------

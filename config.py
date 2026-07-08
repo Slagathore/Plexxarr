@@ -96,8 +96,6 @@ TELEGRAM_ALLOWED_USER_IDS: tuple[int, ...] = _parse_id_list(
 APP_PRODUCT_NAME: str = "Plex Reset Button"
 APP_VERSION: str = "1.0"
 
-TRAY_ICON_CONFIDENCE: float = float(os.getenv("TRAY_ICON_CONFIDENCE", "0.85"))
-TASKBAR_ICON_CONFIDENCE: float = float(os.getenv("TASKBAR_ICON_CONFIDENCE", "0.85"))
 # How long (seconds) to pause between each process-gone check after Exit is clicked.
 # Plex can take 10-30s to fully stop — 3s intervals × 10 retries = 30s total window.
 PLEX_EXIT_WAIT: float = float(os.getenv("PLEX_EXIT_WAIT", "3"))
@@ -220,18 +218,25 @@ LIBRARY_SEARCH_RESULT_LIMIT: int = int(
 )
 
 
-def _assets_dir() -> Path:
-    external_assets = APP_DIR / "assets"
-    if external_assets.is_dir():
-        return external_assets
-    return BUNDLE_DIR / "assets"
+# ---------------------------------------------------------------------------
+# Telegram-side hard reset — OFF by default. Many admins won't want remote
+# users force-killing Plex mid-stream; enable from the Settings tab.
+# ---------------------------------------------------------------------------
+TELEGRAM_HARD_RESET_ENABLED: bool = _env_bool("TELEGRAM_HARD_RESET_ENABLED", False)
 
+# Support link shown in the desktop app header.
+KOFI_URL: str = "https://ko-fi.com/sparklemuffin"
 
-ASSETS_DIR: Path = _assets_dir()
-TRAY_ICON_PATH: str = str(ASSETS_DIR / "tray_icon.png")
-TASKBAR_ICON_PATH: str = str(ASSETS_DIR / "taskbar_icon.png")
-TRAY_EXPAND_ARROW_PATH: str = str(ASSETS_DIR / "tray_expand_arrow.png")
-EXIT_MENU_ITEM_PATH: str = str(ASSETS_DIR / "exit_menu_item.png")
+# ---------------------------------------------------------------------------
+# Preferred download size, in MB per minute of runtime, per media type.
+# 0 = no preference (pick by seeders alone). Used by the torrent pickers to
+# prefer results whose size best matches the target, and shown in Settings as
+# both MB/min and an approximate total (movies ≈ 2 h, episodes ≈ 30 min).
+# ---------------------------------------------------------------------------
+SIZE_PREF_MB_PER_MIN_MOVIE: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_MOVIE", "0"))
+SIZE_PREF_MB_PER_MIN_TV: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_TV", "0"))
+SIZE_PREF_MB_PER_MIN_ANIME: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_ANIME", "0"))
+SIZE_PREF_MB_PER_MIN_XANIME: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_XANIME", "0"))
 
 # ---------------------------------------------------------------------------
 # External media database API keys

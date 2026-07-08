@@ -668,6 +668,8 @@ _anidb_index: dict[str, list[tuple[str, str]]] | None = None
 # aid → all titles for that anime (romaji, synonyms, official, …); [0] = primary.
 # Used so a synonym match still carries every title as alt_titles for scoring.
 _anidb_titles_by_aid: dict[str, list[str]] = {}
+# aid → official English title (dump type 4, lang "en"), where one exists.
+_anidb_english_by_aid: dict[str, str] = {}
 _anidb_index_loaded_at: float = 0.0
 
 
@@ -701,7 +703,7 @@ def _refresh_anidb_cache() -> Path:
 def _load_anidb_index() -> dict[str, list[tuple[str, str]]]:
     """Build or return the cached AniDB title index (title_lower → [(primary, aid)]),
     and populate _anidb_titles_by_aid (aid → all titles)."""
-    global _anidb_index, _anidb_titles_by_aid, _anidb_index_loaded_at
+    global _anidb_index, _anidb_titles_by_aid, _anidb_english_by_aid, _anidb_index_loaded_at
 
     now = time.time()
     if _anidb_index is not None and (now - _anidb_index_loaded_at) < _ANIDB_CACHE_MAX_AGE_S:
@@ -714,6 +716,7 @@ def _load_anidb_index() -> dict[str, list[tuple[str, str]]]:
         return {}
 
     primary_titles: dict[str, str] = {}       # aid → primary title
+    english_titles: dict[str, str] = {}       # aid → official English title
     all_titles: dict[str, list[str]] = {}     # aid → [titles…]
     raw_index: dict[str, list[tuple[str, str]]] = {}  # title_lower → [(raw_title, aid)]
 
@@ -726,10 +729,13 @@ def _load_anidb_index() -> dict[str, list[tuple[str, str]]]:
                 parts = line.split("|", 3)
                 if len(parts) < 4:
                     continue
-                aid, ttype, _lang, title = parts
+                aid, ttype, lang, title = parts
 
                 if ttype == "1":
                     primary_titles[aid] = title
+                # type 4 = official title; keep the English one for display.
+                if ttype == "4" and lang == "en" and aid not in english_titles:
+                    english_titles[aid] = title
                 titles = all_titles.setdefault(aid, [])
                 if title not in titles:
                     titles.append(title)
@@ -759,9 +765,19 @@ def _load_anidb_index() -> dict[str, list[tuple[str, str]]]:
 
     _anidb_index = final
     _anidb_titles_by_aid = all_titles
+    _anidb_english_by_aid = english_titles
     _anidb_index_loaded_at = now
     logger.info("AniDB index loaded: %d title entries, %d anime.", len(final), len(all_titles))
     return final
+
+
+def anidb_english_title(aid: str) -> str | None:
+    """Official English title for an AniDB id, from the offline dump."""
+    try:
+        _load_anidb_index()
+    except Exception:
+        return None
+    return _anidb_english_by_aid.get(str(aid))
 
 
 def search_anidb(title: str, *, media_type: str = "xanime") -> list[MediaResult]:
@@ -822,7 +838,12 @@ def search_anidb(title: str, *, media_type: str = "xanime") -> list[MediaResult]
             break
         seen_aids.add(aid)
         all_titles = _anidb_titles_by_aid.get(aid, [display_title])
-        primary = all_titles[0] if all_titles else display_title
+        # Display the official English title when the dump has one — tracked
+        # shows should read "Witch Hat Atelier", not "Tongari Boushi no
+        # Atelier". Every other title stays in alt_titles for scoring.
+        primary = _anidb_english_by_aid.get(aid) or (
+            all_titles[0] if all_titles else display_title
+        )
         alt = tuple(t for t in all_titles if t != primary)
         results.append(MediaResult(
             title=primary,
