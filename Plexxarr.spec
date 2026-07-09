@@ -27,7 +27,8 @@ hiddenimports = (
     # New modules are imported dynamically enough that we pin them explicitly.
     + ["sv_ttk", "send2trash", "shows_tab", "shows_store", "show_tracker",
        "downloads_store", "download_manager", "torrent_search", "torrent_routing",
-       "auth_store", "db", "ui_helpers", "health", "watchlist_tab", "video_quality", "subtitles"]
+       "auth_store", "db", "ui_helpers", "health", "watchlist_tab", "video_quality",
+       "subtitles", "anime_db"]
 )
 
 

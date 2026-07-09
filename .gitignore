@@ -55,3 +55,6 @@ anidb_titles.dat.gz
 trackers_cache.txt
 maintenance_cache.pkl
 library_lowqual.pkl
+anime_meta.sqlite
+anime_meta.sqlite-*
+unidentified_folders.json

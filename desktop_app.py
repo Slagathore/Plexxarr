@@ -38,6 +38,7 @@ from settings_store import (load_current_settings, reload_config_from_env,
                              save_settings)
 from telegram_service import TelegramBotService
 
+import anime_db
 import auth_store
 import downloads_store
 import telegram_service
@@ -288,6 +289,9 @@ class DesktopApp:
         self._schedule_daily_library_check()
         self._schedule_auto_grab()
         self._schedule_idle_cache()
+        # Local anime metadata (manami + anime-lists dumps): build/refresh in
+        # the background when missing or older than a week.
+        anime_db.ensure_fresh(background=True)
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -2437,6 +2441,10 @@ class DesktopApp:
                                 refreshed.added, refreshed.removed)
                 except Exception:
                     logger.exception("Idle cache: index refresh failed.")
+                try:
+                    anime_db.ensure_fresh(background=False)
+                except Exception:
+                    logger.exception("Idle cache: anime metadata refresh failed.")
 
                 steps = [
                     ("inventory", library_inventory, self._handle_library_inventory_result),

@@ -412,7 +412,9 @@ class ShowsTab:
                     if show.media_type == "tv":
                         found = search_tvdb_shows(query, None) + search_tmdb_shows(query, None)
                     else:
-                        found = search_anidb(
+                        found = show_tracker.anime_db_search_results(
+                            query, show.media_type,
+                        ) + search_anidb(
                             query, media_type=show.media_type,
                         ) + search_anilist(query, explicit=(show.media_type == "xanime"))
                 except Exception as exc:
@@ -558,7 +560,9 @@ class ShowsTab:
                     if media_type == "tv":
                         found = search_tvdb_shows(query, None) + search_tmdb_shows(query, None)
                     else:
-                        found = search_anidb(
+                        found = show_tracker.anime_db_search_results(
+                            query, media_type,
+                        ) + search_anidb(
                             query, media_type=media_type,
                         ) + search_anilist(query, explicit=(media_type == "xanime"))
                 except Exception as exc:

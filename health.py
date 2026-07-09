@@ -161,6 +161,14 @@ def run_health_checks(*, bot_running: bool | None = None) -> list[CheckResult]:
     except OSError as exc:
         checks.append(CheckResult(False, "Staging folder", f"{staging} — {exc}"))
 
+    # Local anime metadata DB (manami + anime-lists dumps)
+    try:
+        import anime_db
+        checks.append(CheckResult(anime_db.available(), "Anime metadata",
+                                  anime_db.status()))
+    except Exception as exc:
+        checks.append(CheckResult(False, "Anime metadata", f"check failed: {exc}"))
+
     # Ollama (optional — LLM features degrade gracefully)
     try:
         import llm_service

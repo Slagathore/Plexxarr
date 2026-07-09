@@ -183,6 +183,22 @@ To enable API-based features (metrics, library search, session data) you need a 
 
 If this app keeps your movie nights running, consider [buying me half a coffee](https://ko-fi.com/sparklemuffin). ☕
 
+## Data Attribution
+
+Anime identification and cross-site id mapping run on a **local database**
+(rebuilt weekly, zero API calls) built from these excellent community datasets:
+
+- [manami-project/anime-offline-database](https://github.com/manami-project/anime-offline-database)
+  — ~41k anime with titles, synonyms, episode counts, seasons, and tags.
+  Licensed under [ODbL v1.0](https://opendatacommons.org/licenses/odbl/1-0/) +
+  DbCL v1.0.
+- [Fribb/anime-lists](https://github.com/Fribb/anime-lists) and
+  [Anime-Lists/anime-lists](https://github.com/Anime-Lists/anime-lists)
+  — the community-curated AniDB ↔ TVDB ↔ TMDB ↔ IMDb ↔ MAL ↔ AniList mapping
+  (the same data the Plex HAMA agent and Sonarr ecosystems use).
+- [AniDB](https://anidb.net)'s public title dump for romaji/English title
+  coverage.
+
 ## Acknowledgements
 
 The torrent download pipeline (Downloads tab) is modeled on

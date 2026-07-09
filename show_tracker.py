@@ -24,6 +24,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+import anime_db
 import config
 import shows_store
 import torrent_routing
@@ -204,16 +205,57 @@ def _identify_folder(folder_name: str, media_type: str) -> MediaResult | None:
 _HIGH_CONFIDENCE = 0.90
 
 
+def anime_db_search_results(name: str, media_type: str) -> list[MediaResult]:
+    """Local anime-metadata hits (manami dump) as MediaResults.
+
+    anidb-id entries slot straight into the existing pipeline (same source
+    key, English-title preference via the AniDB dump); entries without an
+    AniDB link fall back to anilist/mal identities. Hentai entries are only
+    offered for xanime lookups."""
+    explicit = media_type == "xanime"
+    results: list[MediaResult] = []
+    try:
+        hits = anime_db.search(name, limit=6)
+    except Exception:
+        logger.debug("anime_db search failed.", exc_info=True)
+        return []
+    for h in hits:
+        if h.is_adult != explicit:
+            continue
+        if h.anidb_id:
+            from media_lookup import anidb_english_title
+            source, external_id = "anidb", str(h.anidb_id)
+            url = f"https://anidb.net/anime/{h.anidb_id}"
+            title = anidb_english_title(str(h.anidb_id)) or h.title
+        elif h.anilist_id:
+            source, external_id = "anilist", str(h.anilist_id)
+            url = f"https://anilist.co/anime/{h.anilist_id}"
+            title = h.title
+        elif h.mal_id:
+            source, external_id = "jikan", str(h.mal_id)
+            url = f"https://myanimelist.net/anime/{h.mal_id}"
+            title = h.title
+        else:
+            continue
+        results.append(MediaResult(
+            title=title, year=h.year, external_id=external_id,
+            external_url=url, media_type=media_type,
+            overview=f"{h.anime_type or 'anime'}, {h.episodes or '?'} episode(s)",
+            source=source,
+            alt_titles=tuple(t for t in (h.title, *h.all_titles) if t != title),
+        ))
+    return results
+
+
 def _best_anime_match(name: str, year: int | None, *, explicit: bool
                       ) -> tuple[MediaResult | None, float]:
     """Cascade anime identification across sources, cheapest/most-reliable
     first, stopping as soon as a confident match appears.
 
-    Order: AniDB offline dump (instant, no network, best romaji coverage) →
-    AniList (reliable live API) → Jikan (only if its breaker isn't open) →
-    TMDB (English-biased, regular anime only). This makes a full scan fast —
-    most folders never hit the network — and resilient to any one API being
-    down.
+    Order: local anime-metadata DB (manami dump — instant, richest synonym
+    set) → AniDB offline dump → AniList (live) → Jikan (only if its breaker
+    isn't open) → TMDB (English-biased, regular anime only). Most folders
+    never touch the network.
     """
     best: MediaResult | None = None
     best_score = 0.0
@@ -225,6 +267,9 @@ def _best_anime_match(name: str, year: int | None, *, explicit: bool
             best, best_score = b, s
         return best_score >= _HIGH_CONFIDENCE
 
+    # 0. Local anime metadata DB (41k entries, offline, weekly refresh).
+    if consider(anime_db_search_results(name, "xanime" if explicit else "anime")):
+        return best, best_score
     # 1. Offline AniDB dump — the workhorse. Covers most folders with no API call.
     if consider(search_anidb(name, media_type="xanime" if explicit else "anime")):
         return best, best_score
@@ -472,13 +517,23 @@ def _remap_disk_seasons_to_tracker(
 
 def _ensure_tmdb_id(show: shows_store.TrackedShow) -> str | None:
     """Return (and persist) a TMDB id for a show — its own id if TMDB-sourced,
-    else an anime-aware resolution by title. Used for the episode-list and
-    airing fallbacks that non-TMDB sources (anidb/anilist/jikan/tvdb) rely on."""
+    the curated anime-lists mapping for AniDB shows, else an anime-aware
+    resolution by title. Used for the episode-list and airing fallbacks that
+    non-TMDB sources (anidb/anilist/jikan/tvdb) rely on."""
     if show.tmdb_id:
         return show.tmdb_id
-    tmdb_id = show.external_id if show.source == "tmdb" else resolve_tmdb_tv_id(
-        show.title, show.year, prefer_anime=show.media_type in ("anime", "xanime"),
-    )
+    tmdb_id: str | None = None
+    if show.source == "tmdb":
+        tmdb_id = show.external_id
+    elif show.source == "anidb":
+        # Curated cross-id from the local mapping DB beats fuzzy resolution.
+        mapping = anime_db.mapping_for_anidb(show.external_id) or {}
+        if mapping.get("tmdb_id"):
+            tmdb_id = str(mapping["tmdb_id"])
+    if not tmdb_id:
+        tmdb_id = resolve_tmdb_tv_id(
+            show.title, show.year, prefer_anime=show.media_type in ("anime", "xanime"),
+        )
     if tmdb_id:
         shows_store.set_show_tmdb_id(show.show_id, tmdb_id)
     return tmdb_id
@@ -504,6 +559,24 @@ def _sync_show_impl(show_id: int) -> str:
         fetch_episodes, fetch_status = fetchers
         episodes = fetch_episodes(show.external_id)
         status = fetch_status(show.external_id)
+    elif show.source == "anidb":
+        # AniDB has no episode API, but the curated anime-lists mapping often
+        # gives us the TVDB id — TVDB carries proper season-based episode
+        # lists for anime, avoiding TMDB's merged-cour "one long season 1".
+        # Guard: only when this AniDB entry IS the series start (season 1,
+        # no episode offset). A second-cour entry maps to the same TVDB
+        # series, and pulling the full list for it would double-count when
+        # cours are tracked as separate rows.
+        mapping = anime_db.mapping_for_anidb(show.external_id) or {}
+        season_tag = str(mapping.get("default_tvdb_season") or "1")
+        offset = mapping.get("episode_offset") or 0
+        if mapping.get("tvdb_id") and season_tag in ("1", "a") and not offset:
+            try:
+                episodes = get_tvdb_episodes(str(mapping["tvdb_id"]))
+                if episodes:
+                    status = get_tvdb_series_status(str(mapping["tvdb_id"]))
+            except Exception:
+                logger.debug("Mapped-TVDB episode fetch failed.", exc_info=True)
 
     # Airing + status for anime come from AniList by title (the most accurate
     # anime airing source), covering every anime regardless of how it was

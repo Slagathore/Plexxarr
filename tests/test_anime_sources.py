@@ -59,6 +59,8 @@ def test_get_anime_airing_none_when_not_airing(monkeypatch):
 
 
 def test_cascade_short_circuits_on_confident_anidb_match(monkeypatch):
+    monkeypatch.setattr(show_tracker, "anime_db_search_results",
+                        lambda *a, **k: [])
     # A confident AniDB hit must NOT trigger the slower live sources.
     hit = MediaResult(title="Cowboy Bebop", year=1998, external_id="1",
                       external_url="", media_type="anime", overview="", source="anidb")
@@ -76,6 +78,8 @@ def test_cascade_short_circuits_on_confident_anidb_match(monkeypatch):
 
 
 def test_cascade_falls_through_when_anidb_misses(monkeypatch):
+    monkeypatch.setattr(show_tracker, "anime_db_search_results",
+                        lambda *a, **k: [])
     right = MediaResult(title="Some New Anime", year=2026, external_id="9",
                         external_url="", media_type="anime", overview="", source="anilist")
     monkeypatch.setattr(show_tracker, "search_anidb", lambda *a, **k: [])
@@ -87,6 +91,8 @@ def test_cascade_falls_through_when_anidb_misses(monkeypatch):
 
 
 def test_cascade_skips_jikan_when_circuit_open(monkeypatch):
+    monkeypatch.setattr(show_tracker, "anime_db_search_results",
+                        lambda *a, **k: [])
     monkeypatch.setattr(show_tracker, "search_anidb", lambda *a, **k: [])
     monkeypatch.setattr(show_tracker, "search_anilist", lambda *a, **k: [])
     monkeypatch.setattr(show_tracker, "jikan_circuit_open", lambda: True)
