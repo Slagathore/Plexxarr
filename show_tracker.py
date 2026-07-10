@@ -33,7 +33,7 @@ from media_lookup import (
     best_title_similarity,
     get_anime_airing,
     get_jikan_episodes, get_jikan_status,
-    get_tmdb_next_air, get_tmdb_tv_episodes, get_tmdb_tv_status,
+    get_tmdb_next_air, get_tmdb_show_runtime, get_tmdb_tv_episodes, get_tmdb_tv_status,
     get_tvdb_episodes, get_tvdb_series_status,
     jikan_circuit_open, resolve_tmdb_tv_id,
     search_anidb, search_anilist, search_jikan_anime,
@@ -622,6 +622,19 @@ def _sync_show_impl(show_id: int) -> str:
     tmdb_id = _ensure_tmdb_id(refreshed)
     if not episodes and tmdb_id:
         episodes = get_tmdb_tv_episodes(tmdb_id)
+
+    # Real episode runtime — anchors the MB/min size math instead of the flat
+    # 30-minute assumption (a 24-min TV anime vs a 5-min short vs a 45-min
+    # drama are wildly different targets). AniDB-identified shows (anime and
+    # hentai) come from the local metadata DB (manami's duration field, ~1 ms);
+    # everything else asks TMDB once and keeps the answer.
+    runtime = None
+    if show.source == "anidb":
+        runtime = anime_db.duration_for_anidb(show.external_id)
+    if runtime is None and tmdb_id and not show.runtime_min:
+        runtime = get_tmdb_show_runtime(tmdb_id)
+    if runtime and runtime > 0 and abs((show.runtime_min or 0) - runtime) > 0.01:
+        shows_store.set_show_runtime(show_id, round(float(runtime), 2))
 
     # Ordering mismatch: many anime trackers number episodes absolutely
     # (one long "season 1"), but Plex libraries are organised in Season NN

@@ -44,6 +44,32 @@ def test_filter_viable_drops_zero_size_cams_and_oversize(monkeypatch):
     assert pick_best_result([], "movie") is None
 
 
+def test_runtime_anchor_changes_target_and_cap(monkeypatch):
+    """Real runtimes reshape the size math: a 45-min drama episode and a
+    24-min anime episode have different targets/caps under one MB/min pref."""
+    monkeypatch.setattr(config, "SIZE_PREF_MB_PER_MIN_TV", 10.0)
+    monkeypatch.setattr(config, "SIZE_MAX_MB_PER_MIN_TV", 20.0)
+    mb = 1024 * 1024
+    results = [
+        _result("Show S01E01 300MB", 300 * mb, 50),
+        _result("Show S01E01 450MB", 450 * mb, 40),
+        _result("Show S01E01 700MB", 700 * mb, 30),
+    ]
+    # Flat 30-min assumption: target 300 MB → the 300 MB result wins.
+    flat = pick_best_result(results, "tv")
+    assert flat is not None and flat.size_bytes == 300 * mb
+    # A known 45-min runtime: target 450 MB → the 450 MB result wins.
+    anchored = pick_best_result(results, "tv", minutes=45)
+    assert anchored is not None and anchored.size_bytes == 450 * mb
+
+    # Max cap scales with runtime too: 20 MB/min × 24 min = 480 MB cap.
+    viable = filter_viable_results(results, "tv", minutes=24)
+    assert [r.size_bytes for r in viable] == [300 * mb, 450 * mb]
+    # …while a 45-min episode keeps the 700 MB result in play (cap 900 MB).
+    viable = filter_viable_results(results, "tv", minutes=45)
+    assert len(viable) == 3
+
+
 def test_low_quality_scan_sorts_cams_first_and_flags_redundant(tmp_path, monkeypatch):
     # No ffprobe → rates assume 120 min. 600 MB → 5.0, 120 MB → 1.0, 2400 MB → 20.
     import video_quality

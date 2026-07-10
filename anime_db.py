@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 DB_FILE = "anime_meta.sqlite"
 _MAX_AGE_S = 7 * 24 * 3600  # weekly, matching manami's release cadence
+_SCHEMA_VERSION = 2  # bump when columns change: forces a rebuild of old DBs
 
 _MANAMI_URLS = [
     # Release asset (current layout) first, then legacy in-repo path.
@@ -109,6 +110,7 @@ def _build_schema(conn: sqlite3.Connection) -> None:
             year        INTEGER,
             season      TEXT,
             score       REAL,
+            duration_min REAL,
             is_adult    INTEGER NOT NULL DEFAULT 0,
             anidb_id    INTEGER,
             anilist_id  INTEGER,
@@ -182,14 +184,21 @@ def _build_database(manami: dict, fribb: list, xml_root, dest: Path) -> None:
             score_info = entry.get("score")
             score = _float(score_info.get("arithmeticMean")
                            if isinstance(score_info, dict) else score_info)
+            duration_info = entry.get("duration")
+            duration_min = None
+            if isinstance(duration_info, dict):
+                value = _float(duration_info.get("value"))
+                if value:
+                    unit = str(duration_info.get("unit") or "SECONDS").upper()
+                    duration_min = value / 60.0 if unit == "SECONDS" else value
             conn.execute(
                 "INSERT INTO anime (id, title, type, episodes, status, year, season,"
-                " score, is_adult, anidb_id, anilist_id, mal_id, kitsu_id)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " score, duration_min, is_adult, anidb_id, anilist_id, mal_id, kitsu_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (idx, str(entry.get("title") or ""), _str(entry.get("type")),
                  _int(entry.get("episodes")), _str(entry.get("status")),
                  _int(season_info.get("year")), _str(season_info.get("season")),
-                 score, is_adult, ids.get("anidb"), ids.get("anilist"),
+                 score, duration_min, is_adult, ids.get("anidb"), ids.get("anilist"),
                  ids.get("mal"), ids.get("kitsu")),
             )
             titles = {entry.get("title") or ""}
@@ -260,6 +269,8 @@ def _build_database(manami: dict, fribb: list, xml_root, dest: Path) -> None:
 
         conn.execute("INSERT INTO meta (key, value) VALUES ('built_at', ?)",
                      (str(int(time.time())),))
+        conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
+                     (str(_SCHEMA_VERSION),))
         conn.execute("INSERT INTO meta (key, value) VALUES ('entries', ?)",
                      (str(len(rows)),))
         conn.commit()
@@ -271,6 +282,21 @@ def _build_database(manami: dict, fribb: list, xml_root, dest: Path) -> None:
     tmp.rename(dest)
 
 
+def _schema_current() -> bool:
+    if not available():
+        return False
+    try:
+        conn = _connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        finally:
+            conn.close()
+        return bool(row) and int(row[0]) >= _SCHEMA_VERSION
+    except (sqlite3.Error, ValueError):
+        return False
+
+
 def refresh(force: bool = False) -> str:
     """Download the dumps and rebuild the local database. Returns a summary.
 
@@ -278,7 +304,8 @@ def refresh(force: bool = False) -> str:
     A failed download/build leaves the previous database untouched.
     """
     with _REFRESH_LOCK:
-        if not force and available() and time.time() - _db_path().stat().st_mtime < _MAX_AGE_S:
+        if (not force and available() and _schema_current()
+                and time.time() - _db_path().stat().st_mtime < _MAX_AGE_S):
             return "anime metadata already fresh"
 
         manami = None
@@ -315,7 +342,8 @@ def refresh(force: bool = False) -> str:
 
 def ensure_fresh(*, background: bool = True) -> None:
     """Refresh when stale/missing. background=True never blocks the caller."""
-    if available() and time.time() - _db_path().stat().st_mtime < _MAX_AGE_S:
+    if (available() and _schema_current()
+            and time.time() - _db_path().stat().st_mtime < _MAX_AGE_S):
         return
     if background:
         threading.Thread(target=lambda: _safe_refresh(), name="anime-db-refresh",
@@ -453,6 +481,23 @@ def titles_for_anidb(anidb_id: int | str) -> list[str]:
             "SELECT title FROM titles WHERE anime_id = ?", (row[0],))]
     finally:
         conn.close()
+
+
+def duration_for_anidb(anidb_id: int | str) -> float | None:
+    """Typical episode runtime in minutes (from the manami dump), or None.
+    Tolerates databases built before the duration column existed."""
+    if not available():
+        return None
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT duration_min FROM anime WHERE anidb_id = ?",
+            (int(anidb_id),)).fetchone()
+    except sqlite3.OperationalError:
+        return None  # pre-duration schema — next weekly refresh adds it
+    finally:
+        conn.close()
+    return float(row[0]) if row and row[0] else None
 
 
 def episode_count_for_anidb(anidb_id: int | str) -> int | None:

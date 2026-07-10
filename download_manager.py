@@ -77,6 +77,25 @@ def _size_prefs(media_type: str) -> tuple[float, float, int]:
     return prefs.get(media_type, (0.0, 0.0, 30))
 
 
+def _runtime_minutes(show) -> float | None:
+    """A tracked show's real per-episode runtime (minutes), when known."""
+    runtime = getattr(show, "runtime_min", None) if show is not None else None
+    return float(runtime) if runtime and runtime > 0 else None
+
+
+def _request_movie_minutes(req) -> float | None:
+    """Real runtime for a movie request resolved against TMDB, else None."""
+    try:
+        if (req.media_type == "movie" and req.external_id
+                and "themoviedb.org/movie" in (req.external_url or "")):
+            from media_lookup import get_tmdb_movie_runtime
+            return get_tmdb_movie_runtime(str(req.external_id))
+    except Exception:
+        logger.debug("Movie runtime lookup failed for request #%s",
+                     getattr(req, "request_id", "?"), exc_info=True)
+    return None
+
+
 def _looks_like_episode_release(title: str) -> bool:
     """True when a release title carries show markers (SxxEyy, 3x07,
     'Season 2', 'Episode 5', …) — a MOVIE grab must never take these."""
@@ -85,7 +104,8 @@ def _looks_like_episode_release(title: str) -> bool:
 
 
 def filter_viable_results(results: list[TorrentResult], media_type: str,
-                          *, block_cams: bool | None = None) -> list[TorrentResult]:
+                          *, block_cams: bool | None = None,
+                          minutes: float | None = None) -> list[TorrentResult]:
     """Auto-grab hard filters (vetoes, not preferences):
     - size 0 is never downloaded (unverifiable garbage)
     - cam/telesync releases are dropped for movies when BLOCK_CAMS is on
@@ -96,7 +116,8 @@ def filter_viable_results(results: list[TorrentResult], media_type: str,
     from video_quality import is_cam_release
 
     block = config.BLOCK_CAMS if block_cams is None else block_cams
-    _pref, max_rate, minutes = _size_prefs(media_type)
+    _pref, max_rate, default_minutes = _size_prefs(media_type)
+    minutes = minutes if minutes and minutes > 0 else default_minutes
 
     viable = [r for r in results if r.size_bytes > 0]
     if media_type == "movie":
@@ -127,21 +148,24 @@ def _ascii_preferring_title(resolved: str | None, content: str | None) -> str:
     return resolved or content
 
 
-def pick_best_result(results: list[TorrentResult],
-                     media_type: str) -> TorrentResult | None:
+def pick_best_result(results: list[TorrentResult], media_type: str,
+                     *, minutes: float | None = None) -> TorrentResult | None:
     """Best auto-grab candidate honouring the admin's size preference.
 
     Assumes hard filters (filter_viable_results) already ran. With no
     preference set (0), the top-seeded result wins. With a MB/min target,
-    prefer the result whose size lands closest to the target (2 h for
-    movies, 30 min for episodes) on a log scale, seeders as tie-breaker.
+    prefer the result whose size lands closest to the target on a log
+    scale, seeders as tie-breaker. `minutes` is the real runtime when
+    known (tracked-show runtime, TMDB movie runtime, ffprobe of a file
+    being replaced); the fallback is 2 h for movies, 30 min for episodes.
     """
     if not results:
         return None
-    pref, _max_rate, minutes = _size_prefs(media_type)
+    pref, _max_rate, default_minutes = _size_prefs(media_type)
     if pref <= 0:
         return results[0]
 
+    minutes = minutes if minutes and minutes > 0 else default_minutes
     target_bytes = pref * minutes * 1024 * 1024
 
     import math
@@ -662,7 +686,7 @@ class DownloadManager:
 
     @staticmethod
     def _oversize_gate(seeded: list[TorrentResult], media_type: str, key: str,
-                       *, minutes: int | None = None) -> bool:
+                       *, minutes: float | None = None) -> bool:
         """Routine-grab size discipline: when EVERY viable option is >20%
         over the preferred size, wait a day (keyed cooldown) and only then
         allow it. Returns True when grabbing may proceed now."""
@@ -792,8 +816,9 @@ class DownloadManager:
                       or torrent_routing._folder_similarity(
                           torrent_routing.parse_torrent_name(r.title).show_title or r.title,
                           title) >= 0.5]
-        _pref, max_rate, minutes = _size_prefs(media_type)
-        season_minutes = max(1, ep_count) * minutes
+        _pref, max_rate, default_minutes = _size_prefs(media_type)
+        per_ep = _runtime_minutes(show) or default_minutes
+        season_minutes = max(1, ep_count) * per_ep
         if max_rate > 0:
             cap = max_rate * season_minutes * 1024 * 1024
             viable = [r for r in viable if r.size_bytes <= cap]
@@ -883,7 +908,8 @@ class DownloadManager:
         except Exception:
             logger.exception("Episode search failed for %s", query)
             return []
-        viable = filter_viable_results(results, show.media_type)
+        minutes = _runtime_minutes(show)
+        viable = filter_viable_results(results, show.media_type, minutes=minutes)
         viable = [r for r in viable if self._result_matches_show(
             r.title, show, season=ep.season, episode=ep.episode)]
         if not viable:
@@ -891,12 +917,12 @@ class DownloadManager:
         seeded = [r for r in viable if r.seeders > 0]
         if not seeded:
             return self.start_zero_seeder_race(
-                viable, show.media_type,
+                viable, show.media_type, minutes=minutes,
                 episode_context=(show.show_id, ep.season, ep.episode))
         key = f"ep:{show.show_id}:{ep.season}:{ep.episode}"
-        if not self._oversize_gate(seeded, show.media_type, key):
+        if not self._oversize_gate(seeded, show.media_type, key, minutes=minutes):
             return []
-        best = pick_best_result(seeded, show.media_type)
+        best = pick_best_result(seeded, show.media_type, minutes=minutes)
         if best is None:
             return []
         download_id = self.grab(
@@ -933,7 +959,8 @@ class DownloadManager:
             except Exception:
                 logger.exception("Auto-grab search failed for request #%s", req.request_id)
                 continue
-            viable = filter_viable_results(results, media_type)
+            minutes = _request_movie_minutes(req)
+            viable = filter_viable_results(results, media_type, minutes=minutes)
             viable = [r for r in viable if self._result_matches_query(r.title, query)]
             if not viable:
                 logger.info("Request #%s (%s): no acceptable result this pass — "
@@ -944,13 +971,14 @@ class DownloadManager:
             if not seeded:
                 # Nothing has seeders — race a handful and keep the winner.
                 started.extend(self.start_zero_seeder_race(
-                    viable, media_type,
+                    viable, media_type, minutes=minutes,
                     request_id=req.request_id, request_title=query,
                 ))
                 continue
-            if not self._oversize_gate(seeded, media_type, f"req:{req.request_id}"):
+            if not self._oversize_gate(seeded, media_type, f"req:{req.request_id}",
+                                       minutes=minutes):
                 continue
-            best = pick_best_result(seeded, media_type)
+            best = pick_best_result(seeded, media_type, minutes=minutes)
             if best is None:
                 continue
             download_id = self.grab(
@@ -1043,6 +1071,7 @@ class DownloadManager:
         self, results: list[TorrentResult], media_type: str, *,
         request_id: int | None = None, request_title: str | None = None,
         episode_context: tuple[int, int, int] | None = None,
+        minutes: float | None = None,
     ) -> list[int]:
         """All results report 0 seeders: grab up to 5 and monitor for an hour.
 
@@ -1050,7 +1079,8 @@ class DownloadManager:
         keep the single most-progressed download (if any moved at all) and
         cancel the others; if nothing progressed, cancel them all.
         """
-        pref, _mx, minutes = _size_prefs(media_type)
+        pref, _mx, default_minutes = _size_prefs(media_type)
+        minutes = minutes if minutes and minutes > 0 else default_minutes
         target = pref * minutes * 1024 * 1024 if pref > 0 else None
 
         import math
@@ -1128,10 +1158,23 @@ class DownloadManager:
             logger.exception("Replacement search failed for %s", title_query)
             return None
 
-        viable = filter_viable_results(results, "movie", block_cams=True)
-        floor_bytes = config.LOW_QUALITY_MB_PER_MIN * 120 * 1024 * 1024
+        # Anchor every size rule on the movie's REAL runtime — we own the old
+        # file, so ffprobe it (cached) instead of assuming two hours flat.
+        minutes = None
+        try:
+            import video_quality
+            probed, _exact = video_quality.duration_minutes(
+                old_path, Path(old_path).stat().st_size)
+            if probed and probed > 0:
+                minutes = probed
+        except OSError:
+            pass
+
+        viable = filter_viable_results(results, "movie", block_cams=True,
+                                       minutes=minutes)
+        floor_bytes = config.LOW_QUALITY_MB_PER_MIN * (minutes or 120) * 1024 * 1024
         viable = [r for r in viable if r.size_bytes >= floor_bytes and r.seeders > 0]
-        best = pick_best_result(viable, "movie")
+        best = pick_best_result(viable, "movie", minutes=minutes)
         if best is None:
             logger.info("No acceptable non-cam replacement found for %s", title_query)
             return None

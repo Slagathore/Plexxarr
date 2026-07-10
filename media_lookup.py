@@ -1352,6 +1352,48 @@ def get_tvdb_series_status(series_id: str) -> str:
     return ((data.get("data") or {}).get("status") or {}).get("name") or ""
 
 
+_runtime_cache: dict[str, float | None] = {}
+
+
+def get_tmdb_show_runtime(tv_id: str) -> float | None:
+    """Typical episode runtime (minutes) for a TMDB show, cached per id."""
+    key = f"tv:{tv_id}"
+    if key in _runtime_cache:
+        return _runtime_cache[key]
+    minutes: float | None = None
+    if _tmdb_enabled():
+        try:
+            data = _get_json(f"{_TMDB_BASE}/tv/{tv_id}?api_key={config.TMDB_API_KEY}")
+            runtimes = [r for r in (data.get("episode_run_time") or []) if r]
+            if runtimes:
+                minutes = sum(runtimes) / len(runtimes)
+            else:
+                last = data.get("last_episode_to_air") or {}
+                if last.get("runtime"):
+                    minutes = float(last["runtime"])
+        except RuntimeError as exc:
+            logger.debug("TMDB show runtime fetch failed for %s: %s", tv_id, exc)
+    _runtime_cache[key] = minutes
+    return minutes
+
+
+def get_tmdb_movie_runtime(movie_id: str) -> float | None:
+    """Runtime (minutes) for a TMDB movie, cached per id."""
+    key = f"movie:{movie_id}"
+    if key in _runtime_cache:
+        return _runtime_cache[key]
+    minutes: float | None = None
+    if _tmdb_enabled():
+        try:
+            data = _get_json(f"{_TMDB_BASE}/movie/{movie_id}?api_key={config.TMDB_API_KEY}")
+            if data.get("runtime"):
+                minutes = float(data["runtime"])
+        except RuntimeError as exc:
+            logger.debug("TMDB movie runtime fetch failed for %s: %s", movie_id, exc)
+    _runtime_cache[key] = minutes
+    return minutes
+
+
 def get_tmdb_tv_episodes(tv_id: str) -> list[EpisodeInfo]:
     """All episodes for a TMDB TV show, season by season."""
     if not _tmdb_enabled():
