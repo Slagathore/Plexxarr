@@ -77,9 +77,12 @@ def main() -> int:
         if src.is_file():
             shutil.copy2(src, bundle / cache)
             print(f"  copied {cache}")
-    # Clear any partially-built anime DB from a previous bundle launch.
-    partial = bundle / "anime_meta.building"
-    partial.unlink(missing_ok=True)
+    # Clear any partially-built anime DB from a previous bundle launch
+    # (best-effort — a still-running instance may hold it).
+    try:
+        (bundle / "anime_meta.building").unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"  note: couldn't remove partial anime DB ({exc}) — harmless")
 
     print("\nStaged. Launch:")
     print(f"  {bundle / (bundle.name + '.exe')}")
