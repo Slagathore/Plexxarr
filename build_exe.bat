@@ -68,6 +68,11 @@ if %errorlevel% neq 0 (
     popd
 )
 
+:: Delete PyInstaller's scratch dir — it contains a half-built Plexxarr.exe
+:: stub that fails with "Failed to load Python DLL" if launched by mistake,
+:: and it wastes a few hundred MB per build. Only dist\ matters.
+rmdir /s /q "%WORK_ROOT%" >nul 2>nul
+
 echo.
 echo Build complete.
 echo Executable bundle: %DIST_ROOT%\Plexxarr
