@@ -74,23 +74,25 @@ _CORRECTION_FETCH_LIMIT = 15  # fetch this many results upfront so paging works 
 # Static keyboards
 # ---------------------------------------------------------------------------
 
-_TYPE_KEYBOARD = InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton("🎬 Movie(s)",   callback_data="req_type_movie"),
-        InlineKeyboardButton("📺 TV Show(s)", callback_data="req_type_tv"),
-    ],
-    [
-        InlineKeyboardButton("🍜 Anime",   callback_data="req_type_anime"),
-        InlineKeyboardButton("🔞 xAnime",  callback_data="req_type_xanime"),
-    ],
-    [
-        InlineKeyboardButton("❓ Other",       callback_data="req_type_other"),
-        InlineKeyboardButton("📋 View Queue",  callback_data="req_type_queue"),
-    ],
-    [
-        InlineKeyboardButton("❌ Cancel", callback_data="req_cancel"),
-    ],
-])
+def _type_keyboard() -> InlineKeyboardMarkup:
+    anime_row = [InlineKeyboardButton("🍜 Anime", callback_data="req_type_anime")]
+    if config.XANIME_ENABLED:
+        anime_row.append(
+            InlineKeyboardButton("🔞 xAnime", callback_data="req_type_xanime"))
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎬 Movie(s)",   callback_data="req_type_movie"),
+            InlineKeyboardButton("📺 TV Show(s)", callback_data="req_type_tv"),
+        ],
+        anime_row,
+        [
+            InlineKeyboardButton("❓ Other",       callback_data="req_type_other"),
+            InlineKeyboardButton("📋 View Queue",  callback_data="req_type_queue"),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data="req_cancel"),
+        ],
+    ])
 
 _CONFIRM_KEYBOARD = InlineKeyboardMarkup([
     [
@@ -351,12 +353,12 @@ async def start_request_flow(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer()
         await query.message.reply_text(  # type: ignore[union-attr]
             "What would you like to request?",
-            reply_markup=_TYPE_KEYBOARD,
+            reply_markup=_type_keyboard(),
         )
     elif update.message is not None:
         await update.message.reply_text(
             "What would you like to request?",
-            reply_markup=_TYPE_KEYBOARD,
+            reply_markup=_type_keyboard(),
         )
     return SELECT_TYPE
 
@@ -517,7 +519,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     if data == "req_confirm_restart":
         await message.reply_text(
             "No problem — what would you like to request?",
-            reply_markup=_TYPE_KEYBOARD,
+            reply_markup=_type_keyboard(),
         )
         context.user_data.pop(_UD_RESULTS, None)
         context.user_data.pop(_UD_MEDIA_TYPE, None)

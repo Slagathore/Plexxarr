@@ -327,7 +327,13 @@ def _scan_library_folders_impl(media_types: tuple[str, ...]) -> ScanResult:
                 if shows_store.folder_mapped(str(folder)):
                     already += 1
                     continue
-                match = _identify_folder(folder.name, media_type)
+                try:
+                    match = _identify_folder(folder.name, media_type)
+                except Exception:
+                    # One flaky lookup must not kill the whole scan pass —
+                    # leave the folder for the next scan / manual identify.
+                    logger.exception("Identify crashed for %s", folder)
+                    match = None
                 if match is None:
                     unidentified.append(str(folder))
                     logger.info("Could not identify show folder: %s", folder)

@@ -14,6 +14,7 @@
 # =============================================================================
 
 import gzip
+import http.client
 import json
 import logging
 import re
@@ -161,6 +162,10 @@ def _get_json(url: str, *, headers: dict[str, str] | None = None, timeout: int =
         raise RuntimeError(f"HTTP {exc.code} from {url}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Connection error for {url}: {exc.reason}") from exc
+    except (http.client.HTTPException, ConnectionError, TimeoutError, OSError) as exc:
+        # e.g. RemoteDisconnected — a flaky API must degrade like any other
+        # lookup failure, not escape as a raw socket error and kill a scan.
+        raise RuntimeError(f"Connection dropped for {url}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Invalid JSON from {url}") from exc
 

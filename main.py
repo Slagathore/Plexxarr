@@ -20,6 +20,7 @@
 
 import ctypes
 import logging
+import os
 import sys
 
 from app_logging import configure_logging
@@ -74,6 +75,8 @@ def _ensure_admin() -> None:
     """
     if sys.platform != "win32":
         return
+    if os.environ.get("PLEXXARR_SKIP_ELEVATION") == "1":
+        return  # capture/dev run — admin-only actions degrade gracefully
     if getattr(sys, "frozen", False):
         # PyInstaller EXE is already running with the privileges the spec
         # requested (uac_admin=True). Nothing to do here.

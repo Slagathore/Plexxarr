@@ -168,6 +168,14 @@ if not MEDIA_LIBRARY_PATHS:
 # code that walked PLEX_LIBRARY_PATHS without caring about media type.
 PLEX_LIBRARY_PATHS: list[str] = [p.path for p in MEDIA_LIBRARY_PATHS]
 
+# Hentai (xanime) support is an opt-in pickup: hidden from the UI unless
+# turned on here — or a library folder is already tagged xanime, so existing
+# installs keep working after an upgrade. Toggled from Settings/the wizard.
+XANIME_ENABLED: bool = _env_bool(
+    "XANIME_ENABLED",
+    any(p.media_type == "xanime" for p in MEDIA_LIBRARY_PATHS),
+)
+
 
 def media_paths_for_types(*types: str) -> list[str]:
     """
@@ -266,11 +274,11 @@ SIZE_PREF_MB_PER_MIN_XANIME: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_XANIM
 
 # Hard ceiling, same units (0 = no cap). Auto-grab NEVER takes a result whose
 # implied MB/min exceeds this — the answer to "only one result at 2× target".
-# Episodic default matches the preference: 530 MB per 24-min episode.
+# Episodic default: 41 MB/min ≈ 1.2 GB per 30-min episode.
 SIZE_MAX_MB_PER_MIN_MOVIE: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_MOVIE", "0"))
-SIZE_MAX_MB_PER_MIN_TV: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_TV", "22.1"))
-SIZE_MAX_MB_PER_MIN_ANIME: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_ANIME", "22.1"))
-SIZE_MAX_MB_PER_MIN_XANIME: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_XANIME", "22.1"))
+SIZE_MAX_MB_PER_MIN_TV: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_TV", "41"))
+SIZE_MAX_MB_PER_MIN_ANIME: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_ANIME", "41"))
+SIZE_MAX_MB_PER_MIN_XANIME: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_XANIME", "41"))
 
 # Never auto-download cam/telesync releases (movies). Manual grabs still obey
 # the user's click.

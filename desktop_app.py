@@ -246,6 +246,80 @@ class DesktopApp:
 
         walk(root_widget)
 
+    def _screenshot_tour(self) -> None:
+        """Docs capture (PLEXXARR_SHOT_DIR set): maximize, walk the tabs,
+        save one PNG per stop, then exit. Drives the real app so the README
+        screenshots always show live data."""
+        import os
+        import time as _time
+        from PIL import ImageGrab
+
+        outdir = Path(os.environ["PLEXXARR_SHOT_DIR"])
+        outdir.mkdir(parents=True, exist_ok=True)
+        self.root.state("zoomed")
+        self.root.lift()
+        self.root.focus_force()
+
+        def settle(seconds: float) -> None:
+            self.root.update()
+            _time.sleep(seconds)
+            self.root.update()
+
+        def grab(name: str, widget=None) -> None:
+            target = widget if widget is not None else self.root
+            x, y = target.winfo_rootx(), target.winfo_rooty()
+            w, h = target.winfo_width(), target.winfo_height()
+            img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
+            img.save(outdir / f"{name}.png")
+
+        nb = self._notebook
+        tabs = {nb.tab(t, "text"): t for t in nb.tabs()} if nb is not None else {}
+
+        def show_tab(label: str, wait: float = 2.0) -> bool:
+            if nb is None or label not in tabs:
+                return False
+            nb.select(tabs[label])
+            settle(wait)
+            return True
+
+        settle(1.5)
+        try:
+            if show_tab("Status", 3.0):
+                grab("status")
+            if show_tab("Shows", 2.5):
+                grab("shows")
+            if show_tab("Downloads"):
+                grab("downloads")
+            if show_tab("Library"):
+                try:
+                    self._lib_show_all()
+                except Exception:
+                    logger.exception("Library listing failed during capture")
+                tree = getattr(self, "library_results_tree", None)
+                for _ in range(20):  # the full listing loads on a thread
+                    settle(1.5)
+                    if tree is not None and tree.get_children():
+                        break
+                settle(1.0)
+                grab("library")
+            if show_tab("Settings"):
+                canvas = getattr(self, "_settings_canvas", None)
+                frame = getattr(self, "_size_pref_frame", None)
+                inner = getattr(self, "_settings_inner", None)
+                if canvas is not None and frame is not None and inner is not None:
+                    canvas.yview_moveto(
+                        frame.winfo_y() / max(1, inner.winfo_reqheight()))
+                    settle(1.0)
+                    grab("settings", frame)
+                    grab("settings_full")
+            wiz = self.open_setup_wizard()
+            settle(1.5)
+            grab("wizard", wiz)
+            wiz.destroy()
+        finally:
+            logger.info("Screenshot tour complete -> %s", outdir)
+            os._exit(0)
+
     def run(self) -> None:
         if not config.TELEGRAM_BOT_TOKEN:
             # Fresh install: no crash, no bot — walk the user through setup.
@@ -268,6 +342,9 @@ class DesktopApp:
 
         self._tray_icon.run_detached()
         self.root.after(0, self._initialize_runtime_state)
+        import os as _os
+        if _os.environ.get("PLEXXARR_SHOT_DIR"):
+            self.root.after(12000, self._screenshot_tour)
         try:
             self.root.mainloop()
         except KeyboardInterrupt:
@@ -619,9 +696,11 @@ class DesktopApp:
         filter_row = ttk.Frame(maintenance_tab)
         filter_row.grid(row=2, column=0, sticky="ew", pady=(0, 4))
         ttk.Label(filter_row, text="Show:").pack(side=tk.LEFT, padx=(0, 6))
-        for tag, label in (("movie", "Movies"), ("tv", "TV"),
-                            ("anime", "Anime"), ("xanime", "xAnime"),
-                            ("mixed", "Mixed/Other")):
+        maint_tags = [("movie", "Movies"), ("tv", "TV"), ("anime", "Anime")]
+        if config.XANIME_ENABLED:
+            maint_tags.append(("xanime", "xAnime"))
+        maint_tags.append(("mixed", "Mixed/Other"))
+        for tag, label in maint_tags:
             ttk.Checkbutton(
                 filter_row, text=label,
                 variable=self._maint_filter_vars[tag],
@@ -1302,11 +1381,15 @@ class DesktopApp:
             add_tooltip(btn, tip)
 
         self._lib_type_vars: dict[str, tk.BooleanVar] = {}
-        for col, (tag, label) in enumerate(self._LIB_TYPE_LABELS, start=5):
+        lib_labels = [tl for tl in self._LIB_TYPE_LABELS
+                      if tl[0] != "xanime" or config.XANIME_ENABLED]
+        for col, (tag, label) in enumerate(lib_labels, start=5):
             var = tk.BooleanVar(value=(tag == "movie"))  # movies-only by default
             self._lib_type_vars[tag] = var
             ttk.Checkbutton(toolbar, text=label, variable=var,
                             command=self._lib_filters_changed).grid(row=0, column=col, padx=2)
+        if "xanime" not in self._lib_type_vars:
+            self._lib_type_vars["xanime"] = tk.BooleanVar(value=False)
 
         # Movie tools — surfaced only while the Movies filter is the only one on.
         self._lib_movie_bar = ttk.Frame(tab)
@@ -1667,7 +1750,9 @@ class DesktopApp:
         search_entry.bind("<Return>", lambda _e: self.search_torrents_from_ui())
         ttk.Combobox(
             toolbar, textvariable=self._dl_type_var, state="readonly", width=8,
-            values=["movie", "tv", "anime", "xanime", "other"],
+            values=(["movie", "tv", "anime", "xanime", "other"]
+                    if config.XANIME_ENABLED
+                    else ["movie", "tv", "anime", "other"]),
         ).grid(row=0, column=2, padx=(0, 6))
         search_btn = ttk.Button(toolbar, text="Search", command=self.search_torrents_from_ui)
         search_btn.grid(row=0, column=3, padx=(0, 6))
@@ -3677,6 +3762,7 @@ class DesktopApp:
         ("QBITTORRENT_PASSWORD", "qBittorrent password", "secret"),
         # Quality rules
         ("BLOCK_CAMS", "Don't auto-download cams/telesyncs (movies)", "bool"),
+        ("XANIME_ENABLED", "Hentai (xanime) libraries, requests + search (restart to apply)", "bool"),
         ("LOW_QUALITY_MB_PER_MIN", "Low-quality threshold (MB per minute)", "text"),
         ("SUBTITLE_LANGUAGE", "Subtitle language (en, es, fr, …)", "text"),
         # Plex identity
@@ -3713,6 +3799,8 @@ class DesktopApp:
 
         inner = ttk.Frame(canvas, padding=(4, 4, 12, 4))
         inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        self._settings_canvas = canvas
+        self._settings_inner = inner
 
         def _on_inner_configure(_event: Any) -> None:
             canvas.configure(scrollregion=canvas.bbox("all"))
@@ -3771,7 +3859,8 @@ class DesktopApp:
         type_combo = ttk.Combobox(
             add_row,
             textvariable=new_type_var,
-            values=[label for _tag, label in self._PATH_TYPE_LABELS],
+            values=[label for _tag, label in self._PATH_TYPE_LABELS
+                    if _tag != "xanime" or config.XANIME_ENABLED],
             state="readonly",
             width=18,
         )
@@ -3914,6 +4003,7 @@ class DesktopApp:
         """
         frame = ttk.LabelFrame(inner, text="Preferred download size (0 = no preference)", padding=10)
         frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self._size_pref_frame = frame
         frame.columnconfigure(1, weight=1)
 
         ttk.Label(
@@ -3927,6 +4017,8 @@ class DesktopApp:
 
         grid_row = 1
         for key, label, minutes in self._SIZE_PREF_FIELDS:
+            if key.endswith("_XANIME") and not config.XANIME_ENABLED:
+                continue
             max_key = key.replace("SIZE_PREF_", "SIZE_MAX_")
             for slider_key, slider_label, empty_text in (
                 (key, label, "no preference"),
@@ -3953,7 +4045,7 @@ class DesktopApp:
                 scale = ttk.Scale(frame, from_=0.0, to=60.0, variable=var,
                                   command=update_readout)
                 scale.grid(row=grid_row, column=1, sticky="ew", pady=3)
-                ttk.Label(frame, textvariable=readout, width=34).grid(
+                ttk.Label(frame, textvariable=readout, width=42).grid(
                     row=grid_row, column=2, sticky="w", padx=(10, 0), pady=3)
                 update_readout()
                 self._settings_vars[slider_key] = var
@@ -4210,7 +4302,7 @@ class DesktopApp:
     def open_setup_wizard(self) -> None:
         win = tk.Toplevel(self.root)
         win.title("Setup Wizard")
-        win.geometry("680x560")
+        win.geometry("740x600")
         win.transient(self.root)
         win.columnconfigure(0, weight=1)
 
@@ -4271,13 +4363,25 @@ class DesktopApp:
         ttk.Checkbutton(step3, variable=node_var,
                         text="Install Node.js LTS (needed for the torrent Downloads tab)"
                         ).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(step3, variable=ollama_var,
-                        text=("Install Ollama + pull a small local model (~800 MB, "
-                              "CPU-friendly) for smarter request understanding — "
-                              "the app works fine without it")
-                        ).grid(row=1, column=0, sticky="w")
+        ttk.Checkbutton(
+            step3, variable=ollama_var,
+            text=("Install Ollama + pull a small local model (~800 MB, CPU-friendly)\n"
+                  "for smarter request understanding — the app works fine without it"),
+        ).grid(row=1, column=0, sticky="w")
+        xanime_var = tk.BooleanVar(value=config.XANIME_ENABLED)
+
+        def _save_xanime() -> None:
+            self._persist_dl_toggle("XANIME_ENABLED", xanime_var)
+            status_var.set("Hentai support %s — applies on next launch."
+                           % ("on" if xanime_var.get() else "off"))
+
+        ttk.Checkbutton(
+            step3, variable=xanime_var, command=_save_xanime,
+            text=("Include hentai (xanime) libraries, requests, "
+                  "and search — off unless you want it"),
+        ).grid(row=2, column=0, sticky="w")
         btn_row = ttk.Frame(step3)
-        btn_row.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        btn_row.grid(row=3, column=0, sticky="w", pady=(6, 0))
         ttk.Button(btn_row, text="Install checked (via winget)",
                    command=lambda: self._wizard_install(node_var.get(), ollama_var.get(), status_var)
                    ).pack(side=tk.LEFT, padx=(0, 8))
@@ -4311,6 +4415,7 @@ class DesktopApp:
                    ).grid(row=0, column=1, padx=(8, 6))
         ttk.Button(bottom, text="Close", command=win.destroy).grid(row=0, column=2)
         self._apply_dark_widget_styles(win)
+        return win
 
     def _wizard_validate_token(self, token: str, status_var: tk.StringVar) -> None:
         if not token:

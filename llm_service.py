@@ -189,8 +189,11 @@ def categorize_other_request(user_text: str) -> dict:
 
     try:
         parsed = json.loads(cleaned)
+        category = str(parsed.get("category") or "other")
+        if category == "xanime" and not config.XANIME_ENABLED:
+            category = "anime"  # hentai support is off — nearest sane bucket
         return {
-            "category": str(parsed.get("category") or "other"),
+            "category": category,
             "title": parsed.get("title"),
             "reasoning": str(parsed.get("reasoning") or "")[:200],
             "flagged": bool(parsed.get("flagged", False)),

@@ -24,6 +24,9 @@ pyinstaller_check.log
 # Local outreach/press kit — not part of the public repo
 OUTREACH.md
 
+# Raw screenshot-tour output (curated copies live in docs/)
+docs/_shots/
+
 # -----------------------------------------------------------------------
 # Python artefacts
 # -----------------------------------------------------------------------

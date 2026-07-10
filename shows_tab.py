@@ -149,8 +149,11 @@ class ShowsTab:
         ttk.Label(filter_row, text="Type:").pack(side=tk.LEFT)
         self._type_filter_vars: dict[str, tk.BooleanVar] = {}
         for tag, label in (("tv", "TV"), ("anime", "Anime"), ("xanime", "xAnime")):
-            var = tk.BooleanVar(value=True)
+            shown = tag != "xanime" or config.XANIME_ENABLED
+            var = tk.BooleanVar(value=shown)
             self._type_filter_vars[tag] = var
+            if not shown:
+                continue  # hentai is an opt-in pickup — chip hidden, rows filtered out
             ttk.Checkbutton(filter_row, text=label, variable=var,
                             command=self._render_shows).pack(side=tk.LEFT, padx=4)
 
