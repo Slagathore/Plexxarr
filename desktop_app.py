@@ -2101,7 +2101,17 @@ class DesktopApp:
 
         # Shows loop: auto-grab missing episodes at most every 6 hours (the
         # pass re-syncs stale shows itself, so freshly-aired episodes appear).
-        if config.SHOWS_AUTO_GRAB and time.time() - self._last_shows_grab_pass > 6 * 3600:
+        # THE BUG THAT STRANDED TANYA S02E01: this used to require the GLOBAL
+        # toggle, so per-show 🆕/✅ flags never triggered a pass at all.
+        def _any_flagged() -> bool:
+            try:
+                import shows_store as _ss
+                return any(s.auto_grab or s.follow_new for s in _ss.list_shows())
+            except Exception:
+                return False
+
+        if (time.time() - self._last_shows_grab_pass > 6 * 3600
+                and (config.SHOWS_AUTO_GRAB or _any_flagged())):
             self._last_shows_grab_pass = time.time()
 
             def shows_worker() -> None:

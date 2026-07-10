@@ -412,6 +412,7 @@ class DownloadManager:
                         "previous session.", killed)
 
         requeued = 0
+        finish_moves: list[int] = []
         for row in downloads_store.list_downloads(limit=300):
             if row.status == "downloading":
                 downloads_store.set_status(row.download_id, "queued")
@@ -419,9 +420,24 @@ class DownloadManager:
                     row.download_id, "recovered", before=None,
                     after="app restarted — requeued (existing data is kept)")
                 requeued += 1
+            elif row.status == "downloaded" and (row.auto_move or row.auto_rename):
+                # Post-process was interrupted (a cross-drive move can leave
+                # a PARTIAL copy at the destination) — finish it now.
+                finish_moves.append(row.download_id)
         if requeued:
             logger.info("Recovery: requeued %d download(s) from the previous "
                         "session.", requeued)
+        if finish_moves:
+            def finisher() -> None:
+                for did in finish_moves:
+                    try:
+                        outcome = self.apply_route(did)
+                        logger.info("Recovery: finished post-process for #%s: %s",
+                                    did, outcome)
+                    except Exception:
+                        logger.exception("Recovery post-process failed for #%s", did)
+            threading.Thread(target=finisher, name="dl-recovery-finish",
+                             daemon=True).start()
         self._maybe_start_next()
 
     # ------------------------------------------------------------------
@@ -1494,12 +1510,26 @@ class DownloadManager:
                             after=f"already in library ({target}) — staged copy recycled",
                         )
                         moved_any = True  # the episode IS in place
+                        continue
+                    try:
+                        target_smaller = target.stat().st_size < src.stat().st_size
+                    except OSError:
+                        target_smaller = False
+                    if target_smaller:
+                        # Interrupted cross-drive move left a partial copy —
+                        # replace it with the complete staged file.
+                        target.unlink(missing_ok=True)
+                        downloads_store.add_history(
+                            download_id, "replaced", before=str(target),
+                            after="partial copy from an interrupted move — replaced",
+                        )
+                        # fall through to the normal move below
                     else:
                         downloads_store.add_history(
                             download_id, "error", before=str(src),
-                            after=f"NOT moved — a DIFFERENT file exists at: {target}",
+                            after=f"NOT moved — a DIFFERENT (larger) file exists at: {target}",
                         )
-                    continue
+                        continue
                 shutil.move(str(src), str(target))
                 downloads_store.add_history(
                     download_id, "moved", before=str(src), after=str(target),
