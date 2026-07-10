@@ -83,6 +83,10 @@ If Sonarr + Radarr + Prowlarr + Overseerr + qBittorrent behind Docker fits your 
 **Setup wizard**
 ![Wizard](docs/wizard.png)
 
+**The Telegram request flow — search, fix-a-match, queue**
+
+<img src="docs/telegram.png" alt="Telegram request flow" width="600">
+
 </details>
 
 ## Privacy
@@ -207,13 +211,19 @@ The download pipeline is modeled on [torlink](https://github.com/baairon/torlink
 
 😺 Like the app? You could help me get more catnip for my many, many cats — they NEED their zoomies: [ko-fi.com/sparklemuffin](https://ko-fi.com/sparklemuffin).
 
-<!-- The beneficiaries — uncomment once photos land in docs/cats/
+## Cat Tax:
+
 <p>
-  <img src="docs/cats/cat1.jpg" alt="cat 1" height="220">
-  <img src="docs/cats/cat2.jpg" alt="cat 2" height="220">
-  <img src="docs/cats/cat3.jpg" alt="cat 3" height="220">
+  <img src="docs/cats/cat1.jpg" alt="sunbeam floof" height="220">
+  <img src="docs/cats/cat2.jpg" alt="dramatic arch" height="220">
+  <img src="docs/cats/cat3.jpg" alt="shelf lounger" height="220">
 </p>
--->
+<p>
+  <img src="docs/cats/cat4.jpg" alt="the pile" height="220">
+  <img src="docs/cats/cat5.jpg" alt="sun sleeper" height="220">
+  <img src="docs/cats/cat6.jpg" alt="door patrol, with dog" height="220">
+  <img src="docs/cats/cat7.jpg" alt="the snuggle" height="220">
+</p>
 
 ## License
 

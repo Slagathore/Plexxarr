@@ -1,3 +1,4 @@
-Drop cat photos here as cat1.jpg, cat2.jpg, cat3.jpg — the README's Support
-section shows them at 220px tall. Any aspect ratio works. Add more by copying
-the <img> line in README.md.
+Cat Tax photos, shown in README.md (## Cat Tax:). cat1..cat7.jpg are
+EXIF-stripped and resized to 1200px wide. To add more: drop a photo here,
+run it through the same treatment (any image tool; strip metadata), and
+add an <img> line to the README section.

@@ -455,6 +455,49 @@ def _season_from_parents(file_path: Path, root: Path) -> int | None:
     return None
 
 
+def runtime_from_disk(folders: tuple[str, ...],
+                      max_probes: int = 5) -> float | None:
+    """Median runtime (minutes) ffprobed from episodes already on disk.
+
+    The last-resort grounding anchor: when neither the local anime DB nor
+    TMDB knows a runtime, the user's own files do. Skips extras folders and
+    OVA/NC specials, probes the largest few files (biases toward real
+    episodes over shorts), and only trusts exact ffprobe results — so a
+    machine without ffprobe simply returns None instead of a 2-hour guess.
+    """
+    import statistics
+
+    import video_quality
+
+    candidates: list[Path] = []
+    for folder in folders:
+        root = Path(folder)
+        if not root.is_dir():
+            continue
+        for f in root.rglob("*"):
+            if not f.is_file() or f.suffix.lower() not in VIDEO_EXTENSIONS:
+                continue
+            if _EXTRAS_DIR_RE.search(str(f.parent)):
+                continue
+            if _SPECIAL_MARKER_RE.search(f.stem):
+                continue
+            candidates.append(f)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda f: f.stat().st_size, reverse=True)
+
+    minutes: list[float] = []
+    for f in candidates[:max_probes]:
+        try:
+            probed, exact = video_quality.duration_minutes(
+                str(f), f.stat().st_size)
+        except OSError:
+            continue
+        if exact and probed and probed > 0:
+            minutes.append(probed)
+    return round(statistics.median(minutes), 2) if minutes else None
+
+
 def _first_video_file(folders: tuple[str, ...]) -> str | None:
     """First non-extras video under the mapped folders (largest first, so a
     sample never wins over the actual episode)."""
@@ -639,6 +682,11 @@ def _sync_show_impl(show_id: int) -> str:
         runtime = anime_db.duration_for_anidb(show.external_id)
     if runtime is None and tmdb_id and not show.runtime_min:
         runtime = get_tmdb_show_runtime(tmdb_id)
+    if runtime is None and not show.runtime_min:
+        # No database knows this one (common for hentai) — the files already
+        # on disk are real data. Only brand-new shows with nothing owned
+        # remain on the per-type default.
+        runtime = runtime_from_disk(show.folders)
     if runtime and runtime > 0 and abs((show.runtime_min or 0) - runtime) > 0.01:
         shows_store.set_show_runtime(show_id, round(float(runtime), 2))
 
