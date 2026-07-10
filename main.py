@@ -91,8 +91,41 @@ def _ensure_admin() -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _already_running() -> bool:
+    """Single-instance guard: two Plexxarr instances mean two Telegram
+    pollers (constant conflicts), two schedulers, and two download queues
+    fighting over the same staging folder. PID lock in the app dir."""
+    import os
+    import config
+    lock = config.APP_DIR / "plexxarr.pid"
+    try:
+        if lock.is_file():
+            old_pid = int(lock.read_text().strip() or 0)
+            if old_pid and old_pid != os.getpid():
+                try:
+                    import psutil
+                    proc = psutil.Process(old_pid)
+                    blob = ((proc.name() or "") + " "
+                            + " ".join(proc.cmdline())).lower()
+                    # Frozen EXE ("plexxarr.exe") or a source run of main.py.
+                    if proc.is_running() and (
+                            "plexxarr" in blob or "main.py" in blob):
+                        return True
+                except Exception:
+                    pass  # stale/undecodable lock — take it over
+        lock.write_text(str(os.getpid()), encoding="ascii")
+    except OSError:
+        pass
+    return False
+
+
 def main() -> None:
     _ensure_admin()
+    if _already_running():
+        ctypes.windll.user32.MessageBoxW(
+            None, "Plexxarr is already running (check the system tray).",
+            "Plexxarr", 0x30)
+        return
     try:
         from desktop_app import run_desktop_app
 

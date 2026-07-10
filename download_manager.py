@@ -309,6 +309,7 @@ class DownloadManager:
         self._progress_seen: dict[int, tuple[float, float]] = {}
         self._rotate_cooldown: dict[int, float] = {}
         downloads_store.initialize_downloads_db()
+        self._recover_previous_session()
         threading.Thread(target=self._queue_monitor, name="dl-queue-monitor",
                          daemon=True).start()
 
@@ -377,6 +378,53 @@ class DownloadManager:
         return download_id
 
     # ------------------------------------------------------------------
+    # Crash/restart recovery
+    # ------------------------------------------------------------------
+
+    def _recover_previous_session(self) -> None:
+        """Clean up after a previous app session.
+
+        Node runners are detached children — they SURVIVE the app closing,
+        keep downloading into staging, and hold file locks, while their rows
+        sit frozen at 'downloading' in the new session (the 95%%-zombie
+        symptom). Kill any leftover runner of ours and requeue those rows;
+        existing data is verified and kept on restart.
+        """
+        killed = 0
+        try:
+            import psutil
+            runner_marker = _RUNNER_PATH.name  # download.mjs
+            for proc in psutil.process_iter(["name", "cmdline"]):
+                try:
+                    if (proc.info["name"] or "").lower() not in ("node.exe", "node"):
+                        continue
+                    cmdline = " ".join(proc.info["cmdline"] or [])
+                    if runner_marker in cmdline and str(
+                            Path(config.TORRENT_DOWNLOAD_DIR)) in cmdline:
+                        proc.kill()
+                        killed += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception:
+            logger.exception("Orphan runner sweep failed.")
+        if killed:
+            logger.info("Recovery: killed %d orphaned torrent runner(s) from a "
+                        "previous session.", killed)
+
+        requeued = 0
+        for row in downloads_store.list_downloads(limit=300):
+            if row.status == "downloading":
+                downloads_store.set_status(row.download_id, "queued")
+                downloads_store.add_history(
+                    row.download_id, "recovered", before=None,
+                    after="app restarted — requeued (existing data is kept)")
+                requeued += 1
+        if requeued:
+            logger.info("Recovery: requeued %d download(s) from the previous "
+                        "session.", requeued)
+        self._maybe_start_next()
+
+    # ------------------------------------------------------------------
     # Built-in engine queue: cap concurrent downloads, rotate stalled ones
     # ------------------------------------------------------------------
 
@@ -438,8 +486,8 @@ class DownloadManager:
                         self._progress_seen[row.download_id] = (row.progress, now)
                         continue
                     stale_s = now - seen[1]
-                    if (queued_waiting
-                            and stale_s > config.DOWNLOAD_SLOW_ROTATE_MINUTES * 60):
+                    window = config.DOWNLOAD_SLOW_ROTATE_MINUTES * 60
+                    if stale_s > (window if queued_waiting else window * 3):
                         logger.info(
                             "Download #%s made no progress for %.0f min — rotating "
                             "it back to the queue.", row.download_id, stale_s / 60)
@@ -1424,10 +1472,26 @@ class DownloadManager:
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 target = dest_dir / target_name
                 if target.exists():
-                    downloads_store.add_history(
-                        download_id, "error", before=str(src),
-                        after=f"NOT moved — target exists: {target}",
-                    )
+                    try:
+                        same_size = target.stat().st_size == src.stat().st_size
+                    except OSError:
+                        same_size = False
+                    if same_size:
+                        try:
+                            from send2trash import send2trash
+                            send2trash(str(src))
+                        except Exception:
+                            src.unlink(missing_ok=True)
+                        downloads_store.add_history(
+                            download_id, "duplicate", before=str(src),
+                            after=f"already in library ({target}) — staged copy recycled",
+                        )
+                        moved_any = True  # the episode IS in place
+                    else:
+                        downloads_store.add_history(
+                            download_id, "error", before=str(src),
+                            after=f"NOT moved — a DIFFERENT file exists at: {target}",
+                        )
                     continue
                 shutil.move(str(src), str(target))
                 downloads_store.add_history(
