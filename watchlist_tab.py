@@ -24,6 +24,14 @@ from ui_helpers import add_tooltip, make_sortable
 
 logger = logging.getLogger(__name__)
 
+# Selectable before any fetch has run; a fetch merges in the user's own top
+# genres. Names match the TMDB discover maps in plex_api.
+_STANDARD_GENRES = [
+    "Action", "Adventure", "Animation", "Comedy", "Crime", "Documentary",
+    "Drama", "Family", "Fantasy", "Horror", "Mystery", "Romance",
+    "Science Fiction", "Thriller", "War", "Western",
+]
+
 _TYPE_TO_MEDIA = {"movie": "movie", "show": "tv"}
 
 
@@ -100,9 +108,15 @@ class WatchlistTab:
         self._user_combo.pack(side=tk.LEFT, padx=(4, 12))
         ttk.Label(recs_bar, text="Genre:").pack(side=tk.LEFT)
         self._genre_var = tk.StringVar(value="All")
-        self._genre_combo = ttk.Combobox(recs_bar, textvariable=self._genre_var,
-                                         width=16, state="readonly", values=["All"])
+        # Seeded with the standard genre set so the filter works before the
+        # first fetch; a fetch swaps in the user's actual top genres.
+        self._genre_combo = ttk.Combobox(
+            recs_bar, textvariable=self._genre_var, width=16, state="readonly",
+            values=["All"] + _STANDARD_GENRES)
         self._genre_combo.pack(side=tk.LEFT, padx=(4, 12))
+        # The genre filter is applied at fetch time — picking one refetches,
+        # otherwise the selection silently did nothing until the next click.
+        self._genre_combo.bind("<<ComboboxSelected>>", lambda _e: self.get_recs())
         ttk.Label(recs_bar, text="Type:").pack(side=tk.LEFT)
         self._type_var = tk.StringVar(value="All")
         type_combo = ttk.Combobox(recs_bar, textvariable=self._type_var, width=8,
@@ -117,7 +131,7 @@ class WatchlistTab:
                                state="readonly",
                                values=["Everything", "In library", "Not in library"])
         libmode.pack(side=tk.LEFT, padx=(4, 12))
-        libmode.bind("<<ComboboxSelected>>", lambda _e: self._render_recs())
+        libmode.bind("<<ComboboxSelected>>", lambda _e: self._libmode_changed())
         get_btn = ttk.Button(recs_bar, text="Get Recommendations", command=self.get_recs)
         get_btn.pack(side=tk.LEFT)
         add_tooltip(get_btn, "Analyse this user's Plex watch history, find their top "
@@ -166,7 +180,9 @@ class WatchlistTab:
             self._recs_all = payload.get("recs", [])
             self._top_genres = payload.get("genres", [])
             if self._top_genres:
-                self._genre_combo.configure(values=["All"] + self._top_genres)
+                merged = self._top_genres + [g for g in _STANDARD_GENRES
+                                             if g not in self._top_genres]
+                self._genre_combo.configure(values=["All"] + merged)
             self._render_recs()
             self._status_var.set(
                 f"Loaded last recommendations (from {payload.get('at', '?')}) — "
@@ -237,6 +253,17 @@ class WatchlistTab:
 
         threading.Thread(target=worker, name="wl-pull", daemon=True).start()
 
+    def _libmode_changed(self) -> None:
+        """Re-render — and refetch when the cached recs can't satisfy the new
+        mode (e.g. 'Not in library' after an in-library-only fetch, which
+        used to render as a permanent 'none')."""
+        mode = self._libmode_var.get()
+        cached = getattr(self, "_recs_all", []) or []
+        if mode == "Not in library" and not any(not r.in_library for r in cached):
+            self.get_recs()
+            return
+        self._render_recs()
+
     def get_recs(self) -> None:
         user = self._user_var.get().strip()
         genre = self._genre_var.get().strip()
@@ -259,7 +286,9 @@ class WatchlistTab:
                 self._recs_all = recs
                 if top_genres:  # keep the previous genre list on a dud fetch
                     self._top_genres = top_genres
-                    self._genre_combo.configure(values=["All"] + top_genres)
+                    merged = top_genres + [g for g in _STANDARD_GENRES
+                                           if g not in top_genres]
+                    self._genre_combo.configure(values=["All"] + merged)
                 self._render_recs()
                 self._persist_recs()
             self.app._post_to_ui(render)

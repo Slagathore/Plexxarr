@@ -41,6 +41,7 @@ from telegram_service import TelegramBotService
 import anime_db
 import auth_store
 import downloads_store
+import shows_store
 import telegram_service
 import torrent_routing
 from download_manager import DownloadManager
@@ -151,18 +152,18 @@ class DesktopApp:
         self._maint_cache: dict[str, dict[str, Any]] = {}
         self._maint_load_cache()
         self._maint_tree: ttk.Treeview | None = None
-        self._maint_check_vars: list[tk.BooleanVar] = []
         self._maint_status_var = tk.StringVar(value="Select a tool to run.")
         # Typed rows for re-rendering after a filter toggle.
         # Each entry: (media_type_tag, row_values, action_payload).
         # action_payload is opaque per-tool — for find_duplicates it's the
         # file path so Apply Selected can delete the right files; for
-        # sanitize it's the SanitizePair index.
+        # sanitize it's the SanitizePair index; for missing_episodes a
+        # ("grab_ep", …) tuple. Summary rows carry None (not actionable).
         self._maint_typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = []
-        # Per-row payloads currently visible after filtering — kept parallel
-        # to _maint_check_vars so Apply Selected can resolve checked rows
-        # back to the right path / index.
-        self._maint_visible_payloads: list[Any] = []
+        # Visible-row state keyed by tree iid — sorting reorders rows without
+        # breaking the checkbox ↔ payload mapping.
+        self._maint_row_state: dict[str, tuple[tk.BooleanVar, Any]] = {}
+        self._maint_default_checked = False
         # Filter checkbox state — one BooleanVar per media type tag.
         self._maint_filter_vars: dict[str, tk.BooleanVar] = {
             tag: tk.BooleanVar(value=True) for tag in ("movie", "tv", "anime", "xanime", "mixed")
@@ -706,6 +707,12 @@ class DesktopApp:
                 variable=self._maint_filter_vars[tag],
                 command=self._apply_maint_filter,
             ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(filter_row, text="Select all",
+                   command=lambda: self._maint_set_all(True)
+                   ).pack(side=tk.LEFT, padx=(14, 3))
+        ttk.Button(filter_row, text="Deselect all",
+                   command=lambda: self._maint_set_all(False)
+                   ).pack(side=tk.LEFT, padx=3)
 
         # Adjust the tab's row layout: results frame moves to row 3.
         maintenance_tab.rowconfigure(3, weight=1)
@@ -735,6 +742,9 @@ class DesktopApp:
         maint_scroll.grid(row=0, column=1, sticky="ns")
         self._maint_tree.configure(yscrollcommand=maint_scroll.set)
         self._maint_tree.bind("<ButtonRelease-1>", self._on_maint_tree_click)
+        # Row state is keyed by tree iid (not row index), so header-click
+        # sorting can reorder rows without breaking the checkboxes.
+        make_sortable(self._maint_tree)
 
         # -----------------------------------------------------------------
         # Settings tab
@@ -2012,13 +2022,33 @@ class DesktopApp:
         values = self._dl_downloads_tree.item(selected[0], "values")
         return int(values[0]) if values else None
 
+    @staticmethod
+    def _download_row_order(row: Any) -> tuple[int, int]:
+        """Downloads-tab ordering (per Cole): actively downloading first,
+        partial (stopped with progress) next, then queued, then failed,
+        then completed/renamed/moved. Newest first within each group."""
+        status = row.status
+        progress = row.progress or 0.0
+        if status == "downloading":
+            group = 0
+        elif status in ("queued", "cancelled", "stalled") and progress > 0:
+            group = 1  # partial — will resume from existing data
+        elif status in ("queued", "pending"):
+            group = 2
+        elif status == "error":
+            group = 3
+        else:
+            group = 4  # downloaded / moved / other terminal states
+        return (group, -row.download_id)
+
     def refresh_downloads(self) -> None:
         if self._dl_downloads_tree is None:
             return
         selected_id = self._selected_download_id()
         for item in self._dl_downloads_tree.get_children():
             self._dl_downloads_tree.delete(item)
-        for row in downloads_store.list_downloads(limit=100):
+        for row in sorted(downloads_store.list_downloads(limit=100),
+                          key=self._download_row_order):
             route = row.error if row.status == "error" else (
                 (f"{row.planned_dest or ''}" + (f" / {row.planned_name}" if row.planned_name else ""))
                 or row.route_reason or ""
@@ -2496,6 +2526,7 @@ class DesktopApp:
         col3: str = "Extra",
         check_label: str = "[/]",
         typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] | None = None,
+        default_checked: bool = False,
     ) -> None:
         """
         Render rows into the maintenance results tree.
@@ -2523,6 +2554,7 @@ class DesktopApp:
             typed_rows = [("mixed", row, None) for row in rows]
 
         self._maint_typed_rows = list(typed_rows)
+        self._maint_default_checked = default_checked
         self._apply_maint_filter()
 
         # Cache the render so switching tools and back is instant — and
@@ -2533,6 +2565,7 @@ class DesktopApp:
                 "typed_rows": self._maint_typed_rows,
                 "cols": (col1, col2, col3),
                 "check_label": check_label,
+                "default_checked": default_checked,
                 "status": self._maint_status_var.get(),
                 "at": datetime.datetime.now().strftime("%b %d %H:%M"),
             }
@@ -2553,6 +2586,7 @@ class DesktopApp:
         self._populate_maint_tree(
             [], col1=col1, col2=col2, col3=col3,
             check_label=cached["check_label"], typed_rows=cached["typed_rows"],
+            default_checked=cached.get("default_checked", tool == "clean_junk"),
         )
         self._maint_status_var.set(
             f"{cached['status']}  (cached {cached['at']} — 🔄 Re-run to refresh)"
@@ -2611,9 +2645,9 @@ class DesktopApp:
     def _apply_maint_filter(self) -> None:
         """
         Re-render the maintenance tree from `_maint_typed_rows`, hiding rows
-        whose media-type tag is currently unchecked. Re-builds the parallel
-        `_maint_check_vars` and `_maint_visible_payloads` lists so Apply
-        Selected can map a checked row back to its action payload.
+        whose media-type tag is currently unchecked. Rebuilds `_maint_row_state`
+        (iid → (checkbox var, payload)) so Apply Selected can map a checked
+        row back to its action payload even after header-click sorting.
         """
         if self._maint_tree is None:
             return
@@ -2621,16 +2655,19 @@ class DesktopApp:
 
         for item in self._maint_tree.get_children():
             self._maint_tree.delete(item)
-        self._maint_check_vars = []
-        self._maint_visible_payloads: list[Any] = []
+        # iid -> (checked BooleanVar, action payload); survives header sorting.
+        self._maint_row_state: dict[str, tuple[tk.BooleanVar, Any]] = {}
 
+        checked = bool(getattr(self, "_maint_default_checked", False))
         for media_type, (_check, c1, c2, c3), payload in self._maint_typed_rows:
             if media_type not in active_tags:
                 continue
-            var = tk.BooleanVar(value=False)
-            self._maint_check_vars.append(var)
-            self._maint_visible_payloads.append(payload)
-            self._maint_tree.insert("", "end", values=("[ ]", c1, c2, c3))
+            # Rows with no action payload (summary lines) are never checked.
+            row_checked = checked and payload is not None
+            var = tk.BooleanVar(value=row_checked)
+            mark = "[X]" if row_checked else "[ ]"
+            item = self._maint_tree.insert("", "end", values=(mark, c1, c2, c3))
+            self._maint_row_state[item] = (var, payload)
 
     def _on_maint_tree_click(self, event: Any) -> None:
         if self._maint_tree is None:
@@ -2644,18 +2681,77 @@ class DesktopApp:
         row_id = self._maint_tree.identify_row(event.y)
         if not row_id:
             return
-        children = list(self._maint_tree.get_children())
-        try:
-            idx = children.index(row_id)
-        except ValueError:
+        state = getattr(self, "_maint_row_state", {}).get(row_id)
+        if state is None:
             return
-        if idx >= len(self._maint_check_vars):
-            return
-        var = self._maint_check_vars[idx]
+        var, _payload = state
         var.set(not var.get())
         current_vals = list(self._maint_tree.item(row_id, "values"))
         current_vals[0] = "[X]" if var.get() else "[ ]"
         self._maint_tree.item(row_id, values=current_vals)
+
+    def _grab_missing_selected(self, gaps: list[tuple]) -> None:
+        """Missing Episodes -> Apply Selected: search + download each checked
+        gap through the tracked show it belongs to (same path auto-grab uses,
+        so relevance guards and size anchors all apply)."""
+        if not self._ask_yes_no(
+            "Download missing episodes",
+            f"Search for and download {len(gaps)} missing episode(s)?\n\n"
+            "Each grab uses the tracked show's runtime-anchored size rules.",
+        ):
+            return
+        self._maint_status_var.set(f"Grabbing {len(gaps)} missing episode(s)…")
+
+        def worker() -> None:
+            by_folder: dict[str, Any] = {}
+            for s in shows_store.list_shows():
+                for f in s.folders:
+                    by_folder[f.casefold()] = s
+            started = 0
+            skipped: list[str] = []
+            for _tag, title, season, episode, show_path in gaps:
+                label = f"{title} S{season:02d}E{episode:02d}"
+                show = by_folder.get(str(show_path).casefold())
+                if show is None:
+                    skipped.append(label + " (folder not tracked)")
+                    continue
+                ep_row = next(
+                    (e for e in shows_store.list_episodes(show.show_id)
+                     if e.season == season and e.episode == episode), None)
+                if ep_row is None:
+                    skipped.append(label + " (no tracker row — Sync the show)")
+                    continue
+                try:
+                    started += len(
+                        self.download_manager._grab_one_episode(show, ep_row))
+                except Exception:
+                    logger.exception("Missing-episode grab failed for %s", label)
+                    skipped.append(label + " (error — see log)")
+
+            def done() -> None:
+                msg = f"Missing Episodes: started {started} download(s)."
+                if skipped:
+                    msg += f" Skipped {len(skipped)}."
+                    self._show_warning(
+                        "Missing Episodes",
+                        "Skipped:\n" + "\n".join(skipped[:12])
+                        + ("\n…" if len(skipped) > 12 else ""))
+                self._maint_status_var.set(msg)
+            self._post_to_ui(done)
+
+        threading.Thread(target=worker, name="maint-grab-missing",
+                         daemon=True).start()
+
+    def _maint_set_all(self, state: bool) -> None:
+        """Check or uncheck every visible row (summary rows stay unchecked)."""
+        if self._maint_tree is None:
+            return
+        for item, (var, payload) in getattr(self, "_maint_row_state", {}).items():
+            value = state and payload is not None
+            var.set(value)
+            vals = list(self._maint_tree.item(item, "values"))
+            vals[0] = "[X]" if value else "[ ]"
+            self._maint_tree.item(item, values=vals)
 
     # =====================================================================
     # Maintenance tab — daily library check
@@ -2994,6 +3090,7 @@ class DesktopApp:
         self._populate_maint_tree(
             [], col1="File / Folder", col2="Why it's junk", col3="Size",
             check_label="Delete?", typed_rows=typed_rows,
+            default_checked=True,
         )
 
     # =====================================================================
@@ -3061,19 +3158,19 @@ class DesktopApp:
                     ("", f"{show_title}  S{s.season:02d}", summary, show_path),
                     None,
                 ))
-            # Per-gap rows underneath
+            # Per-gap rows underneath — checkable: Apply Selected downloads them.
             for ep in report.gaps:
                 if ep.show_title != show_title:
                     continue
                 typed_rows.append((
                     tag,
                     ("", f"  -> missing", f"S{ep.season:02d}E{ep.episode:02d}", ep.show_path),
-                    None,
+                    ("grab_ep", ep.show_title, ep.season, ep.episode, ep.show_path),
                 ))
 
         self._populate_maint_tree(
             [], col1="Show / Season", col2="Detail", col3="Path",
-            typed_rows=typed_rows,
+            check_label="Grab?", typed_rows=typed_rows,
         )
         self._show_info(
             "Missing Episodes",
@@ -3148,7 +3245,8 @@ class DesktopApp:
 
     def _apply_maint_selection(self) -> None:
         if self._maint_tool_name not in ("sanitize", "find_duplicates",
-                                         "custom_rename", "clean_junk"):
+                                         "custom_rename", "clean_junk",
+                                         "missing_episodes"):
             self._show_info(
                 "Apply Selection",
                 "The current tool results have no applyable actions.\n\n"
@@ -3156,14 +3254,15 @@ class DesktopApp:
                 "  - Find Duplicates    -> DELETES the checked files\n"
                 "  - Clean Junk         -> DELETES the checked junk/empty folders\n"
                 "  - Sanitize Names     -> RENAMES the checked files\n"
-                "  - Custom Rename...   -> RENAMES per your rules",
+                "  - Custom Rename...   -> RENAMES per your rules\n"
+                "  - Missing Episodes   -> DOWNLOADS the checked episodes",
             )
             return
 
         selected_payloads = [
             payload
-            for var, payload in zip(self._maint_check_vars, self._maint_visible_payloads)
-            if var.get()
+            for var, payload in getattr(self, "_maint_row_state", {}).values()
+            if var.get() and payload is not None
         ]
         if not selected_payloads:
             self._show_warning("Nothing selected", "Check at least one row before clicking Apply Selected.")
@@ -3194,6 +3293,14 @@ class DesktopApp:
                 self._post_to_ui(lambda: self._handle_apply_sanitize_result(len(pairs), errors))
 
             threading.Thread(target=worker, name="maint-apply-sanitize", daemon=True).start()
+            return
+
+        if self._maint_tool_name == "missing_episodes":
+            gaps = [p for p in selected_payloads
+                    if isinstance(p, tuple) and p and p[0] == "grab_ep"]
+            if not gaps:
+                return
+            self._grab_missing_selected(gaps)
             return
 
         if self._maint_tool_name == "find_duplicates":

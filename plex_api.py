@@ -524,7 +524,9 @@ def get_recommendations(
     return top_genres, results
 
 
-# TMDB genre-name → id (movie discover). Only common ones; unknown names skip.
+# TMDB genre-name → id. Movies and TV use DIFFERENT id sets for several
+# genres (TMDB merges some into combo genres on the TV side), so discover
+# queries each endpoint with its own map; unknown names skip that endpoint.
 _TMDB_GENRE_IDS = {
     "action": 28, "adventure": 12, "animation": 16, "comedy": 35, "crime": 80,
     "documentary": 99, "drama": 18, "family": 10751, "fantasy": 14,
@@ -532,43 +534,65 @@ _TMDB_GENRE_IDS = {
     "romance": 10749, "science fiction": 878, "sci-fi": 878, "thriller": 53,
     "war": 10752, "western": 37,
 }
+_TMDB_TV_GENRE_IDS = {
+    "action": 10759, "adventure": 10759, "animation": 16, "anime": 16,
+    "comedy": 35, "crime": 80, "documentary": 99, "drama": 18,
+    "family": 10751, "fantasy": 10765, "kids": 10762, "mystery": 9648,
+    "science fiction": 10765, "sci-fi": 10765, "war": 10768,
+    "western": 37, "reality": 10764, "soap": 10766, "talk": 10767,
+}
 
 
 def _tmdb_discover_recs(genre_name: str, *, exclude_titles: set[str],
                         limit: int) -> list[Recommendation]:
-    """Popular TMDB movies in a genre that aren't in the library yet."""
+    """Popular TMDB movies AND shows in a genre that aren't in the library.
+
+    Both endpoints run — "Animation shows not in library" used to return
+    nothing because only /discover/movie was queried and the Type filter
+    then dropped every result."""
     import json as _json
     import urllib.request as _rq
-    genre_id = _TMDB_GENRE_IDS.get(genre_name.casefold())
-    if genre_id is None:
-        return []
-    try:
-        req = _rq.Request(
-            "https://api.themoviedb.org/3/discover/movie"
-            f"?api_key={config.TMDB_API_KEY}&with_genres={genre_id}"
-            "&sort_by=popularity.desc&vote_count.gte=500",
-            headers={"Accept": "application/json"},
-        )
-        with _rq.urlopen(req, timeout=15) as resp:
-            data = _json.loads(resp.read().decode("utf-8", errors="replace"))
-    except Exception:
-        logger.debug("TMDB discover failed.", exc_info=True)
-        return []
+
+    plans = []
+    movie_id = _TMDB_GENRE_IDS.get(genre_name.casefold())
+    if movie_id is not None:
+        plans.append(("movie", "discover/movie", movie_id, "title", "release_date"))
+    tv_id = _TMDB_TV_GENRE_IDS.get(genre_name.casefold())
+    if tv_id is not None:
+        plans.append(("show", "discover/tv", tv_id, "name", "first_air_date"))
+
     out: list[Recommendation] = []
-    for item in data.get("results", []):
-        title = str(item.get("title") or "")
-        if not title or title.casefold() in exclude_titles:
+    per_type = max(3, limit // 2) if len(plans) > 1 else limit
+    for item_type, endpoint, genre_id, title_key, date_key in plans:
+        try:
+            req = _rq.Request(
+                f"https://api.themoviedb.org/3/{endpoint}"
+                f"?api_key={config.TMDB_API_KEY}&with_genres={genre_id}"
+                "&sort_by=popularity.desc&vote_count.gte=200",
+                headers={"Accept": "application/json"},
+            )
+            with _rq.urlopen(req, timeout=15) as resp:
+                data = _json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception:
+            logger.debug("TMDB discover failed for %s.", endpoint, exc_info=True)
             continue
-        year = None
-        if item.get("release_date"):
-            year = _safe_int(str(item["release_date"])[:4]) or None
-        out.append(Recommendation(
-            title=title, year=year, item_type="movie",
-            genres=(genre_name,), note=f"popular {genre_name} (not in library)",
-            in_library=False,
-        ))
-        if len(out) >= limit:
-            break
+        added = 0
+        for item in data.get("results", []):
+            title = str(item.get(title_key) or "")
+            if not title or title.casefold() in exclude_titles:
+                continue
+            year = None
+            if item.get(date_key):
+                year = _safe_int(str(item[date_key])[:4]) or None
+            out.append(Recommendation(
+                title=title, year=year, item_type=item_type,
+                genres=(genre_name,),
+                note=f"popular {genre_name} (not in library)",
+                in_library=False,
+            ))
+            added += 1
+            if added >= per_type:
+                break
     return out
 
 
