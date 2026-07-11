@@ -49,6 +49,9 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("downloads", "show_id", "INTEGER"),
     ("downloads", "season", "INTEGER"),
     ("downloads", "episode", "INTEGER"),
+    # Explicit failure-memory context ("pack:title:2") for grabs that have
+    # neither an episode context nor a request id (flag-driven season packs).
+    ("downloads", "failure_key", "TEXT"),
     # Quality-replacement grabs: the old (cam/low-quality) file to delete
     # once this download has moved into the library.
     ("downloads", "replace_path", "TEXT"),
@@ -95,6 +98,7 @@ class DownloadRow:
     episode: int | None = None
     replace_path: str | None = None
     files_json: str | None = None
+    failure_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,7 +115,7 @@ _DOWNLOAD_COLUMNS = (
     "id, request_id, title, magnet, source, media_type, status, progress, "
     "staging_dir, planned_dest, planned_name, route_reason, auto_rename, "
     "auto_move, error, created_at, completed_at, show_id, season, episode, "
-    "replace_path, files_json"
+    "replace_path, files_json, failure_key"
 )
 
 
@@ -211,7 +215,7 @@ def _row_to_download(row) -> DownloadRow:
         route_reason=row[11], auto_rename=bool(row[12]), auto_move=bool(row[13]),
         error=row[14], created_at=row[15], completed_at=row[16],
         show_id=row[17], season=row[18], episode=row[19],
-        replace_path=row[20], files_json=row[21],
+        replace_path=row[20], files_json=row[21], failure_key=row[22],
     )
 
 
@@ -222,6 +226,7 @@ def create_download(
     auto_rename: bool, auto_move: bool,
     show_id: int | None = None, season: int | None = None,
     episode: int | None = None, replace_path: str | None = None,
+    failure_key: str | None = None,
 ) -> int:
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
@@ -230,13 +235,13 @@ def create_download(
             INSERT INTO downloads
                 (request_id, title, magnet, source, media_type, staging_dir,
                  planned_dest, planned_name, route_reason, auto_rename, auto_move,
-                 show_id, season, episode, replace_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 show_id, season, episode, replace_path, failure_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (request_id, title, magnet, source, media_type, staging_dir,
              planned_dest, planned_name, route_reason,
              int(auto_rename), int(auto_move), show_id, season, episode,
-             replace_path),
+             replace_path, failure_key),
         )
         conn.commit()
         download_id = int(cursor.lastrowid or 0)
@@ -289,11 +294,12 @@ def _remember_failure(download_id: int) -> None:
     m = _re.search(r"btih:([A-Za-z0-9]{32,40})", row.magnet or "")
     if not m:
         return
-    key = None
-    if row.show_id is not None and row.season is not None and row.episode is not None:
-        key = f"ep:{row.show_id}:{row.season}:{row.episode}"
-    elif row.request_id is not None:
-        key = f"req:{row.request_id}"
+    key = getattr(row, "failure_key", None)
+    if not key:
+        if row.show_id is not None and row.season is not None and row.episode is not None:
+            key = f"ep:{row.show_id}:{row.season}:{row.episode}"
+        elif row.request_id is not None:
+            key = f"req:{row.request_id}"
     if key:
         record_failed_grab(key, m.group(1))
 

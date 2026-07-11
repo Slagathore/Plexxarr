@@ -382,6 +382,7 @@ class DownloadManager:
         auto_move: bool | None = None,
         episode_context: tuple[int, int, int] | None = None,  # (show_id, season, episode)
         replace_path: str | None = None,  # old low-quality file to delete after move
+        failure_key: str | None = None,   # failure-memory context for pack grabs
     ) -> int:
         """Start downloading a search result. Returns the download row id."""
         auto_rename = config.TORRENT_AUTO_RENAME if auto_rename is None else auto_rename
@@ -412,7 +413,7 @@ class DownloadManager:
             route_reason=plan.reason,
             auto_rename=auto_rename, auto_move=auto_move,
             show_id=show_id, season=season, episode=episode,
-            replace_path=replace_path,
+            replace_path=replace_path, failure_key=failure_key,
         )
         if episode_context is not None:
             shows_store.set_episode_grab(
@@ -856,6 +857,7 @@ class DownloadManager:
         if not viable:
             return []
         key = f"pack:{title.casefold()}:{season}"
+        viable = _prefer_unfailed(viable, key)
         if not self._oversize_gate(viable, media_type, key, minutes=season_minutes):
             return []
         import math
@@ -869,7 +871,8 @@ class DownloadManager:
 
         best = sorted(viable, key=rank)[0]
         download_id = self.grab(best, request_id=request_id, request_title=title,
-                                auto_rename=True, auto_move=True)
+                                auto_rename=True, auto_move=True,
+                                failure_key=key)
         logger.info("Season-pack grab: '%s' S%02d → download #%s (%s)",
                     title, season, download_id, best.title)
         return [download_id]
