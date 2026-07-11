@@ -42,7 +42,13 @@ def test_find_junk_flags_samples_and_notes(tmp_path, monkeypatch):
     assert "Big Film (2020) 1080p.mkv" not in flagged
 
 
-def test_add_public_trackers_appends_and_dedupes():
+def test_add_public_trackers_appends_and_dedupes(monkeypatch):
+    import download_manager
+    # Pin the tracker list: without a local cache (CI), the live ngosang
+    # list is fetched, and it sometimes carries scheme-variants of the same
+    # host that legitimately survive dedupe — flaking the count assert.
+    monkeypatch.setattr(download_manager, "_public_trackers",
+                        lambda: list(download_manager._BUILTIN_TRACKERS))
     magnet = "magnet:?xt=urn:btih:abc&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
     out = add_public_trackers(magnet)
     assert out.startswith(magnet)
