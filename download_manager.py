@@ -437,6 +437,29 @@ class DownloadManager:
     # Crash/restart recovery
     # ------------------------------------------------------------------
 
+    def shutdown(self) -> None:
+        """Graceful close: kill our runner processes and requeue their rows
+        (progress kept — webtorrent re-verifies on resume). Without this,
+        runners survive as headless orphans that download into staging and
+        hold file locks until the next launch's recovery sweep."""
+        with self._lock:
+            procs = dict(self._processes)
+            self._processes.clear()
+        for download_id, proc in procs.items():
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    downloads_store.set_status(download_id, "queued")
+                    downloads_store.add_history(
+                        download_id, "requeued",
+                        before="downloading",
+                        after="app closing — will resume next launch")
+            except Exception:
+                logger.exception("Shutdown: failed to stop runner #%s", download_id)
+        if procs:
+            logger.info("Shutdown: stopped %d active runner(s); rows requeued.",
+                        len(procs))
+
     def _recover_previous_session(self) -> None:
         """Clean up after a previous app session.
 
@@ -1369,8 +1392,11 @@ class DownloadManager:
             str(config.TORRENT_STALL_TIMEOUT_SECONDS),
         ]
         try:
+            # stderr merges into stdout: the JSON reader skips non-JSON
+            # lines anyway, and an undrained stderr pipe would fill up and
+            # freeze a chatty runner mid-download.
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=_CREATE_NO_WINDOW,
             )
@@ -1417,7 +1443,10 @@ class DownloadManager:
                 self._processes.pop(download_id, None)
 
         row = downloads_store.get_download(download_id)
-        if row is not None and row.status == "cancelled":
+        if row is not None and row.status in ("cancelled", "queued"):
+            # Someone else took ownership: user cancel, queue rotation, or
+            # app shutdown requeue. The kill-induced exit code must not
+            # overwrite that status or poison the failure memory.
             return
 
         if error_message or proc.returncode not in (0, None):

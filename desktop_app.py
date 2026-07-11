@@ -4998,6 +4998,10 @@ class DesktopApp:
         self._quitting = True
         logger.info("Shutting down desktop app.")
         try:
+            self.download_manager.shutdown()
+        except Exception:
+            logger.exception("Failed to stop download runners cleanly.")
+        try:
             self._tray_icon.stop()
         except Exception:
             logger.exception("Failed to stop tray icon cleanly.")
