@@ -511,7 +511,7 @@ class DesktopApp:
         self.watchlist_tab = WatchlistTab(watchlist_tab, self)
 
         status_tab.columnconfigure(0, weight=1)
-        status_tab.rowconfigure(2, weight=1)
+        status_tab.rowconfigure(3, weight=1)
         requests_tab.columnconfigure(0, weight=1)
         requests_tab.rowconfigure(1, weight=1)
         requests_tab.rowconfigure(2, weight=0)
@@ -524,8 +524,38 @@ class DesktopApp:
         logs_tab.columnconfigure(0, weight=1)
         logs_tab.rowconfigure(0, weight=1)
 
+        # Update banner — hidden until the nightly check finds a release.
+        self._update_banner = ttk.Frame(status_tab, padding=(8, 4))
+        self._update_banner.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        self._update_banner.grid_remove()
+        self._update_banner_label = ttk.Label(
+            self._update_banner, text="", font=("Segoe UI", 10, "bold"))
+        self._update_banner_label.pack(side=tk.LEFT, padx=(0, 10))
+        self._update_install_btn = ttk.Button(
+            self._update_banner, text="Install update",
+            command=self._install_update)
+        self._update_install_btn.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(self._update_banner, text="What's new",
+                   command=lambda: webbrowser.open_new_tab(
+                       self._update_info.html_url) if self._update_info else None
+                   ).pack(side=tk.LEFT, padx=(0, 6))
+        self._update_dismiss_btn = ttk.Button(
+            self._update_banner, text="Dismiss",
+            command=lambda: self._update_banner.grid_remove())
+        self._update_dismiss_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._update_skip_btn = ttk.Button(
+            self._update_banner, text="Skip this version",
+            command=self._skip_update_version)
+        self._update_skip_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._update_mute_btn = ttk.Button(
+            self._update_banner, text="Mute update notices",
+            command=self._mute_update_notices)
+        self._update_mute_btn.pack(side=tk.LEFT)
+        self._update_info = None
+        self._urgent_popup_shown = False
+
         status_toolbar = ttk.Frame(status_tab)
-        status_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        status_toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         health_btn = ttk.Button(status_toolbar, text="🩺 Health Check",
                                 command=lambda: self.run_health_check(include_updates=False))
         health_btn.grid(row=0, column=0, padx=(0, 6))
@@ -542,7 +572,7 @@ class DesktopApp:
 
         # Frozen header: the vitals stay pinned while activity streams below.
         vitals = ttk.Frame(status_tab)
-        vitals.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        vitals.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         self._status_plex_dot = ttk.Label(vitals, text="●", foreground=_DOT_GRAY)
         self._status_plex_dot.pack(side=tk.LEFT)
         ttk.Label(vitals, textvariable=self.plex_status_var).pack(side=tk.LEFT, padx=(4, 16))
@@ -554,7 +584,7 @@ class DesktopApp:
                   font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT)
 
         status_panes = ttk.PanedWindow(status_tab, orient=tk.VERTICAL)
-        status_panes.grid(row=2, column=0, sticky="nsew")
+        status_panes.grid(row=3, column=0, sticky="nsew")
 
         activity_frame = ttk.LabelFrame(
             status_panes, text="Live activity — downloads, renames, moves", padding=4)
@@ -713,6 +743,14 @@ class DesktopApp:
         ttk.Button(filter_row, text="Deselect all",
                    command=lambda: self._maint_set_all(False)
                    ).pack(side=tk.LEFT, padx=3)
+        combo_btn = ttk.Button(filter_row, text="Combo Clean rename…",
+                               command=self._run_combo_clean)
+        combo_btn.pack(side=tk.LEFT, padx=(14, 3))
+        add_tooltip(combo_btn,
+                    "Preview a per-library cleanup rename: dots → spaces, "
+                    "[brackets] and {braces} stripped, junk words removed. "
+                    "Pick exactly ONE library type above first. Nothing is "
+                    "renamed until you Apply Selected.")
 
         # Adjust the tab's row layout: results frame moves to row 3.
         maintenance_tab.rowconfigure(3, weight=1)
@@ -2659,14 +2697,26 @@ class DesktopApp:
         self._maint_row_state: dict[str, tuple[tk.BooleanVar, Any]] = {}
 
         checked = bool(getattr(self, "_maint_default_checked", False))
-        for media_type, (_check, c1, c2, c3), payload in self._maint_typed_rows:
+        parents: dict[int, str] = {}
+        hidden_at: int | None = None
+        for entry in self._maint_typed_rows:
+            media_type, (_check, c1, c2, c3), payload = entry[0], entry[1], entry[2]
+            level = entry[3] if len(entry) > 3 else 0
+            if hidden_at is not None:
+                if level > hidden_at:
+                    continue  # child of a filtered-out row
+                hidden_at = None
             if media_type not in active_tags:
+                hidden_at = level
                 continue
             # Rows with no action payload (summary lines) are never checked.
             row_checked = checked and payload is not None
             var = tk.BooleanVar(value=row_checked)
             mark = "[X]" if row_checked else "[ ]"
-            item = self._maint_tree.insert("", "end", values=(mark, c1, c2, c3))
+            parent = parents.get(level - 1, "") if level > 0 else ""
+            item = self._maint_tree.insert(
+                parent, "end", values=(mark, c1, c2, c3), open=(level == 0))
+            parents[level] = item
             self._maint_row_state[item] = (var, payload)
 
     def _on_maint_tree_click(self, event: Any) -> None:
@@ -2689,6 +2739,59 @@ class DesktopApp:
         current_vals = list(self._maint_tree.item(row_id, "values"))
         current_vals[0] = "[X]" if var.get() else "[ ]"
         self._maint_tree.item(row_id, values=current_vals)
+
+    def _run_combo_clean(self) -> None:
+        """Combo Clean rename for the ONE library type selected in the filter
+        bar. Renders a preview through the custom_rename plumbing, so Apply
+        Selected performs the renames with the usual confirmation."""
+        active = [tag for tag, var in self._maint_filter_vars.items()
+                  if var.get() and tag != "mixed"]
+        if len(active) != 1:
+            self._show_info(
+                "Combo Clean",
+                "Tick exactly ONE library type (Movies / TV / Anime / …) in "
+                "the filter bar so the cleanup targets a single library.")
+            return
+        media_type = active[0]
+        self._maint_set_busy(f"Combo Clean preview ({media_type})")
+
+        def worker() -> None:
+            try:
+                from maintenance import build_combo_renames
+                pairs = build_combo_renames(media_type)
+            except Exception as exc:
+                logger.exception("Combo Clean preview failed.")
+                self._post_to_ui(
+                    lambda: self._maint_status_var.set(f"Combo Clean error: {exc}"))
+                return
+
+            def render() -> None:
+                self._maint_tool_name = "custom_rename"
+                self._maint_results = pairs
+                if not pairs:
+                    self._maint_status_var.set(
+                        f"Combo Clean: nothing to rename in {media_type} — "
+                        "names are already clean.")
+                    self._populate_maint_tree(
+                        [], col1="Current name", col2="New name", col3="")
+                    return
+                self._maint_status_var.set(
+                    f"Combo Clean: {len(pairs)} file(s) in {media_type} would "
+                    "be renamed. Review, tick, then Apply Selected.")
+                typed_rows = [
+                    (media_type,
+                     ("", Path(pr.original).name, Path(pr.sanitized).name, ""),
+                     pr, 0)
+                    for pr in pairs
+                ]
+                self._populate_maint_tree(
+                    [], col1="Current name", col2="New name", col3="",
+                    check_label="Rename?", typed_rows=typed_rows,
+                )
+            self._post_to_ui(render)
+
+        threading.Thread(target=worker, name="maint-combo-clean",
+                         daemon=True).start()
 
     def _grab_missing_selected(self, gaps: list[tuple]) -> None:
         """Missing Episodes -> Apply Selected: search + download each checked
@@ -2767,8 +2870,120 @@ class DesktopApp:
                 logger.exception("Daily library check failed.")
                 summary = {"checked": 0, "newly_found": 0, "errors": [str(exc)]}
             self._post_to_ui(lambda: self._handle_daily_check_result(summary, silent=silent))
+            # Piggyback the app-update check on the nightly pass.
+            try:
+                import updater
+                info = updater.check_for_update()
+            except Exception:
+                logger.debug("Nightly update check failed.", exc_info=True)
+                info = None
+            if info is not None:
+                self._post_to_ui(lambda: self._show_update_banner(info))
 
         threading.Thread(target=worker, name="maint-daily-check", daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # In-app updates — nightly check, dismissable Status-tab banner
+    # ------------------------------------------------------------------
+
+    def _show_update_banner(self, info) -> None:
+        """Show the update banner, honouring dismiss/skip/mute — unless the
+        release is marked urgent (PLEXXARR-URGENT in its notes), which
+        overrides every quieting choice and pops the message once."""
+        import updater as _updater
+        self._update_info = info
+        if not info.urgent:
+            if not config.UPDATE_NOTIFY:
+                return
+            if info.version == config.UPDATE_SKIPPED_VERSION:
+                return
+        text = f"Update available: v{info.version} (you have v{config.APP_VERSION})"
+        if info.urgent:
+            text = f"⚠ URGENT update v{info.version}: {info.urgent_message}"
+            self._update_banner_label.configure(foreground="#ff5f5f")
+            # Urgent ignores quieting: no skip/mute, dismiss only hides
+            # until the next launch.
+            self._update_skip_btn.pack_forget()
+            self._update_mute_btn.pack_forget()
+        self._update_banner_label.configure(text=text)
+        can_self = _updater.can_self_update(info)
+        self._update_install_btn.configure(
+            text="Install update" if can_self else "Open release page",
+            command=self._install_update if can_self else (
+                lambda: webbrowser.open_new_tab(info.html_url)))
+        self._update_banner.grid()
+        if info.urgent and not self._urgent_popup_shown:
+            self._urgent_popup_shown = True
+            self._show_warning(
+                "Urgent update",
+                f"Plexxarr v{info.version} is an urgent release:\n\n"
+                f"{info.urgent_message}\n\n"
+                "Please update as soon as possible.")
+
+    def _skip_update_version(self) -> None:
+        info = self._update_info
+        if info is None:
+            return
+        setattr(config, "UPDATE_SKIPPED_VERSION", info.version)
+        try:
+            save_settings({"UPDATE_SKIPPED_VERSION": info.version},
+                          config.DOTENV_PATH)
+        except Exception:
+            logger.exception("Failed to persist UPDATE_SKIPPED_VERSION")
+        self._update_banner.grid_remove()
+
+    def _mute_update_notices(self) -> None:
+        if not self._ask_yes_no(
+            "Mute update notices",
+            "Hide update notifications permanently? Urgent security "
+            "releases will still be shown. You can re-enable notices "
+            "any time with UPDATE_NOTIFY=true in .env.",
+        ):
+            return
+        setattr(config, "UPDATE_NOTIFY", False)
+        try:
+            save_settings({"UPDATE_NOTIFY": "false"}, config.DOTENV_PATH)
+        except Exception:
+            logger.exception("Failed to persist UPDATE_NOTIFY")
+        self._update_banner.grid_remove()
+
+    def _install_update(self) -> None:
+        info = self._update_info
+        if info is None:
+            return
+        import updater as _updater
+        if not _updater.can_self_update(info):
+            webbrowser.open_new_tab(info.html_url)
+            return
+        if not self._ask_yes_no(
+            "Install update",
+            f"Download and install v{info.version} now?\n\n"
+            "The app will close, swap in the new build (your settings, "
+            "databases, and caches are preserved), and relaunch.",
+        ):
+            return
+        self.status_var.set(f"Downloading update v{info.version}…")
+
+        def worker() -> None:
+            try:
+                bat = _updater.stage_self_update(
+                    info, on_status=lambda m: self._post_to_ui(
+                        lambda: self.status_var.set(m)))
+            except Exception as exc:
+                logger.exception("Update staging failed.")
+                self._post_to_ui(lambda: self._show_warning(
+                    "Update failed",
+                    f"Could not stage the update: {exc}\n\n"
+                    "Nothing was changed — you can retry or install "
+                    "manually from the release page."))
+                return
+
+            def go() -> None:
+                _updater.launch_staged_update(bat)
+                self.shutdown_from_terminal()
+            self._post_to_ui(go)
+
+        threading.Thread(target=worker, name="app-update", daemon=True).start()
 
     def _handle_daily_check_result(self, summary: dict, *, silent: bool = False) -> None:
         self._last_library_check_date = datetime.date.today().isoformat()
@@ -2962,22 +3177,88 @@ class DesktopApp:
             "(keep at least one per group), then Apply Selected."
         )
 
-        # One typed row per candidate file. The first row in each group shows
-        # the title; subsequent rows are indented "-> " continuations. Each
-        # row's payload is the absolute path so Apply Selected can delete it.
-        typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = []
+        # Whole-folder duplication (the same episodes in two directories) is
+        # folded into ONE expandable block per folder pair — the flat list
+        # buried the signal under hundreds of per-episode rows. Two-candidate
+        # groups sharing the same pair of parent folders, 3+ matches → block.
+        from collections import defaultdict
+        pair_buckets: dict[tuple[str, str], list[Any]] = defaultdict(list)
+        singles: list[Any] = []
         for group in results:
-            for i, (path, size) in enumerate(zip(group.candidates, group.candidate_sizes)):
-                indent = "" if i == 0 else "  -> "
-                title = indent + group.normalized_title
+            if len(group.candidates) == 2:
+                pa = str(Path(group.candidates[0]).parent)
+                pb = str(Path(group.candidates[1]).parent)
+                if pa != pb:
+                    pair_buckets[tuple(sorted((pa, pb)))].append(group)
+                    continue
+            singles.append(group)
+
+        typed_rows: list[tuple] = []
+        folded = 0
+        for (da, db), gs in sorted(
+                pair_buckets.items(),
+                key=lambda kv: -sum(g.total_size_bytes for g in kv[1])):
+            if len(gs) < 3:
+                singles.extend(gs)
+                continue
+            folded += 1
+            tag = media_type_for_path(da)
+            sides = []
+            for side in (da, db):
+                side_files = []
+                side_size = 0
+                for g in gs:
+                    for c, s in zip(g.candidates, g.candidate_sizes):
+                        if str(Path(c).parent) == side:
+                            side_files.append(c)
+                            side_size += s
+                sides.append((side, side_files, side_size))
+            total = sum(s for _d, _f, s in sides)
+            typed_rows.append((
+                tag,
+                ("", f"[folder pair] {Path(da).name}  <->  {Path(db).name}",
+                 f"{len(gs)} matching file(s) in two folders",
+                 self._fmt_bytes(total)),
+                None, 0,
+            ))
+            for side, side_files, side_size in sides:
                 typed_rows.append((
-                    media_type_for_path(path),
-                    ("", title, path, self._fmt_bytes(size)),
-                    path,
+                    tag,
+                    ("", "DELETE this whole side", side,
+                     f"{len(side_files)} file(s), {self._fmt_bytes(side_size)}"),
+                    ("paths", side_files), 1,
+                ))
+                for c in side_files:
+                    try:
+                        sz = Path(c).stat().st_size
+                    except OSError:
+                        sz = 0
+                    typed_rows.append((
+                        tag, ("", Path(c).name, c, self._fmt_bytes(sz)), c, 2,
+                    ))
+
+        for group in sorted(singles, key=lambda g: -g.total_size_bytes):
+            tag = media_type_for_path(group.candidates[0])
+            typed_rows.append((
+                tag,
+                ("", group.normalized_title,
+                 f"{len(group.candidates)} copies",
+                 self._fmt_bytes(group.total_size_bytes)),
+                None, 0,
+            ))
+            for path, size in zip(group.candidates, group.candidate_sizes):
+                typed_rows.append((
+                    tag, ("", Path(path).name, path, self._fmt_bytes(size)),
+                    path, 1,
                 ))
 
+        if folded:
+            self._maint_status_var.set(
+                self._maint_status_var.get()
+                + f"  ({folded} whole-folder pair(s) collapsed — expand to inspect)")
+
         self._populate_maint_tree(
-            [], col1="Normalized Title", col2="File Path", col3="File Size",
+            [], col1="Duplicate", col2="Path", col3="Size",
             check_label="Delete?", typed_rows=typed_rows,
         )
         self._show_info(
@@ -3304,8 +3585,16 @@ class DesktopApp:
             return
 
         if self._maint_tool_name == "find_duplicates":
-            # Payloads are absolute file paths.
-            paths_to_delete = [p for p in selected_payloads if isinstance(p, str)]
+            # Payloads: absolute file paths, or ("paths", [...]) for a whole
+            # folder side. Checking a side and its children double-counts —
+            # dedupe keeps the delete list honest.
+            paths_to_delete: list[str] = []
+            for p in selected_payloads:
+                if isinstance(p, str):
+                    paths_to_delete.append(p)
+                elif isinstance(p, tuple) and p and p[0] == "paths":
+                    paths_to_delete.extend(p[1])
+            paths_to_delete = list(dict.fromkeys(paths_to_delete))
             if not paths_to_delete:
                 return
             self._confirm_and_delete_duplicates(paths_to_delete)

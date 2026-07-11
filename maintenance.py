@@ -202,6 +202,38 @@ _RELEASE_GROUP = re.compile(r"-[A-Z0-9]{2,12}$", re.IGNORECASE)
 _SEPARATORS = re.compile(r"[._]+")
 _MULTI_SPACES = re.compile(r"\s{2,}")
 
+# --- duplicate-detection guards (learned from a real-library audit) ----------
+# Bonus-content folders and creditless/OVA files must never be compared
+# against real episodes; pt/cd parts of one item aren't copies of each other;
+# x.5 recaps and SxxXyy specials are DIFFERENT episodes; promo stubs
+# (ETRG.mp4, RARBG.com.mp4) are junk, not media.
+_DUP_EXTRAS_DIR_RE = re.compile(
+    r"^(?:extras?|featurettes?|behind the scenes|deleted scenes|interviews|"
+    r"scenes|shorts|trailers?|other|nc(?:op|ed)s?|creditless|menus?|"
+    r"bonus(?:es)?|pv|cm|samples?|special features?)$", re.IGNORECASE)
+_DUP_SPECIAL_FILE_RE = re.compile(r"\b(?:OVA|OAD|NC(?:OP|ED))\b", re.IGNORECASE)
+_DUP_PART_RE = re.compile(r"\b(?:pt|part|cd|disc|disk)[\s._-]?(\d{1,2})\b",
+                          re.IGNORECASE)
+_DUP_HALF_RE = re.compile(r"(\d{1,3})\.5\b")
+_DUP_SXX_X_RE = re.compile(r"[Ss](\d{1,2})[Xx](\d{1,2})\b")
+_DUP_EXX_X_RE = re.compile(r"[Ee](\d{1,3})[Xx](\d{1,2})\b")
+_DUP_PROMO_STEMS = {"etrg", "rarbg", "rarbg com", "sample", "readme", "info",
+                    "torrent downloaded from"}
+_DUP_YEAR_RE = re.compile(r"\((19|20)\d{2}\)|\b(?:19|20)\d{2}\b")
+
+# Junk words the Combo Clean rename always removes (whole-word), agreed from
+# a frequency scan of the real library: quality/codec/source/group noise.
+_COMBO_REMOVE_WORDS = [
+    "480p", "720p", "1080p", "2160p", "4k", "x264", "x265", "h264", "h265",
+    "hevc", "av1", "10bit", "8bit", "aac", "ac3", "flac", "opus",
+    "web", "webrip", "webdl", "dl", "bluray", "brrip", "bdrip", "hdtv",
+    "bd", "dvd", "dvdrip", "remux", "dual", "audio", "amzn", "nf",
+    "galaxytv", "subsplease", "eztv", "eztvx", "heteam", "judas",
+]
+_COMBO_WORD_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in _COMBO_REMOVE_WORDS) + r")\b",
+    re.IGNORECASE)
+
 
 def _normalize_title(name: str) -> str:
     """
@@ -259,18 +291,42 @@ def find_duplicates() -> list[DuplicateGroup]:
         logger.warning("find_duplicates: no media files found in configured library paths.")
         return []
 
-    # Key: (normalized_title, season_or_None, episode_or_None)
-    groups: dict[tuple[str, int | None, int | None], list[Path]] = {}
+    # Key: (title, year, season, episode, part). Year separates reboots that
+    # share a name (Goosebumps 1995 vs 2023); part separates cd1/cd2 and
+    # pt1/pt2 splits of ONE item; episode is a string so 13.5 recaps and
+    # SxxXyy specials stay distinct from their whole-number neighbours.
+    groups: dict[tuple, list[Path]] = {}
     for f in files:
+        if any(_DUP_EXTRAS_DIR_RE.match(part) for part in f.parent.parts):
+            continue
+        stem = f.stem
+        if _DUP_SPECIAL_FILE_RE.search(stem) or "sample" in stem.lower():
+            continue
         title = _normalize_title(f.name)
-        if not title:
+        if not title or title in _DUP_PROMO_STEMS:
             continue
         ep = _parse_episode(f.name)
-        key = (title, ep[0] if ep else None, ep[1] if ep else None)
+        season = ep[0] if ep else None
+        episode: str | None = str(ep[1]) if ep else None
+        m = _DUP_HALF_RE.search(stem)
+        if m and ep and int(m.group(1)) == ep[1]:
+            episode = f"{ep[1]}.5"
+        m = _DUP_SXX_X_RE.search(stem)
+        if m:
+            season = int(m.group(1))
+            episode = f"x{int(m.group(2))}"
+        m = _DUP_EXX_X_RE.search(stem)
+        if m:
+            episode = f"{int(m.group(1))}x{int(m.group(2))}"
+        m = _DUP_PART_RE.search(stem)
+        part = m.group(1) if m else None
+        ym = _DUP_YEAR_RE.search(f.parent.name) or _DUP_YEAR_RE.search(stem)
+        year = ym.group(0).strip("()") if ym else None
+        key = (title, year, season, episode, part)
         groups.setdefault(key, []).append(f)
 
     results: list[DuplicateGroup] = []
-    for (norm_title, season, episode), paths in groups.items():
+    for (norm_title, year, season, episode, _part), paths in groups.items():
         if len(paths) < 2:
             continue
         sorted_paths = sorted(paths)
@@ -280,9 +336,9 @@ def find_duplicates() -> list[DuplicateGroup]:
                 sizes.append(p.stat().st_size)
             except OSError:
                 sizes.append(0)
-        label = norm_title
+        label = norm_title + (f" ({year})" if year else "")
         if season is not None and episode is not None:
-            label = f"{norm_title} S{season:02d}E{episode:02d}"
+            label = f"{label} S{season:02d}E{episode}"
         results.append(DuplicateGroup(
             normalized_title=label,
             candidates=[str(p) for p in sorted_paths],
@@ -727,6 +783,35 @@ def _parse_episode(filename: str) -> tuple[int, int] | None:
     if m:
         return int(m.group(1)), int(m.group(2))
     return None
+
+
+def build_combo_renames(media_type: str) -> list[SanitizePair]:
+    """Combo Clean for ONE library type (preview only — nothing renamed):
+    dots become spaces, [bracketed] and {braced} chunks go away, the agreed
+    junk-word list is stripped whole-word, whitespace is tidied. Skips a
+    file when the result is unchanged, dangerously short, or collides."""
+    roots = [p.path for p in config.MEDIA_LIBRARY_PATHS
+             if p.media_type == media_type]
+    pairs: list[SanitizePair] = []
+    for f in _media_files(roots):
+        new = f.stem.replace(".", " ")
+        new = re.sub(r"\[[^\]]*\]", " ", new)
+        new = re.sub(r"\{[^}]*\}", " ", new)
+        new = _COMBO_WORD_RE.sub(" ", new)
+        new = _MULTI_SPACES.sub(" ", new).strip(" -_~")
+        if len(new) < 3 or new == f.stem:
+            continue
+        target = f.with_name(new + f.suffix)
+        if target.exists():
+            continue
+        try:
+            size = f.stat().st_size
+        except OSError:
+            size = 0
+        pairs.append(SanitizePair(original=str(f), sanitized=str(target),
+                                  size_bytes=size))
+    pairs.sort(key=lambda pr: pr.original.casefold())
+    return pairs
 
 
 def find_missing_episodes() -> MissingEpisodesReport:

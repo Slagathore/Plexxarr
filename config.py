@@ -168,6 +168,12 @@ if not MEDIA_LIBRARY_PATHS:
 # code that walked PLEX_LIBRARY_PATHS without caring about media type.
 PLEX_LIBRARY_PATHS: list[str] = [p.path for p in MEDIA_LIBRARY_PATHS]
 
+# In-app update notifications (nightly GitHub release check). SKIPPED
+# remembers "dismiss until next release"; NOTIFY=false mutes non-urgent
+# banners forever. Urgent releases (PLEXXARR-URGENT marker) ignore both.
+UPDATE_NOTIFY: bool = _env_bool("UPDATE_NOTIFY", True)
+UPDATE_SKIPPED_VERSION: str = os.getenv("UPDATE_SKIPPED_VERSION", "").strip()
+
 # Hentai (xanime) support is an opt-in pickup: hidden from the UI unless
 # turned on here — or a library folder is already tagged xanime, so existing
 # installs keep working after an upgrade. Toggled from Settings/the wizard.
