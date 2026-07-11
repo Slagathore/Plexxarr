@@ -4152,6 +4152,8 @@ class DesktopApp:
         # Ollama
         ("OLLAMA_HOST", "Ollama Host URL", "text"),
         ("OLLAMA_MODEL", "Ollama Model Tag", "text"),
+        ("OLLAMA_THINK", "LLM thinking (false/true/low/medium/high)", "text"),
+        ("OLLAMA_SHOW_THINKING", "Log the LLM's thinking output", "bool"),
         # Torrent pipeline
         ("TORRENT_DOWNLOAD_DIR", "Torrent staging folder", "path"),
         ("TORRENT_STALL_TIMEOUT_SECONDS", "Torrent stall timeout (seconds)", "int"),

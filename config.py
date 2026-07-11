@@ -319,13 +319,24 @@ OMDB_API_KEY: str = os.getenv("OMDB_API_KEY", "").strip()
 # request), and rapidfuzz covers for it when it's absent or wrong.
 # Quality ladder if the box can afford more:
 #   qwen2.5:0.5b (~400 MB, ultra-light) < gemma3:1b (default) <
-#   llama3.2:3b (~2 GB) < any ":cloud" tag (no local load, but requires a
-#   free ollama.com account + `ollama signin`, and request text leaves the
-#   machine — processed by ollama.com under their privacy policy).
+#   llama3.2:3b (~2 GB) < kimi-k2.7-code:cloud or another ":cloud" tag (no
+#   local load, but requires a free ollama.com account + `ollama signin`, and
+#   request text leaves the machine — processed by ollama.com under their
+#   privacy policy).
 # OLLAMA_HOST defaults to http://localhost:11434 (standard Ollama install).
+# OLLAMA_THINK enables reasoning on thinking-capable models (e.g.
+# kimi-k2.7-code): false | true | low | medium | high. OLLAMA_SHOW_THINKING
+# controls whether the model's thinking is logged — it is never mixed into
+# the reply content either way.
 # ---------------------------------------------------------------------------
 OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemma3:1b").strip()
+_raw_think = os.getenv("OLLAMA_THINK", "false").strip().lower()
+OLLAMA_THINK: bool | str = (
+    _raw_think if _raw_think in {"low", "medium", "high"}
+    else _raw_think in {"1", "true", "yes", "on"}
+)
+OLLAMA_SHOW_THINKING: bool = _env_bool("OLLAMA_SHOW_THINKING", False)
 
 # ---------------------------------------------------------------------------
 # AniDB — used for xAnime (explicit anime) title lookup

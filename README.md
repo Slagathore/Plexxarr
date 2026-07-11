@@ -127,6 +127,7 @@ Copy `.env.example` to `.env`. Everything below is also editable from the Settin
 | `MEDIA_LIBRARY_PATHS` | No | — | Typed library folders (edit via Settings) |
 | `TMDB_API_KEY` / `TVDB_API_KEY` | No | — | Free keys; enable movie/TV lookups and richer matching |
 | `OLLAMA_HOST` / `OLLAMA_MODEL` | No | `localhost:11434` / `gemma3:1b` | Optional local LLM for request categorization |
+| `OLLAMA_THINK` / `OLLAMA_SHOW_THINKING` | No | `false` / `false` | Reasoning (`false`/`true`/`low`/`medium`/`high`) on thinking-capable models like `kimi-k2.7-code:cloud`; log it or not |
 | `QBITTORRENT_ENABLED` / `_URL` / `_USERNAME` / `_PASSWORD` | No | `false` | Use your qBittorrent as the download engine |
 | `TORRENT_DOWNLOAD_DIR` | No | `downloads/` | Staging folder before files move into libraries |
 | `SIZE_PREF_MB_PER_MIN_*` | No | movies `10`, episodic `22.1` | Preferred size per type (530 MB per 24-min episode) |

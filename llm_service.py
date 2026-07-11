@@ -65,10 +65,19 @@ def _chat(prompt: str) -> str | None:
     if client is None:
         return None
     try:
+        kwargs: dict[str, Any] = {}
+        if config.OLLAMA_THINK:
+            # Only sent when enabled — non-thinking models reject the parameter.
+            kwargs["think"] = config.OLLAMA_THINK
         response = client.chat(
             model=config.OLLAMA_MODEL,
             messages=[{"role": "user", "content": prompt}],
+            **kwargs,
         )
+        if config.OLLAMA_SHOW_THINKING:
+            thinking = response["message"].get("thinking")
+            if thinking:
+                logger.info("Ollama thinking:\n%s", thinking)
         return response["message"]["content"].strip()
     except Exception as exc:
         logger.error("Ollama chat failed: %s", exc)

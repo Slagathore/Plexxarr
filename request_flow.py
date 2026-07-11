@@ -14,7 +14,7 @@
 #     ↓
 #   Requests added to DB  →  END
 #
-# "Other" type bypasses the lookup pipeline and goes straight to Gemini
+# "Other" type bypasses the lookup pipeline and goes straight to the LLM
 # for categorisation, then ends the conversation immediately.
 #
 # Exposes:
@@ -406,7 +406,7 @@ async def handle_content_input(update: Update, context: ContextTypes.DEFAULT_TYP
     media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "other")
     raw_text = update.message.text.strip()
 
-    # ---- "Other" type: hand off to Gemini immediately ----------------------
+    # ---- "Other" type: hand off to the LLM immediately ---------------------
     if media_type == "other":
         await update.message.reply_text("Got it! Analysing your request…")
         loop = asyncio.get_running_loop()
@@ -482,7 +482,7 @@ async def handle_content_input(update: Update, context: ContextTypes.DEFAULT_TYP
                     lambda c=candidates, q=lr.request.title: fuzzy_correct_title(q, c),
                 )
                 if corrected:
-                    # Swap best_match to the Gemini-preferred candidate
+                    # Swap best_match to the LLM-preferred candidate
                     for m in lr.external_matches:
                         if m.title == corrected:
                             lr.best_match = m
