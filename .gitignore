@@ -20,6 +20,8 @@ pyinstaller_check.log
 # Local tooling / editor context (may hold personal info)
 # -----------------------------------------------------------------------
 .claude/
+CLAUDE.md
+AGENTS.md
 
 # Local outreach/press kit, not part of the public repo
 OUTREACH.md
