@@ -950,7 +950,10 @@ class DesktopApp:
         if self.requests_tree is None:
             return
 
-        requests = list_requests(limit=200)
+        # Show every request with outstanding work, including needs_identity
+        # rows so they are visible for resolution (the resolve action UI is
+        # Task A/E; note: deferred - resolve button lands with the grab queue).
+        requests = list_requests(status="active", limit=200)
         selected = self.requests_tree.selection()
         selected_id = None
         if selected:
@@ -964,6 +967,8 @@ class DesktopApp:
         for request in requests:
             row_id = str(request.request_id)
             display_title = request.resolved_title or request.content
+            if request.status == "needs_identity":
+                display_title = f"{display_title}  [needs identity]"
             type_label = self._TYPE_LABEL.get(request.media_type, "?")
             in_library = "YES" if request.found_in_library else ""
             self.requests_tree.insert(
@@ -999,9 +1004,14 @@ class DesktopApp:
         type_label = self._TYPE_LABEL.get(req.media_type, "?")
         lines = [
             f"Request #{req.request_id}  |  {type_label} ({req.media_type})  |  {req.created_at}",
+            f"Status    : {req.status}",
             f"Requester : {req.requester}",
             f"Raw input : {req.content}",
         ]
+        if req.status == "needs_identity":
+            lines.append("[NEEDS IDENTITY]  Resolve a provider match before this can be grabbed.")
+        if req.identity_source and req.external_id:
+            lines.append(f"Identity  : {req.identity_source}:{req.external_id}")
         if req.resolved_title and req.resolved_title != req.content:
             lines.append(f"Resolved  : {req.resolved_title}")
         if req.external_url:

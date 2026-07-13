@@ -1,0 +1,115 @@
+{
+  "_comment": "Golden corpus of real-shaped release names with the exact RTN 1.11.1 parse this repo pins. Values were captured live from parse() on 2026-07-13. Regenerating on an RTN upgrade is a deliberate, reviewed act - a diff here means parsing behaviour moved.",
+  "cases": [
+    {
+      "raw": "The.Angry.Birds.Movie.2016.1080p.BluRay.x264-AMIABLE",
+      "parsed_title": "The Angry Birds Movie",
+      "year": 2016,
+      "seasons": [],
+      "episodes": [],
+      "resolution": "1080p",
+      "country": null,
+      "trash": false
+    },
+    {
+      "raw": "The.Angry.Birds.Movie.2.2019.1080p.BluRay.x264-GROUP",
+      "parsed_title": "The Angry Birds Movie 2",
+      "year": 2019,
+      "seasons": [],
+      "episodes": [],
+      "resolution": "1080p",
+      "country": null,
+      "trash": false
+    },
+    {
+      "raw": "Married.At.First.Sight.AU.S13.1080p.WEB-DL-GROUP",
+      "parsed_title": "Married At First Sight",
+      "year": null,
+      "seasons": [13],
+      "episodes": [],
+      "resolution": "1080p",
+      "country": "AU",
+      "trash": false
+    },
+    {
+      "raw": "Married.at.First.Sight.US.S18E05.720p.WEB.h264-GROUP",
+      "parsed_title": "Married at First Sight",
+      "year": null,
+      "seasons": [18],
+      "episodes": [5],
+      "resolution": "720p",
+      "country": "US",
+      "trash": false
+    },
+    {
+      "raw": "Dune.Part.Two.2024.2160p.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265-FLUX",
+      "parsed_title": "Dune Part Two",
+      "year": 2024,
+      "seasons": [],
+      "episodes": [],
+      "resolution": "2160p",
+      "country": null,
+      "trash": false
+    },
+    {
+      "raw": "Tremors.1990.1080p.BluRay.x265-RARBG",
+      "parsed_title": "Tremors",
+      "year": 1990,
+      "seasons": [],
+      "episodes": [],
+      "resolution": "1080p",
+      "country": null,
+      "trash": false
+    },
+    {
+      "raw": "Tremors.II.Aftershocks.1996.1080p.BluRay.x264",
+      "parsed_title": "Tremors II Aftershocks",
+      "year": 1996,
+      "seasons": [],
+      "episodes": [],
+      "resolution": "1080p",
+      "country": null,
+      "trash": false
+    },
+    {
+      "raw": "Severance.S02E01.1080p.WEB.h264-ETHEL",
+      "parsed_title": "Severance",
+      "year": null,
+      "seasons": [2],
+      "episodes": [1],
+      "resolution": "1080p",
+      "country": null,
+      "trash": false
+    },
+    {
+      "raw": "Some.Show.Complete.S01-S03.1080p.WEB.x264",
+      "parsed_title": "Some Show",
+      "year": null,
+      "seasons": [1, 2, 3],
+      "episodes": [],
+      "resolution": "1080p",
+      "country": null,
+      "trash": false
+    },
+    {
+      "raw": "Longlegs.2024.CAM.x264-YIFY",
+      "parsed_title": "Longlegs",
+      "year": 2024,
+      "seasons": [],
+      "episodes": [],
+      "resolution": "unknown",
+      "country": null,
+      "trash": true
+    },
+    {
+      "raw": "Deadpool.and.Wolverine.2024.HDTS.c1nem4",
+      "parsed_title": "Deadpool and Wolverine",
+      "year": 2024,
+      "seasons": [],
+      "episodes": [],
+      "resolution": "unknown",
+      "country": null,
+      "trash": true
+    }
+  ]
+}

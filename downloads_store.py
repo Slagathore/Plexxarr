@@ -59,6 +59,13 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # THIS instead of fuzzy staging-folder matching (which once swapped two
     # simultaneous downloads' files).
     ("downloads", "files_json", "TEXT"),
+    # Immutable snapshot of what this grab was meant to satisfy (the
+    # MediaIdentity + season/episode target + size prefs) frozen at grab time.
+    # Every later check (verification, reconciliation, restart) reads THIS, so
+    # editing/deleting the request or restarting the app can never change what
+    # an in-flight download was for. NOTE: the table/column names in the ALTER
+    # above are static literals — never interpolate user input into them.
+    ("downloads", "want_json", "TEXT"),
 ]
 
 _SCHEMA_HISTORY = """
@@ -99,6 +106,7 @@ class DownloadRow:
     replace_path: str | None = None
     files_json: str | None = None
     failure_key: str | None = None
+    want_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -115,7 +123,7 @@ _DOWNLOAD_COLUMNS = (
     "id, request_id, title, magnet, source, media_type, status, progress, "
     "staging_dir, planned_dest, planned_name, route_reason, auto_rename, "
     "auto_move, error, created_at, completed_at, show_id, season, episode, "
-    "replace_path, files_json, failure_key"
+    "replace_path, files_json, failure_key, want_json"
 )
 
 
@@ -216,6 +224,7 @@ def _row_to_download(row) -> DownloadRow:
         error=row[14], created_at=row[15], completed_at=row[16],
         show_id=row[17], season=row[18], episode=row[19],
         replace_path=row[20], files_json=row[21], failure_key=row[22],
+        want_json=row[23],
     )
 
 
@@ -226,7 +235,7 @@ def create_download(
     auto_rename: bool, auto_move: bool,
     show_id: int | None = None, season: int | None = None,
     episode: int | None = None, replace_path: str | None = None,
-    failure_key: str | None = None,
+    failure_key: str | None = None, want_json: str | None = None,
 ) -> int:
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
@@ -235,18 +244,41 @@ def create_download(
             INSERT INTO downloads
                 (request_id, title, magnet, source, media_type, staging_dir,
                  planned_dest, planned_name, route_reason, auto_rename, auto_move,
-                 show_id, season, episode, replace_path, failure_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 show_id, season, episode, replace_path, failure_key, want_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (request_id, title, magnet, source, media_type, staging_dir,
              planned_dest, planned_name, route_reason,
              int(auto_rename), int(auto_move), show_id, season, episode,
-             replace_path, failure_key),
+             replace_path, failure_key, want_json),
         )
         conn.commit()
         download_id = int(cursor.lastrowid or 0)
     add_history(download_id, "grabbed", before=None, after=title)
     return download_id
+
+
+def set_want(download_id: int, want: dict) -> None:
+    """Freeze the want snapshot for a download. Written once at grab time and
+    then treated as immutable — later checks READ it, never rewrite it."""
+    import json as _json
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute("UPDATE downloads SET want_json = ? WHERE id = ?",
+                     (_json.dumps(want), download_id))
+        conn.commit()
+
+
+def get_want(download_id: int) -> dict | None:
+    """Read back the frozen want snapshot, or None if this row predates it."""
+    import json as _json
+    row = get_download(download_id)
+    if row is None or not row.want_json:
+        return None
+    try:
+        data = _json.loads(row.want_json)
+        return data if isinstance(data, dict) else None
+    except (ValueError, TypeError):
+        return None
 
 
 def delete_download(download_id: int) -> None:

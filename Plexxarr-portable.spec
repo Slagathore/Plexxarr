@@ -13,6 +13,9 @@ project_dir = Path(spec_file).resolve().parent if spec_file else Path.cwd().reso
 
 datas = []
 datas += collect_data_files("sv_ttk")
+# rank-torrent-name + parsett pattern data files (selection engine).
+datas += collect_data_files("RTN")
+datas += collect_data_files("parsett")
 for _rf in ("download.mjs", "package.json", "package-lock.json", "diag.mjs"):
     _src = project_dir / "torrent_runner" / _rf
     if _src.is_file():
@@ -21,10 +24,15 @@ for _rf in ("download.mjs", "package.json", "package-lock.json", "diag.mjs"):
 hiddenimports = (
     collect_submodules("telegram")
     + collect_submodules("pystray")
+    # rank-torrent-name (selection engine) + transitive deps.
+    + collect_submodules("RTN")
+    + collect_submodules("parsett")
+    + collect_submodules("pydantic")
+    + ["pydantic_core", "orjson", "Levenshtein", "arrow", "pymediainfo"]
     + ["sv_ttk", "send2trash", "shows_tab", "shows_store", "show_tracker",
        "downloads_store", "download_manager", "torrent_search", "torrent_routing",
        "auth_store", "db", "ui_helpers", "health", "watchlist_tab", "video_quality",
-       "subtitles", "anime_db"]
+       "subtitles", "anime_db", "media_identity"]
 )
 
 _EXCLUDE_HEAVY = [

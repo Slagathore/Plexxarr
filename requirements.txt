@@ -34,3 +34,9 @@ send2trash>=1.8.0
 # Subtitle fetching for the Library tab (optional at runtime — the button
 # explains how to install it if missing)
 subliminal>=2.2.0
+
+# Deterministic torrent-name ranking + parsing for the selection engine.
+# Pinned to the exact PyPI-confirmed release (live-verified 2026-07-13:
+# pip index versions rank-torrent-name -> 1.11.1; requires_python <4.0,>=3.11).
+# Pulls in parsett + pydantic; the PyInstaller specs collect those explicitly.
+rank-torrent-name==1.11.1

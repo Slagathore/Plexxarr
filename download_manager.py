@@ -33,6 +33,8 @@ from typing import Any, Callable
 
 import config
 import downloads_store
+import media_identity
+import queue_store
 import show_tracker
 import shows_store
 import torrent_routing
@@ -177,6 +179,73 @@ def _ascii_preferring_title(resolved: str | None, content: str | None) -> str:
     if content and ratio(content) >= 0.7:
         return content
     return resolved or content
+
+
+def _build_want_snapshot(
+    result: TorrentResult, req, *, request_title: str | None,
+    show_id: int | None, season: int | None, episode: int | None,
+    minutes: float | None,
+) -> dict:
+    """Freeze what this grab is meant to satisfy: the MediaIdentity + the
+    season/episode target + the size prefs, at grab time. Stored immutably in
+    downloads.want_json; verification/reconciliation/restart READ this instead
+    of re-deriving intent from the mutable request row (or the torrent title).
+    """
+    pref, max_rate, _default_minutes = _size_prefs(result.media_type)
+    identity_source = getattr(req, "identity_source", None) if req else None
+    external_id = getattr(req, "external_id", None) if req else None
+    canonical_title = getattr(req, "resolved_title", None) if req else None
+    canonical_year = getattr(req, "canonical_year", None) if req else None
+    origin_countries = list(getattr(req, "origin_countries", []) or []) if req else []
+    aliases = list(getattr(req, "aliases", []) or []) if req else []
+    # The season target: an explicit episode_context wins, else the request's
+    # season, else none.
+    want_season = season if season is not None else (
+        getattr(req, "season", None) if req else None)
+    search = request_title or media_identity.search_alias(canonical_title, None) or result.title
+    return {
+        "schema": 1,
+        "request_id": getattr(req, "request_id", None) if req else None,
+        "media_type": result.media_type,
+        "identity_source": identity_source,
+        "external_id": external_id,
+        "canonical_title": canonical_title,
+        "canonical_year": canonical_year,
+        "origin_countries": origin_countries,
+        "aliases": aliases,
+        "search_alias": search,
+        "show_id": show_id,
+        "season": want_season,
+        "episode": episode,
+        "size_pref_mb_min": pref,
+        "size_max_rate": max_rate,
+        "runtime_minutes": minutes,
+    }
+
+
+def _request_title_from_row(row) -> str | None:
+    """The single source of the title used for routing/naming a download.
+
+    Reads the immutable want snapshot first (collapsing the three historical
+    derivations: restart used the torrent title, _start_row rebuilt from the
+    request, apply_route did a third thing). Falls back to the _start_row
+    reconstruction for rows grabbed before want_json existed, and finally to
+    the torrent row title.
+    """
+    want_json = getattr(row, "want_json", None)
+    if want_json:
+        try:
+            want = json.loads(want_json)
+            title = want.get("search_alias") or want.get("canonical_title")
+            if title:
+                return title
+        except (ValueError, TypeError):
+            pass
+    if row.request_id is not None:
+        req = get_request(row.request_id)
+        if req is not None:
+            return _ascii_preferring_title(req.resolved_title, req.content)
+    return row.title
 
 
 def pick_best_result(results: list[TorrentResult], media_type: str,
@@ -404,6 +473,14 @@ class DownloadManager:
         staging = Path(config.TORRENT_DOWNLOAD_DIR)
         staging.mkdir(parents=True, exist_ok=True)
 
+        # Freeze the want snapshot from the request row as it stands NOW.
+        req = get_request(request_id) if request_id is not None else None
+        minutes = _request_movie_minutes(req) if (
+            req is not None and result.media_type == "movie") else None
+        want = _build_want_snapshot(
+            result, req, request_title=request_title,
+            show_id=show_id, season=season, episode=episode, minutes=minutes)
+
         download_id = downloads_store.create_download(
             title=result.title, magnet=result.magnet, source=result.source,
             media_type=result.media_type, request_id=request_id,
@@ -414,6 +491,7 @@ class DownloadManager:
             auto_rename=auto_rename, auto_move=auto_move,
             show_id=show_id, season=season, episode=episode,
             replace_path=replace_path, failure_key=failure_key,
+            want_json=json.dumps(want),
         )
         if episode_context is not None:
             shows_store.set_episode_grab(
@@ -548,11 +626,7 @@ class DownloadManager:
 
     def _start_row(self, row: downloads_store.DownloadRow) -> None:
         downloads_store.set_status(row.download_id, "downloading")
-        request_title = None
-        if row.request_id is not None:
-            req = get_request(row.request_id)
-            if req is not None:
-                request_title = _ascii_preferring_title(req.resolved_title, req.content)
+        request_title = _request_title_from_row(row)
         threading.Thread(
             target=self._run_download,
             args=(row.download_id, row.magnet,
@@ -674,7 +748,9 @@ class DownloadManager:
         if proc is not None and proc.poll() is None:
             return "already running"
         downloads_store.set_status(download_id, "queued", error=None)
-        request_title = row.title
+        # Read the frozen want snapshot instead of the torrent row's own title
+        # (the old restart bug: a sequel-named torrent title re-drove routing).
+        request_title = _request_title_from_row(row)
         threading.Thread(
             target=self._run_download,
             args=(download_id, row.magnet, row.staging_dir or config.TORRENT_DOWNLOAD_DIR,
@@ -729,11 +805,7 @@ class DownloadManager:
             return "Download not found."
         if row.status not in ("downloaded",):
             return f"Can't apply route while status is '{row.status}'."
-        request_title = None
-        if row.request_id is not None:
-            req = get_request(row.request_id)
-            if req is not None:
-                request_title = req.resolved_title or req.content
+        request_title = _request_title_from_row(row)
         return self._post_process(
             row.download_id, force_move=True, force_rename=True,
             request_title=request_title,
@@ -993,11 +1065,36 @@ class DownloadManager:
     def auto_grab_open_requests(self) -> list[int]:
         """Grab open requests that have no download yet. Movies take the
         best single result; shows/anime/hentai use the season-aware plan
-        (finish the latest owned season → next season → season 1)."""
+        (finish the latest owned season → next season → season 1).
+
+        needs_identity rows are never queried here (they are not 'open'); this
+        pass logs them so the skip is visible, and a per-row identity guard
+        double-protects against any 'open' row that lacks a qualified identity.
+        """
         started: list[int] = []
+        # Visible, logged reason for skipping identity-less rows.
+        pending_identity = list_requests(
+            status=queue_store.STATUS_NEEDS_IDENTITY, limit=200)
+        if pending_identity:
+            logger.info(
+                "Auto-grab: skipping %d request(s) that need an identity before "
+                "they can be grabbed (ids: %s).",
+                len(pending_identity),
+                [r.request_id for r in pending_identity])
+
         already = downloads_store.request_ids_with_downloads()
         for req in list_requests(status="open", limit=100):
             if req.request_id in already or req.found_in_library:
+                continue
+            # An 'open' movie/tv/anime row must carry a provider-qualified
+            # identity to be auto-grabbable. 'other' is exempt by design; an
+            # unqualified typed/unknown row is skipped with a logged reason
+            # rather than coerced to 'other' and grabbed (the #85 path).
+            if req.media_type != "other" and not req.is_qualified:
+                logger.info(
+                    "Auto-grab: request #%s (%s) is open but has no qualified "
+                    "identity — skipping (needs_identity).",
+                    req.request_id, req.media_type)
                 continue
             query = _ascii_preferring_title(req.resolved_title, req.content)
             media_type = req.media_type if req.media_type != "unknown" else "other"

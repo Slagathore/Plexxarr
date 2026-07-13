@@ -12,6 +12,10 @@ datas = []
 # sv-ttk ships its Sun Valley theme as Tcl data files; without collecting them
 # the dark theme silently falls back to the stock gray ttk look in the EXE.
 datas += collect_data_files("sv_ttk")
+# rank-torrent-name + its parser parsett carry regex/pattern data files that
+# the analysis misses; collect them so the selection engine parses in the EXE.
+datas += collect_data_files("RTN")
+datas += collect_data_files("parsett")
 # The Node webtorrent downloader lives beside the app; ship the script +
 # manifest so the Downloads pipeline works from the bundle. (node_modules is
 # NOT bundled — run `npm install` in torrent_runner/ next to the EXE once, and
@@ -24,11 +28,18 @@ for _rf in ("download.mjs", "package.json", "package-lock.json", "diag.mjs"):
 hiddenimports = (
     collect_submodules("telegram")
     + collect_submodules("pystray")
+    # rank-torrent-name (selection engine) + its transitive deps. parsett is
+    # the parser; pydantic/pydantic_core back the models; the rest are RTN's
+    # runtime deps that get imported dynamically.
+    + collect_submodules("RTN")
+    + collect_submodules("parsett")
+    + collect_submodules("pydantic")
+    + ["pydantic_core", "orjson", "Levenshtein", "arrow", "pymediainfo"]
     # New modules are imported dynamically enough that we pin them explicitly.
     + ["sv_ttk", "send2trash", "shows_tab", "shows_store", "show_tracker",
        "downloads_store", "download_manager", "torrent_search", "torrent_routing",
        "auth_store", "db", "ui_helpers", "health", "watchlist_tab", "video_quality",
-       "subtitles", "anime_db"]
+       "subtitles", "anime_db", "media_identity"]
 )
 
 

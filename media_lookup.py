@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import config
+import media_identity
 
 logger = logging.getLogger(__name__)
 
@@ -1012,81 +1013,12 @@ _EP_PATTERNS = [
 _FUZZY_LIBRARY_THRESHOLD = 0.75
 
 # --- Sequel-number guard -----------------------------------------------------
-# "Dune Part Two" must never match a library entry of just "Dune", and
-# "<movie> 2" must not match "<movie>". Both the substring fallback and
-# rapidfuzz's WRatio (which rewards partial matches) were producing these
-# false "already in your library" positives. The guard extracts the sequel
-# numbers each title carries and rejects a match when they differ.
-
-_ROMAN_NUMERALS = {
-    "ii": 2, "iii": 3, "iv": 4, "v": 5,
-    "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10,
-}
-_NUMBER_WORDS = {
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-}
-_PART_MARKERS = {"part", "pt", "chapter", "vol", "volume", "book", "season"}
-
-
-# Tokens that mark the start of release-group junk in a filename. Sequel
-# numbers sit NEXT TO the title ("John Wick 3"); digits after these markers
-# are codec/audio noise ("DDP5.1", "x265", "1080p") and must not pollute the
-# signature — otherwise junk digits block legitimate matches.
-_JUNK_TOKEN_RE = re.compile(
-    r"^(?:\d{3,4}p|x26[45]|h26[45]|hevc|avc|blu-?ray|b[dr]rip|web-?(?:dl|rip)?"
-    r"|hdtv|dvdrip|remux|proper|repack|extended|uncut|imax|hdr(?:10)?\+?"
-    r"|dolby|vision|dv|atmos|ddp?\d?|dts(?:hd)?|aac\d?|ac3|truehd|opus"
-    r"|\d+bit|multi|dual|sub(?:bed|s)?|dub(?:bed)?|remaster(?:ed)?)$",
-    re.IGNORECASE,
-)
-
-
-def _signature_portion(title: str) -> list[str]:
-    """Tokens of the title up to the first year or release-junk marker.
-
-    "john wick 3 2019 1080p ddp5 1 x265 group" → ["john", "wick", "3"]
-    """
-    tokens = re.findall(r"[a-z0-9]+", title.casefold())
-    portion: list[str] = []
-    for tok in tokens:
-        if tok.isdigit() and len(tok) == 4 and 1880 <= int(tok) <= 2159:
-            break  # year — title (and any sequel number) ends here
-        if _JUNK_TOKEN_RE.match(tok):
-            break
-        portion.append(tok)
-    return portion or tokens  # a title that IS a year/junk word survives
-
-
-def _sequel_signature(title: str) -> frozenset[int]:
-    """Return the set of sequel/part numbers a title carries.
-
-    Captures: standalone digit tokens ("Movie 2", "Movie 10"), roman numerals
-    ("Rocky III"), and number words directly after a part marker
-    ("Dune Part Two"). Only the portion of the name before the first
-    year/release-junk marker is considered, so "DDP5.1"/"x265"-style noise
-    from release groups can't inject phantom numbers. Four-digit numbers in
-    the plausible-year range are ignored so "Blade Runner 2049" isn't
-    treated as sequel #2049.
-    """
-    numbers: set[int] = set()
-    prev = ""
-    for tok in _signature_portion(title):
-        if tok.isdigit():
-            value = int(tok)
-            if not (1880 <= value <= 2159 and len(tok) == 4):  # skip years
-                numbers.add(value)
-        elif tok in _ROMAN_NUMERALS:
-            numbers.add(_ROMAN_NUMERALS[tok])
-        elif tok in _NUMBER_WORDS and prev in _PART_MARKERS:
-            numbers.add(_NUMBER_WORDS[tok])
-        prev = tok
-    return frozenset(numbers)
-
-
-def _sequel_mismatch(a: str, b: str) -> bool:
-    """True when the two titles clearly refer to different entries in a series."""
-    return _sequel_signature(a) != _sequel_signature(b)
+# The sequel-number logic MOVED to media_identity.py so selection, pre-move
+# verification, reconciliation and intake dedupe all share ONE definition of
+# "different entry in a series". These thin aliases keep media_lookup's own
+# callers (check_library_for_title, below) and the existing tests working.
+_sequel_signature = media_identity.sequel_signature
+_sequel_mismatch = media_identity.sequel_mismatch
 
 
 def clean_library_name(name: str) -> str:
