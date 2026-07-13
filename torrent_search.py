@@ -62,6 +62,16 @@ def _magnet_from_hash(info_hash: str, name: str) -> str:
     return magnet
 
 
+_BTIH_RE = re.compile(r"btih:([A-Za-z0-9]{32,40})", re.IGNORECASE)
+
+
+def _infohash(magnet: str) -> str:
+    """Lowercased btih info-hash from a magnet URI, or '' if absent. Used to
+    dedupe pools across sources."""
+    m = _BTIH_RE.search(magnet or "")
+    return m.group(1).lower() if m else ""
+
+
 # ---------------------------------------------------------------------------
 # YTS — movies (JSON API)
 # ---------------------------------------------------------------------------
@@ -102,7 +112,8 @@ def search_yts(query: str, *, limit: int = 20) -> list[TorrentResult]:
 # The Pirate Bay — via the apibay.org JSON API (no HTML scraping)
 # ---------------------------------------------------------------------------
 
-def search_tpb(query: str, media_type: str, *, limit: int = 30) -> list[TorrentResult]:
+def search_tpb(query: str, media_type: str, *, limit: int = 30,
+               collect: bool = False) -> list[TorrentResult]:
     # cat=200 restricts to Video. (Categories: 201 movies, 205 TV, 207 HD
     # movies, 208 HD TV — 200 covers the whole video tree.)
     url = "https://apibay.org/q.php?" + urllib.parse.urlencode({"q": query, "cat": "200"})
@@ -127,6 +138,11 @@ def search_tpb(query: str, media_type: str, *, limit: int = 30) -> list[TorrentR
             source="tpb",
             media_type=media_type,
         ))
+    # Collection mode keeps the API's own order and only BOUNDS the pool — it
+    # must not seeder-sort-then-truncate, or a correct low-seed release gets
+    # dropped before the gates ever run (section 4 item 1).
+    if collect:
+        return results[:limit]
     results.sort(key=lambda r: r.seeders, reverse=True)
     return results[:limit]
 
@@ -148,7 +164,12 @@ def _parse_nyaa_size(text: str) -> int:
 
 
 def _search_nyaa_rss(base: str, query: str, category: str, source: str,
-                     media_type: str, *, limit: int = 30) -> list[TorrentResult]:
+                     media_type: str, *, limit: int = 30,
+                     collect: bool = False) -> list[TorrentResult]:
+    # RSS is sorted by seeders desc server-side. In collection mode we still
+    # only BOUND the pool (take the first `limit`); the point is that `limit` is
+    # the wide per-source pool, not a narrow final cut, and the selection gates —
+    # not seeders — decide the winner (section 4 item 1).
     url = f"{base}/?" + urllib.parse.urlencode(
         {"page": "rss", "q": query, "c": category, "f": "0", "s": "seeders", "o": "desc"}
     )
@@ -179,13 +200,17 @@ def _search_nyaa_rss(base: str, query: str, category: str, source: str,
     return results
 
 
-def search_nyaa(query: str, *, limit: int = 30) -> list[TorrentResult]:
+def search_nyaa(query: str, *, limit: int = 30,
+                collect: bool = False) -> list[TorrentResult]:
     # c=1_2: Anime — English-translated (same filter the old browser links used)
-    return _search_nyaa_rss("https://nyaa.si", query, "1_2", "nyaa", "anime", limit=limit)
+    return _search_nyaa_rss("https://nyaa.si", query, "1_2", "nyaa", "anime",
+                            limit=limit, collect=collect)
 
 
-def search_sukebei(query: str, *, limit: int = 30) -> list[TorrentResult]:
-    return _search_nyaa_rss("https://sukebei.nyaa.si", query, "0_0", "sukebei", "xanime", limit=limit)
+def search_sukebei(query: str, *, limit: int = 30,
+                   collect: bool = False) -> list[TorrentResult]:
+    return _search_nyaa_rss("https://sukebei.nyaa.si", query, "0_0", "sukebei",
+                            "xanime", limit=limit, collect=collect)
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +236,82 @@ def search_torrents(query: str, media_type: str, *, limit: int = 30) -> list[Tor
 
     results.sort(key=lambda r: r.seeders, reverse=True)
     return results[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Collection mode — wide per-source pools for the selection engine (Task B)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CollectedPool:
+    """A widened, deduped candidate pool plus the per-source counts the
+    selection decision records (pick_meta). `results` is NOT seeder-truncated —
+    the selection gates, not seeders, decide the winner."""
+    results: tuple           # tuple[TorrentResult, ...]
+    pool_stats: dict         # {"per_source": {src: n}, "collected": n,
+                             #  "deduped": n, "duplicates_removed": n}
+
+
+def search_collect(query: str, media_type: str, *,
+                   per_source: int = 50) -> CollectedPool:
+    """Gather wide per-source pools (30-50 each), normalize, and dedupe by
+    info-hash WITHOUT any global seeder truncation. This is what every automatic
+    path uses instead of search_torrents (section 4 item 1). Per-source pool
+    sizes are recorded for pick_meta.
+
+    Automatic callers are NOT rewired to this yet — that is Phase 3. search_torrents
+    keeps its legacy seeder-sorted shape for manual/legacy callers.
+    """
+    query = query.strip()
+    per_source = max(1, min(int(per_source), 50))
+    if not query:
+        return CollectedPool(results=tuple(),
+                             pool_stats={"per_source": {}, "collected": 0,
+                                         "deduped": 0, "duplicates_removed": 0})
+
+    per_source_results: list[tuple[str, list[TorrentResult]]] = []
+    if media_type == "movie":
+        per_source_results.append(("yts", search_yts(query, limit=per_source)))
+        per_source_results.append(
+            ("tpb", search_tpb(query, media_type, limit=per_source, collect=True)))
+    elif media_type == "anime":
+        per_source_results.append(
+            ("nyaa", search_nyaa(query, limit=per_source, collect=True)))
+    elif media_type == "xanime":
+        per_source_results.append(
+            ("sukebei", search_sukebei(query, limit=per_source, collect=True)))
+    else:  # tv / other / unknown
+        per_source_results.append(
+            ("tpb", search_tpb(query, media_type, limit=per_source, collect=True)))
+
+    per_source_stats: dict = {}
+    collected: list[TorrentResult] = []
+    for src, res in per_source_results:
+        per_source_stats[src] = len(res)
+        collected.extend(res)
+
+    # Dedupe by info-hash. On a collision keep the copy reporting more seeders
+    # (better swarm health for the identical payload); order is otherwise stable.
+    seen: dict[str, int] = {}
+    deduped: list[TorrentResult] = []
+    for r in collected:
+        ih = _infohash(r.magnet)
+        key = ih or f"__noihash__{len(deduped)}"
+        if key in seen:
+            idx = seen[key]
+            if r.seeders > deduped[idx].seeders:
+                deduped[idx] = r
+            continue
+        seen[key] = len(deduped)
+        deduped.append(r)
+
+    stats = {
+        "per_source": per_source_stats,
+        "collected": len(collected),
+        "deduped": len(deduped),
+        "duplicates_removed": len(collected) - len(deduped),
+    }
+    return CollectedPool(results=tuple(deduped), pool_stats=stats)
 
 
 def format_size(size_bytes: int) -> str:

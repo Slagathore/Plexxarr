@@ -134,6 +134,49 @@ CREATE TABLE IF NOT EXISTS grab_deferrals (
 )
 """
 
+# ---------------------------------------------------------------------------
+# Selection provenance (Task B item 4 / RESOLVED DECISION 12): normalized
+# selection_runs + candidate_decisions. Every automatic (and manual-preflight)
+# torrent_select pass can be persisted here so the grab queue can render "what
+# did it choose, why did that one win, and what did every loser fail on?".
+#
+# Phase 1 builds the tables + ONE transactional writer + a read API. NOTHING
+# writes them automatically yet — the wiring lands in Phase 3. The ALTER/CREATE
+# identifiers here are static literals; never interpolate user input into them.
+# ---------------------------------------------------------------------------
+_SCHEMA_SELECTION_RUNS = """
+CREATE TABLE IF NOT EXISTS selection_runs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at       TEXT NOT NULL,
+    mode             TEXT NOT NULL,
+    profile          TEXT NOT NULL,
+    rtn_version      TEXT NOT NULL,
+    request_id       INTEGER,
+    download_id      INTEGER,
+    chosen_infohash  TEXT,
+    chosen_title     TEXT,
+    reason           TEXT,
+    pool_stats_json  TEXT
+)
+"""
+
+_SCHEMA_CANDIDATE_DECISIONS = """
+CREATE TABLE IF NOT EXISTS candidate_decisions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    selection_run_id INTEGER NOT NULL,
+    rank_position    INTEGER,
+    infohash         TEXT,
+    title            TEXT,
+    passed           INTEGER NOT NULL DEFAULT 0,
+    reason_code      TEXT NOT NULL,
+    detail           TEXT,
+    score_total      REAL,
+    score_components_json TEXT,
+    seeders          INTEGER,
+    size_bytes       INTEGER
+)
+"""
+
 
 def _init_failed_grabs(conn) -> None:
     conn.execute("""
@@ -208,6 +251,8 @@ def initialize_downloads_db() -> None:
         conn.execute(_SCHEMA_DOWNLOADS)
         conn.execute(_SCHEMA_HISTORY)
         conn.execute(_SCHEMA_DEFERRALS)
+        conn.execute(_SCHEMA_SELECTION_RUNS)
+        conn.execute(_SCHEMA_CANDIDATE_DECISIONS)
         for table, column, col_def in _MIGRATIONS:
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if existing and column not in existing:
@@ -409,3 +454,176 @@ def list_history(*, limit: int = 200) -> list[HistoryRow]:
             (limit,),
         ).fetchall()
     return [HistoryRow(*r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Selection provenance API (Task B item 4 / RESOLVED DECISION 12)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SelectionRunRow:
+    selection_run_id: int
+    created_at: str
+    mode: str
+    profile: str
+    rtn_version: str
+    request_id: int | None
+    download_id: int | None
+    chosen_infohash: str | None
+    chosen_title: str | None
+    reason: str | None
+    pool_stats_json: str | None
+
+
+@dataclass(frozen=True)
+class CandidateDecisionRow:
+    candidate_decision_id: int
+    selection_run_id: int
+    rank_position: int | None
+    infohash: str | None
+    title: str | None
+    passed: bool
+    reason_code: str
+    detail: str | None
+    score_total: float | None
+    score_components_json: str | None
+    seeders: int | None
+    size_bytes: int | None
+
+
+def record_selection_run(decision, *, request_id: int | None = None,
+                         download_id: int | None = None) -> int:
+    """Persist a torrent_select.SelectionDecision transactionally: one
+    selection_runs row plus one candidate_decisions row PER candidate, in a
+    single transaction (never a read-modify-write from several sites — the whole
+    decision lands atomically or not at all).
+
+    `decision` is duck-typed against torrent_select.SelectionDecision so this
+    module does not import the RTN-backed selector at module load. Returns the
+    new selection_run id.
+
+    Phase 1: this exists for Phase 3/4 to call. Nothing calls it automatically
+    yet.
+    """
+    import json as _json
+
+    verdicts = list(getattr(decision, "verdicts", ()) or ())
+    scores = list(getattr(decision, "scores", ()) or ())
+    # rank_position by infohash for any candidate that made the scored top list.
+    positions = {getattr(s, "infohash", None): i + 1
+                 for i, s in enumerate(scores)}
+    score_by_hash = {getattr(s, "infohash", None): s for s in scores}
+
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO selection_runs
+                (created_at, mode, profile, rtn_version, request_id, download_id,
+                 chosen_infohash, chosen_title, reason, pool_stats_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                getattr(decision, "created_at", ""),
+                getattr(decision, "mode", ""),
+                getattr(decision, "profile", ""),
+                getattr(decision, "rtn_version", ""),
+                request_id, download_id,
+                getattr(decision, "chosen_infohash", None),
+                getattr(decision, "chosen_title", None),
+                getattr(decision, "reason", "") or "",
+                _json.dumps(getattr(decision, "pool_stats", {}) or {}),
+            ),
+        )
+        run_id = int(cursor.lastrowid or 0)
+
+        rows = []
+        for v in verdicts:
+            ih = getattr(v, "infohash", None)
+            sb = score_by_hash.get(ih)
+            rows.append((
+                run_id,
+                positions.get(ih),
+                ih,
+                getattr(v, "title", None),
+                int(bool(getattr(v, "passed", False))),
+                getattr(v, "reason_code", ""),
+                getattr(v, "detail", ""),
+                getattr(sb, "total", None) if sb is not None else None,
+                (_json.dumps(getattr(sb, "components", {}))
+                 if sb is not None else None),
+                getattr(sb, "seeders", None) if sb is not None else None,
+                getattr(sb, "size_bytes", None) if sb is not None else None,
+            ))
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO candidate_decisions
+                    (selection_run_id, rank_position, infohash, title, passed,
+                     reason_code, detail, score_total, score_components_json,
+                     seeders, size_bytes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        conn.commit()
+    return run_id
+
+
+def get_selection_run(selection_run_id: int) -> SelectionRunRow | None:
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, created_at, mode, profile, rtn_version, request_id,
+                   download_id, chosen_infohash, chosen_title, reason,
+                   pool_stats_json
+            FROM selection_runs WHERE id = ?
+            """,
+            (selection_run_id,),
+        ).fetchone()
+    return SelectionRunRow(*row) if row else None
+
+
+def list_candidate_decisions(selection_run_id: int) -> list[CandidateDecisionRow]:
+    """Every candidate's verdict for one run, scored survivors first (by
+    rank_position), then rejections."""
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, selection_run_id, rank_position, infohash, title, passed,
+                   reason_code, detail, score_total, score_components_json,
+                   seeders, size_bytes
+            FROM candidate_decisions
+            WHERE selection_run_id = ?
+            ORDER BY (rank_position IS NULL), rank_position, id
+            """,
+            (selection_run_id,),
+        ).fetchall()
+    return [
+        CandidateDecisionRow(
+            candidate_decision_id=r[0], selection_run_id=r[1],
+            rank_position=r[2], infohash=r[3], title=r[4], passed=bool(r[5]),
+            reason_code=r[6], detail=r[7], score_total=r[8],
+            score_components_json=r[9], seeders=r[10], size_bytes=r[11],
+        )
+        for r in rows
+    ]
+
+
+def get_selection_run_for_download(download_id: int) -> SelectionRunRow | None:
+    """Most recent selection run linked to a download (Phase 3/4 consumer)."""
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, created_at, mode, profile, rtn_version, request_id,
+                   download_id, chosen_infohash, chosen_title, reason,
+                   pool_stats_json
+            FROM selection_runs WHERE download_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (download_id,),
+        ).fetchone()
+    return SelectionRunRow(*row) if row else None

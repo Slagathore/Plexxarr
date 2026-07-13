@@ -136,6 +136,12 @@ def _looks_like_episode_release(title: str) -> bool:
     return parsed.season is not None or parsed.episode is not None
 
 
+# NOTE: filter_viable_results + pick_best_result are SUPERSEDED by the pure
+# torrent_select.select_torrent engine (Task B / torrent_select.py), which runs
+# eight reason-coded gates and a versioned score instead of these two-signal
+# vetoes. They stay live because the legacy automatic paths still call them;
+# those paths are rewired to select_torrent in Phase 3. Do not delete yet.
+# note: deferred to Phase 3.
 def filter_viable_results(results: list[TorrentResult], media_type: str,
                           *, block_cams: bool | None = None,
                           minutes: float | None = None) -> list[TorrentResult]:
