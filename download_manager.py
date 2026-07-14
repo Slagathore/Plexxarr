@@ -27,6 +27,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any, Callable
@@ -38,8 +39,11 @@ import queue_store
 import show_tracker
 import shows_store
 import torrent_routing
+import torrent_select
+from media_identity import MediaIdentity
 from queue_store import get_request, list_requests
-from torrent_search import TorrentResult, search_torrents
+from torrent_search import TorrentResult, search_collect, search_torrents
+from torrent_select import SelectWant
 
 logger = logging.getLogger(__name__)
 
@@ -136,12 +140,13 @@ def _looks_like_episode_release(title: str) -> bool:
     return parsed.season is not None or parsed.episode is not None
 
 
-# NOTE: filter_viable_results + pick_best_result are SUPERSEDED by the pure
-# torrent_select.select_torrent engine (Task B / torrent_select.py), which runs
-# eight reason-coded gates and a versioned score instead of these two-signal
-# vetoes. They stay live because the legacy automatic paths still call them;
-# those paths are rewired to select_torrent in Phase 3. Do not delete yet.
-# note: deferred to Phase 3.
+# NOTE: filter_viable_results + pick_best_result + _prefer_unfailed are
+# SUPERSEDED by the pure torrent_select.select_torrent engine (Task B), which
+# runs eight reason-coded gates and a versioned score instead of these
+# two-signal vetoes. As of Phase 3 NO automatic decision path calls them — a
+# grep proves it. They are RETAINED only because their own unit tests exercise
+# them directly (tests/test_video_quality.py, tests/test_maintenance_dupes.py)
+# and they remain available to any manual/legacy caller. Legacy manual-only.
 def filter_viable_results(results: list[TorrentResult], media_type: str,
                           *, block_cams: bool | None = None,
                           minutes: float | None = None) -> list[TorrentResult]:
@@ -461,6 +466,25 @@ class _QBitClient:
         })
 
 
+@dataclass(frozen=True)
+class ManualGrabOutcome:
+    """The result of a manual-pick preflight (DownloadManager.manual_grab).
+
+    ok            : the grab started (either it passed every gate, or the caller
+                    supplied a typed override).
+    needs_override: a gate rejected the pick and the caller must confirm a typed
+                    override to proceed; nothing was grabbed.
+    reason_code   : the rejecting gate ('ok' when it passed cleanly).
+    selection_run_id: the persisted decision (always recorded).
+    """
+    ok: bool
+    download_id: int | None
+    reason_code: str
+    detail: str
+    selection_run_id: int | None
+    needs_override: bool
+
+
 class DownloadManager:
     """Owns runner subprocesses and post-processing. One instance per app."""
 
@@ -554,6 +578,78 @@ class DownloadManager:
             # MAX_ACTIVE_DOWNLOADS at once and rotates stale ones out.
             self._maybe_start_next()
         return download_id
+
+    def manual_grab(
+        self, result: TorrentResult, *,
+        request_id: int | None = None, request_title: str | None = None,
+        auto_rename: bool | None = None, auto_move: bool | None = None,
+        episode_context: tuple[int, int, int] | None = None,
+        override_reason: str | None = None,
+    ) -> "ManualGrabOutcome":
+        """Manual user pick (mode manual-user-pick): run the hard gates as a
+        PREFLIGHT before grabbing.
+
+        The user's explicit choice is never re-scored away, but a gate rejection
+        (a sequel/identity/country mismatch, a CAM, an oversize pick, …) is
+        surfaced. The pick proceeds only when it passes every gate OR the caller
+        supplies a typed `override_reason`, which is recorded in the selection
+        run's pool_stats so the override is auditable. Selection provenance is
+        persisted either way.
+        """
+        media_type = result.media_type
+        req = get_request(request_id) if request_id is not None else None
+        if req is not None:
+            want = self._want_from_request(
+                req, media_type, mode=torrent_select.MODE_MANUAL_USER_PICK)
+        elif episode_context is not None:
+            show = shows_store.get_show(episode_context[0])
+            if show is not None:
+                want = self._want_for_show_episode(
+                    show, episode_context[1], episode_context[2],
+                    _runtime_minutes(show),
+                    torrent_select.MODE_MANUAL_USER_PICK)
+            else:
+                want = self._race_fallback_want(media_type, None)
+        else:
+            pref, max_rate, default_minutes = _size_prefs(media_type)
+            want = SelectWant(
+                identity=MediaIdentity(media_type=media_type,
+                                       canonical_title=request_title or None),
+                size_pref_mb_min=pref, size_max_rate=max_rate,
+                fallback_minutes=default_minutes,
+                allow_cam=not config.BLOCK_CAMS,
+                mode=torrent_select.MODE_MANUAL_USER_PICK)
+
+        decision, by_hash = self._run_selection([result], want)
+        chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
+        verdict = decision.verdicts[0] if decision.verdicts else None
+        reason = verdict.reason_code if verdict is not None else "no_candidate"
+        detail = verdict.detail if verdict is not None else ""
+
+        if chosen is None and not override_reason:
+            # A gate rejected the pick and the user has not confirmed an
+            # override: refuse, persist the refusal so it is visible.
+            run_id = downloads_store.record_selection_run(
+                decision, request_id=request_id)
+            return ManualGrabOutcome(
+                ok=False, download_id=None, reason_code=reason, detail=detail,
+                selection_run_id=run_id, needs_override=True)
+
+        if chosen is None and override_reason:
+            # Record the typed override on the decision before persisting.
+            decision.pool_stats["manual_override"] = override_reason
+            decision.pool_stats["overridden_reason_code"] = reason
+
+        download_id = self.grab(
+            result, request_id=request_id, request_title=request_title,
+            auto_rename=auto_rename, auto_move=auto_move,
+            episode_context=episode_context)
+        run_id = downloads_store.record_selection_run(
+            decision, request_id=request_id, download_id=download_id)
+        return ManualGrabOutcome(
+            ok=True, download_id=download_id,
+            reason_code=("ok" if chosen is not None else reason), detail=detail,
+            selection_run_id=run_id, needs_override=False)
 
     # ------------------------------------------------------------------
     # Crash/restart recovery
@@ -942,15 +1038,10 @@ class DownloadManager:
             return False
         return True
 
-    @staticmethod
-    def _result_matches_query(result_title: str, query: str) -> bool:
-        """Movie/other auto-grabs: the release must actually resemble what
-        was asked for — containment or fuzzy match on the parsed title."""
-        if query.casefold() in result_title.casefold():
-            return True
-        parsed = torrent_routing.parse_torrent_name(result_title)
-        return torrent_routing._folder_similarity(
-            parsed.show_title or result_title, query) >= 0.55
+    # _result_matches_query was DELETED in Phase 3: its sole caller (the movie
+    # auto-grab branch) now runs torrent_select, whose title-identity gate
+    # (RTN.title_match + sequel/numeric guards) supersedes the old
+    # containment/fuzzy check. Nothing else referenced it.
 
     def _match_tracked_show(self, title: str) -> shows_store.TrackedShow | None:
         best: shows_store.TrackedShow | None = None
@@ -960,6 +1051,127 @@ class DownloadManager:
             if score > best_score:
                 best, best_score = show, score
         return best if best_score >= 0.85 else None
+
+    # ------------------------------------------------------------------
+    # Selection engine wiring (Phase 3) — every automatic decision path runs
+    # torrent_select.select_torrent over a search_collect pool, injects the
+    # CAM check, and persists the decision via record_selection_run. The legacy
+    # filter_viable_results/pick_best_result/_prefer_unfailed picker is retained
+    # only for its unit tests and any manual/legacy caller; NO automatic path
+    # below reaches it.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _recent_failure_hashes(context_key: str) -> set[str]:
+        """Info-hashes that failed for this context within the retry window.
+
+        Drives torrent_select's scored -25 recent_failure component (the
+        explainable replacement for _prefer_unfailed's order-dependent
+        pre-sort). Unlike the old pre-sort these are NOT excluded — merely
+        penalised — so a release that is the only remaining option can still
+        win.
+        """
+        fails = downloads_store.failed_grab_times(context_key)
+        if not fails:
+            return set()
+        cutoff = time.time() - FAILED_GRAB_RETRY_AFTER_S
+        return {h for h, t in fails.items() if t >= cutoff}
+
+    def _blocklist_for(self, want: SelectWant):
+        """Subject-scoped blocklist input for the selector.
+
+        Phase 3 defines the CALL so Phase 4 only has to swap the lookup body:
+        it will read downloads_store for permanent, subject-scoped blocklist
+        entries keyed on want.identity.subject_key and return them (or a
+        reason-aware callable). Until Task C lands that table there are no
+        automatic entries, so this returns None and the engine's blocklist gate
+        is a no-op. note: deferred - Phase 4 wires the real blocklist read here.
+        """
+        return None
+
+    def _run_selection(self, results, want: SelectWant, *,
+                       failure_key: str | None = None,
+                       pool_stats: dict | None = None):
+        """Run the pure selector over a result pool and return
+        (SelectionDecision, {infohash: TorrentResult}).
+
+        Injects cam_check=video_quality.is_cam_release at EVERY site (binding
+        Phase 0/1 obligation: RTN.trash alone misses HDCAM-style names like
+        WORKPRINT), the recent-failure penalty, and the (stub) blocklist input.
+        """
+        from video_quality import is_cam_release
+        candidates = []
+        by_hash: dict[str, TorrentResult] = {}
+        for r in results:
+            cand = torrent_select.to_candidate(r)
+            candidates.append(cand)
+            if cand.norm_infohash:
+                by_hash.setdefault(cand.norm_infohash, r)
+        recent = self._recent_failure_hashes(failure_key) if failure_key else None
+        decision = torrent_select.select_torrent(
+            candidates, want,
+            blocklist=self._blocklist_for(want),
+            recent_failures=recent,
+            cam_check=is_cam_release,
+            pool_stats=pool_stats,
+        )
+        return decision, by_hash
+
+    def _want_from_request(self, req, media_type: str, *, mode: str,
+                           season: int | None = None,
+                           episode: int | None = None,
+                           minutes: float | None = None,
+                           runtime_override: float | None = None) -> SelectWant:
+        """Build the immutable SelectWant a request-linked grab is judged
+        against, from the request row's stored identity (never raw user text).
+        """
+        pref, max_rate, default_minutes = _size_prefs(media_type)
+        # For movie/other single grabs, fall back to the search alias as the
+        # canonical title so RTN.title_match still guards the pick when the row
+        # carries no resolved_title (preserving the old _result_matches_query
+        # containment guard through the engine's title gate).
+        canonical = getattr(req, "resolved_title", None) if req else None
+        if not canonical and req is not None:
+            canonical = _row_search_alias(req) or None
+        identity = MediaIdentity(
+            media_type=media_type,
+            identity_source=getattr(req, "identity_source", None) if req else None,
+            external_id=(str(req.external_id)
+                         if req is not None and req.external_id is not None else None),
+            canonical_title=canonical,
+            canonical_year=getattr(req, "canonical_year", None) if req else None,
+            origin_countries=tuple(getattr(req, "origin_countries", []) or ())
+            if req else (),
+            aliases=tuple(getattr(req, "aliases", []) or ()) if req else (),
+            season=season if season is not None else (
+                getattr(req, "season", None) if req else None),
+            episode=episode,
+        )
+        rt = runtime_override if runtime_override is not None else minutes
+        return SelectWant(
+            identity=identity, size_pref_mb_min=pref, size_max_rate=max_rate,
+            runtime_minutes=rt, fallback_minutes=default_minutes,
+            allow_cam=not config.BLOCK_CAMS, mode=mode)
+
+    def _want_for_show_episode(self, show: shows_store.TrackedShow,
+                               season: int | None, episode: int | None,
+                               minutes: float | None, mode: str) -> SelectWant:
+        """SelectWant for a tracked-show episode/season grab, keyed on the
+        show's identity from tracked_shows (source + external_id)."""
+        pref, max_rate, default_minutes = _size_prefs(show.media_type)
+        identity = MediaIdentity(
+            media_type=show.media_type,
+            identity_source=getattr(show, "source", None),
+            external_id=(str(show.external_id)
+                         if getattr(show, "external_id", None) is not None else None),
+            canonical_title=show.title,
+            season=season,
+            episode=episode,
+        )
+        return SelectWant(
+            identity=identity, size_pref_mb_min=pref, size_max_rate=max_rate,
+            runtime_minutes=minutes, fallback_minutes=default_minutes,
+            allow_cam=not config.BLOCK_CAMS, mode=mode)
 
     def _grab_season_pack(self, title: str, media_type: str, season: int,
                           ep_count: int, *, request_id: int | None,
@@ -977,14 +1189,19 @@ class DownloadManager:
         if not search_title:
             search_title = self._search_title_for(show) if show is not None else title
         results: list[TorrentResult] = []
+        pool_stats: dict = {}
         for query in (f"{search_title} S{season:02d}", f"{search_title} Season {season}"):
             try:
-                results = search_torrents(query, media_type, limit=15)
+                pool = search_collect(query, media_type)
             except Exception:
                 logger.exception("Season-pack search failed for %s", query)
-                results = []
-            if results:
+                continue
+            if pool.results:
+                results = list(pool.results)
+                pool_stats = dict(pool.pool_stats)
                 break
+        # Pre-filter to plausible packs (seeders required — packs never race) and
+        # guard against unrelated shows before the engine scores what survives.
         viable = [r for r in results if r.size_bytes > 0 and r.seeders > 0]
         if show is not None:
             viable = [r for r in viable
@@ -996,33 +1213,36 @@ class DownloadManager:
                       or torrent_routing._folder_similarity(
                           torrent_routing.parse_torrent_name(r.title).show_title or r.title,
                           title) >= 0.5]
-        _pref, max_rate, default_minutes = _size_prefs(media_type)
+        _pref, _max_rate, default_minutes = _size_prefs(media_type)
         per_ep = _runtime_minutes(show) or default_minutes
         season_minutes = max(1, ep_count) * per_ep
-        if max_rate > 0:
-            cap = max_rate * season_minutes * 1024 * 1024
-            viable = [r for r in viable if r.size_bytes <= cap]
-        if not viable:
-            return []
         key = f"pack:{title.casefold()}:{season}"
-        viable = _prefer_unfailed(viable, key)
-        if not self._oversize_gate(viable, media_type, key, minutes=season_minutes):
+
+        # The size max cap scales to the whole season (season_minutes), so a
+        # pack isn't vetoed by a per-episode cap — passed to the engine via the
+        # want's runtime_minutes override.
+        req = get_request(request_id) if request_id is not None else None
+        want = self._want_from_request(
+            req, media_type, mode=torrent_select.MODE_AUTOMATIC_SEASON_PACK,
+            season=season, runtime_override=season_minutes)
+        decision, by_hash = self._run_selection(
+            viable, want, failure_key=key, pool_stats=pool_stats)
+        chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
+        if chosen is None:
+            downloads_store.record_selection_run(decision, request_id=request_id)
             return []
-        import math
-        pref = _size_prefs(media_type)[0]
-        target = pref * season_minutes * 1024 * 1024 if pref > 0 else None
-
-        def rank(r: TorrentResult):
-            if target and r.size_bytes:
-                return (abs(math.log2(r.size_bytes / target)), -r.seeders)
-            return (0.0, -r.seeders)
-
-        best = sorted(viable, key=rank)[0]
-        download_id = self.grab(best, request_id=request_id, request_title=title,
+        survivors = [by_hash[s.infohash] for s in decision.scores
+                     if s.infohash in by_hash]
+        if not self._oversize_gate(survivors, media_type, key, minutes=season_minutes):
+            downloads_store.record_selection_run(decision, request_id=request_id)
+            return []
+        download_id = self.grab(chosen, request_id=request_id, request_title=title,
                                 auto_rename=True, auto_move=True,
                                 failure_key=key)
+        downloads_store.record_selection_run(
+            decision, request_id=request_id, download_id=download_id)
         logger.info("Season-pack grab: '%s' S%02d → download #%s (%s)",
-                    title, season, download_id, best.title)
+                    title, season, download_id, chosen.title)
         return [download_id]
 
     def _grab_request_seasonwise(self, req) -> list[int]:
@@ -1072,7 +1292,8 @@ class DownloadManager:
         if latest_missing:
             started: list[int] = []
             for ep in latest_missing[:config.SHOWS_GRAB_LIMIT_PER_PASS]:
-                started.extend(self._grab_one_episode(show, ep))
+                started.extend(self._grab_one_episode(
+                    show, ep, request_id=req.request_id))
             return started
 
         # Latest owned season is complete → the next season with aired eps.
@@ -1092,9 +1313,16 @@ class DownloadManager:
                                       search_title=title)
 
     def _grab_one_episode(self, show: shows_store.TrackedShow,
-                          ep: shows_store.EpisodeRow) -> list[int]:
+                          ep: shows_store.EpisodeRow,
+                          *, request_id: int | None = None) -> list[int]:
         """Search + grab a single tracked episode (shared by the missing-
-        episode pass and season-aware requests)."""
+        episode pass, follow-new/keep-at-100, and season-aware requests).
+
+        `request_id` flows the originating request through so season-wise grabs
+        stop losing their provenance (the Task C item 4 leak; the LINKAGE lands
+        now, the junction table is Phase 4). Selection runs through the engine
+        in automatic-episode mode.
+        """
         if ep.grab_download_id is not None:
             linked = downloads_store.get_download(ep.grab_download_id)
             if linked is not None and linked.status not in ("error", "cancelled"):
@@ -1102,36 +1330,53 @@ class DownloadManager:
         search_title = self._search_title_for(show)
         query = f"{search_title} S{ep.season:02d}E{ep.episode:02d}"
         try:
-            results = search_torrents(query, show.media_type, limit=10)
+            pool = search_collect(query, show.media_type)
+            results = list(pool.results)
+            pool_stats = dict(pool.pool_stats)
             if not results and show.media_type in ("anime", "xanime"):
-                results = search_torrents(
-                    f"{search_title} {ep.episode:02d}", show.media_type, limit=10)
+                pool = search_collect(
+                    f"{search_title} {ep.episode:02d}", show.media_type)
+                results = list(pool.results)
+                pool_stats = dict(pool.pool_stats)
         except Exception:
             logger.exception("Episode search failed for %s", query)
             return []
         minutes = _runtime_minutes(show)
-        viable = filter_viable_results(results, show.media_type, minutes=minutes)
-        viable = [r for r in viable if self._result_matches_show(
+        # Episode/season contradiction + show-name guard (the engine's title
+        # gate does not check episode numbers, and _result_matches_show carries
+        # the kanji-incident "resembles a known name" protection).
+        viable = [r for r in results if self._result_matches_show(
             r.title, show, season=ep.season, episode=ep.episode)]
-        if not viable:
-            return []
-        seeded = [r for r in viable if r.seeders > 0]
-        if not seeded:
-            return self.start_zero_seeder_race(
-                viable, show.media_type, minutes=minutes,
-                episode_context=(show.show_id, ep.season, ep.episode))
+        want = self._want_for_show_episode(
+            show, ep.season, ep.episode, minutes,
+            torrent_select.MODE_AUTOMATIC_EPISODE)
         key = f"ep:{show.show_id}:{ep.season}:{ep.episode}"
-        seeded = _prefer_unfailed(seeded, key)
-        if not self._oversize_gate(seeded, show.media_type, key, minutes=minutes):
+        decision, by_hash = self._run_selection(
+            viable, want, failure_key=key, pool_stats=pool_stats)
+        chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
+        if chosen is None:
+            downloads_store.record_selection_run(decision, request_id=request_id)
             return []
-        best = pick_best_result(seeded, show.media_type, minutes=minutes)
-        if best is None:
+        survivors = [by_hash[s.infohash] for s in decision.scores
+                     if s.infohash in by_hash]
+        if chosen.seeders <= 0:
+            # The engine's best pick has no seeders: hand the gated survivors to
+            # the zero-seeder race (its own selection run + mode).
+            return self.start_zero_seeder_race(
+                survivors, show.media_type, minutes=minutes,
+                request_id=request_id,
+                episode_context=(show.show_id, ep.season, ep.episode))
+        if not self._oversize_gate(survivors, show.media_type, key, minutes=minutes):
+            downloads_store.record_selection_run(decision, request_id=request_id)
             return []
         download_id = self.grab(
-            best, episode_context=(show.show_id, ep.season, ep.episode),
+            chosen, request_id=request_id,
+            episode_context=(show.show_id, ep.season, ep.episode),
             auto_rename=True, auto_move=True)
+        downloads_store.record_selection_run(
+            decision, request_id=request_id, download_id=download_id)
         logger.info("Auto-grabbed %s → download #%s (%s, %s seeders)",
-                    query, download_id, best.title, best.seeders)
+                    query, download_id, chosen.title, chosen.seeders)
         return [download_id]
 
     def auto_grab_open_requests(self) -> list[int]:
@@ -1184,39 +1429,46 @@ class DownloadManager:
                 continue
 
             try:
-                results = search_torrents(query, media_type, limit=10)
+                pool = search_collect(query, media_type)
             except Exception:
                 logger.exception("Auto-grab search failed for request #%s", req.request_id)
                 continue
             minutes = _request_movie_minutes(req)
-            viable = filter_viable_results(results, media_type, minutes=minutes)
-            viable = [r for r in viable if self._result_matches_query(r.title, query)]
-            if not viable:
+            key = f"req:{req.request_id}"
+            want = self._want_from_request(
+                req, media_type, mode=torrent_select.MODE_AUTOMATIC_SINGLE,
+                minutes=minutes)
+            decision, by_hash = self._run_selection(
+                list(pool.results), want, failure_key=key,
+                pool_stats=dict(pool.pool_stats))
+            chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
+            if chosen is None:
+                downloads_store.record_selection_run(decision, request_id=req.request_id)
                 logger.info("Request #%s (%s): no acceptable result this pass — "
                             "will retry on the next auto-grab cycle.",
                             req.request_id, query)
                 continue
-            seeded = [r for r in viable if r.seeders > 0]
-            if not seeded:
-                # Nothing has seeders — race a handful and keep the winner.
+            survivors = [by_hash[s.infohash] for s in decision.scores
+                         if s.infohash in by_hash]
+            if chosen.seeders <= 0:
+                # Nothing survivable has seeders — race the gated survivors
+                # (their own selection run + zero-seeder-race mode).
                 started.extend(self.start_zero_seeder_race(
-                    viable, media_type, minutes=minutes,
+                    survivors, media_type, minutes=minutes,
                     request_id=req.request_id, request_title=query,
                 ))
                 continue
-            seeded = _prefer_unfailed(seeded, f"req:{req.request_id}")
-            if not self._oversize_gate(seeded, media_type, f"req:{req.request_id}",
-                                       minutes=minutes):
-                continue
-            best = pick_best_result(seeded, media_type, minutes=minutes)
-            if best is None:
+            if not self._oversize_gate(survivors, media_type, key, minutes=minutes):
+                downloads_store.record_selection_run(decision, request_id=req.request_id)
                 continue
             download_id = self.grab(
-                best, request_id=req.request_id, request_title=query,
+                chosen, request_id=req.request_id, request_title=query,
             )
+            downloads_store.record_selection_run(
+                decision, request_id=req.request_id, download_id=download_id)
             logger.info(
                 "Auto-grabbed request #%s → download #%s (%s, %s seeders)",
-                req.request_id, download_id, best.title, best.seeders,
+                req.request_id, download_id, chosen.title, chosen.seeders,
             )
             started.append(download_id)
         return started
@@ -1305,22 +1557,51 @@ class DownloadManager:
     ) -> list[int]:
         """All results report 0 seeders: grab up to 5 and monitor for an hour.
 
+        Race candidates pass gates 1-8 exactly like a normal pick — the
+        selection runs through the engine in zero-seeder-race mode, so a wrong
+        release (sequel, CAM, country mismatch) can never enter the race. The
+        race REDESIGN (auto-move disable, winner verification, race_loser
+        semantics) is Phase 4; here only candidate SELECTION goes through the
+        engine and the decision is persisted.
+
         Rules (per Cole): if one finishes, cancel the rest. At the hour mark,
         keep the single most-progressed download (if any moved at all) and
         cancel the others; if nothing progressed, cancel them all.
         """
-        pref, _mx, default_minutes = _size_prefs(media_type)
-        minutes = minutes if minutes and minutes > 0 else default_minutes
-        target = pref * minutes * 1024 * 1024 if pref > 0 else None
+        # Rebuild the want from the originating context so the gates judge the
+        # race pool against the same identity a normal pick would.
+        if episode_context is not None:
+            show = shows_store.get_show(episode_context[0])
+            if show is not None:
+                want = self._want_for_show_episode(
+                    show, episode_context[1], episode_context[2], minutes,
+                    torrent_select.MODE_ZERO_SEEDER_RACE)
+            else:
+                want = self._race_fallback_want(media_type, minutes)
+            key = (f"ep:{episode_context[0]}:{episode_context[1]}:"
+                   f"{episode_context[2]}")
+        elif request_id is not None:
+            req = get_request(request_id)
+            want = self._want_from_request(
+                req, media_type, mode=torrent_select.MODE_ZERO_SEEDER_RACE,
+                minutes=minutes)
+            key = f"req:{request_id}"
+        else:
+            want = self._race_fallback_want(media_type, minutes)
+            key = None
 
-        import math
-
-        def rank(r: TorrentResult):
-            if target and r.size_bytes:
-                return abs(math.log2(r.size_bytes / target))
-            return 0.0
-
-        picks = sorted(results, key=rank)[:5]
+        decision, by_hash = self._run_selection(
+            list(results), want, failure_key=key)
+        # Persist the race decision (Phase 4 links every race download to this
+        # shared selection_run_id and adds winner verification). note: deferred
+        # - Phase 4 shares one selection_run_id across all race downloads.
+        run_id = downloads_store.record_selection_run(decision, request_id=request_id)
+        picks = [by_hash[s.infohash] for s in decision.scores
+                 if s.infohash in by_hash][:5]
+        if not picks:
+            logger.info("Zero-seeder race: no candidate survived the gates "
+                        "(run #%s)", run_id)
+            return []
         ids = [
             self.grab(r, request_id=request_id, request_title=request_title,
                       episode_context=episode_context)
@@ -1330,6 +1611,18 @@ class DownloadManager:
         threading.Thread(target=self._race_monitor, args=(ids,),
                          name="dl-zero-seeder-race", daemon=True).start()
         return ids
+
+    def _race_fallback_want(self, media_type: str,
+                            minutes: float | None) -> SelectWant:
+        """A minimal, identity-less want for a race with no request/show
+        context — the gates still reject CAM/oversize/zero-size candidates."""
+        pref, max_rate, default_minutes = _size_prefs(media_type)
+        return SelectWant(
+            identity=MediaIdentity(media_type=media_type),
+            size_pref_mb_min=pref, size_max_rate=max_rate,
+            runtime_minutes=minutes, fallback_minutes=default_minutes,
+            allow_cam=not config.BLOCK_CAMS,
+            mode=torrent_select.MODE_ZERO_SEEDER_RACE)
 
     def _race_monitor(self, ids: list[int], *, duration_s: int = 3600) -> None:
         deadline = time.time() + duration_s
@@ -1383,7 +1676,7 @@ class DownloadManager:
         Returns the download id, or None when nothing acceptable was found.
         """
         try:
-            results = search_torrents(title_query, "movie", limit=25)
+            pool = search_collect(title_query, "movie")
         except Exception:
             logger.exception("Replacement search failed for %s", title_query)
             return None
@@ -1400,20 +1693,36 @@ class DownloadManager:
         except OSError:
             pass
 
-        viable = filter_viable_results(results, "movie", block_cams=True,
-                                       minutes=minutes)
+        # Replacement-specific floor (don't swap junk for junk) + seeders>0
+        # (replacement never races) as a pre-filter; the engine then gates
+        # (CAM always blocked here) and scores what survives.
         floor_bytes = config.LOW_QUALITY_MB_PER_MIN * (minutes or 120) * 1024 * 1024
-        viable = [r for r in viable if r.size_bytes >= floor_bytes and r.seeders > 0]
-        best = pick_best_result(viable, "movie", minutes=minutes)
-        if best is None:
+        viable = [r for r in pool.results
+                  if r.size_bytes >= floor_bytes and r.seeders > 0]
+        pref, max_rate, default_minutes = _size_prefs("movie")
+        # note: deferred - Task F/Phase 6 gives replacement a real MediaIdentity
+        # (media_identity + old_path -> replacement); today it only has the
+        # title query, so the want carries canonical_title but no external id.
+        want = SelectWant(
+            identity=MediaIdentity(media_type="movie", canonical_title=title_query),
+            size_pref_mb_min=pref, size_max_rate=max_rate,
+            runtime_minutes=minutes, fallback_minutes=default_minutes,
+            allow_cam=False,  # always block cams — that's what we're replacing
+            mode=torrent_select.MODE_AUTOMATIC_REPLACEMENT)
+        decision, by_hash = self._run_selection(
+            viable, want, pool_stats=dict(pool.pool_stats))
+        chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
+        if chosen is None:
+            downloads_store.record_selection_run(decision)
             logger.info("No acceptable non-cam replacement found for %s", title_query)
             return None
         download_id = self.grab(
-            best, request_title=title_query,
+            chosen, request_title=title_query,
             auto_rename=True, auto_move=True, replace_path=old_path,
         )
+        downloads_store.record_selection_run(decision, download_id=download_id)
         logger.info("Replacement grab for %s → download #%s (%s)",
-                    title_query, download_id, best.title)
+                    title_query, download_id, chosen.title)
         return download_id
 
     # ------------------------------------------------------------------

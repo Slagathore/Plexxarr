@@ -210,9 +210,10 @@ def test_request_command_bare_text_needs_identity():
 def test_auto_grab_skips_needs_identity(monkeypatch):
     request_intake.add_needs_identity("married at first sight", "cole")
     # Auto-grab must never query a needs_identity row. Fail loudly if it does.
-    monkeypatch.setattr(download_manager, "search_torrents",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("searched a needs_identity row")))
+    def _boom(*a, **k):
+        raise AssertionError("searched a needs_identity row")
+    monkeypatch.setattr(download_manager, "search_torrents", _boom)
+    monkeypatch.setattr(download_manager, "search_collect", _boom)
     dm = download_manager.DownloadManager()
     assert dm.auto_grab_open_requests() == []
 
@@ -435,8 +436,11 @@ def test_seasonwise_grab_query_contains_alias(monkeypatch):
     req = queue_store.get_request(row.request_ids[0])
 
     captured = []
-    monkeypatch.setattr(download_manager, "search_torrents",
-                        lambda q, *a, **k: captured.append(q) or [])
+    from torrent_search import CollectedPool
+    monkeypatch.setattr(
+        download_manager, "search_collect",
+        lambda q, *a, **k: captured.append(q) or CollectedPool(
+            results=tuple(), pool_stats={}))
     dm = download_manager.DownloadManager()
     dm._grab_request_seasonwise(req)
     assert captured, "season-wise grab issued no query"
@@ -525,8 +529,11 @@ def test_seasonwise_alias_survives_competing_tracked_show(monkeypatch):
         assert "Married at First Sight US" in req.aliases
 
         captured = []
-        monkeypatch.setattr(download_manager, "search_torrents",
-                            lambda q, *a, **k: captured.append(q) or [])
+        from torrent_search import CollectedPool
+        monkeypatch.setattr(
+            download_manager, "search_collect",
+            lambda q, *a, **k: captured.append(q) or CollectedPool(
+                results=tuple(), pool_stats={}))
         dm = download_manager.DownloadManager()
         # Sanity: the competing show DOES fuzzy-match (the bug's precondition).
         assert dm._match_tracked_show("Married at First Sight US") is not None

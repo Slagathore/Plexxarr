@@ -2186,15 +2186,34 @@ class DesktopApp:
             seeders=result.seeders, source=result.source, media_type=media_type,
         )
         request_id, request_title = (self._dl_request_context or (None, None))
-        download_id = self.download_manager.grab(
-            result,
+        grab_kwargs = dict(
             request_id=request_id,
             request_title=request_title,
             auto_rename=bool(self._dl_auto_rename_var.get()),
             auto_move=bool(self._dl_auto_move_var.get()),
             episode_context=self._dl_episode_context,
         )
-        self._dl_status_var.set(f"Started download #{download_id}: {result.title}")
+        # Manual pick: run the hard gates as a preflight (mode manual-user-pick).
+        # A gate rejection (sequel/identity/country mismatch, CAM, oversize)
+        # requires a typed override, recorded in the selection run.
+        outcome = self.download_manager.manual_grab(result, **grab_kwargs)
+        if outcome.needs_override:
+            confirmed = self._ask_yes_no(
+                "Override selection gate",
+                f"This pick was flagged: {outcome.reason_code}\n"
+                f"{outcome.detail}\n\nDownload it anyway?")
+            if not confirmed:
+                self._dl_status_var.set(
+                    f"Grab cancelled — flagged {outcome.reason_code}")
+                return
+            outcome = self.download_manager.manual_grab(
+                result, override_reason=f"user confirmed via UI ({outcome.reason_code})",
+                **grab_kwargs)
+        if not outcome.ok or outcome.download_id is None:
+            self._dl_status_var.set(f"Grab did not start: {outcome.reason_code}")
+            return
+        self._dl_status_var.set(
+            f"Started download #{outcome.download_id}: {result.title}")
         self.last_action_var.set("Last action: torrent grab")
         self.refresh_downloads()
 
