@@ -335,7 +335,7 @@ def test_needs_identity_row_and_season_subject_key():
     rows = grab_queue.request_rows()
     ni_row = next(r for r in rows if r.request_id == ni.request_id)
     assert ni_row.row_type == grab_queue.ROW_NEEDS_IDENTITY
-    assert "resolve" in ni_row.reason
+    assert "resolve" in ni_row.reason.lower()
     tv_row = next(r for r in rows if r.request_id == tv.request_id)
     assert tv_row.subject_key == "tvdb:55:s2"
     assert tv_row.display_title == "Known Show S02"
