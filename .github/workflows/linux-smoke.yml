@@ -1,0 +1,72 @@
+# Task H item 9 — Linux source/package smoke, kept SEPARATE from tests.yml so
+# a smoke failure is distinguishable from a unit-test failure at a glance.
+#
+# What this job proves (each step is a failable gate):
+#   1. The declared Ubuntu OS packages install (the same apt line the in-app
+#      Linux diagnostics recommend — keep in sync with platform_adapter.py).
+#   2. The Linux dependency contract (requirements.txt with sys_platform
+#      markers) installs cleanly.
+#   3. The torrent runner loads and shuts down in deterministic no-network
+#      smoke mode.
+#   4. The platform process adapter starts and stops a harmless fixture tree.
+#   5. Source startup/clean-shutdown under Xvfb via `main.py --smoke-test`
+#      (bounded, network-free, writes only to its own temp dirs).
+#   6. PyInstaller builds the Linux artifact from Plexxarr-linux.spec
+#      (PyInstaller is not a cross-compiler — this MUST run on Linux).
+#   7. The built artifact itself passes --smoke-test under Xvfb.
+name: linux-smoke
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OS packages (the in-app diagnostics apt line + xvfb)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk ffmpeg xdg-utils python3-venv xvfb
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # System python3 + venv, not setup-python: python3-tk installs tkinter
+      # for the distro interpreter, which is exactly what a Linux user gets.
+      - name: Install the Linux dependency contract
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
+          .venv/bin/pip install pyinstaller==6.11.1
+
+      - name: Torrent runner deterministic no-network smoke
+        working-directory: torrent_runner
+        run: |
+          npm ci
+          node download.mjs --smoke-test
+
+      - name: Platform process adapter fixture start/stop
+        run: .venv/bin/python platform_adapter.py --selftest
+
+      - name: Source smoke under Xvfb (bounded, network-free)
+        run: xvfb-run -a .venv/bin/python main.py --smoke-test
+
+      - name: Build the Linux artifact
+        run: .venv/bin/pyinstaller --noconfirm Plexxarr-linux.spec
+
+      - name: Packaged-artifact smoke under Xvfb
+        run: xvfb-run -a dist/Plexxarr/Plexxarr --smoke-test
+
+      - name: Upload the Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plexxarr-linux
+          path: dist/Plexxarr
+          retention-days: 14

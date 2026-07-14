@@ -1,6 +1,7 @@
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import TypedDict, cast
 import psutil
 
 import config
+import platform_adapter
 
 logger = logging.getLogger(__name__)
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -120,6 +122,18 @@ def _list_plex_processes() -> list[psutil.Process]:
     return processes
 
 
+def _stop_process_tree(proc: psutil.Process) -> tuple[bool, str]:
+    """Force-stop the process and its child tree, per platform.
+
+    Windows keeps the exact taskkill flow it always had. Everywhere else the
+    platform adapter walks the tree with psutil: children first, terminate ->
+    timed wait -> kill (Task H item 5 — never taskkill, never a hard-coded
+    distro path)."""
+    if sys.platform == "win32":
+        return _taskkill_process_tree(proc)
+    return platform_adapter.terminate_process_tree(proc.pid)
+
+
 def _taskkill_process_tree(proc: psutil.Process) -> tuple[bool, str]:
     """Use Windows taskkill to force-stop the process and any child tree."""
     try:
@@ -201,7 +215,7 @@ def _kill_plex_processes() -> tuple[list[str], list[str]]:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             name = f"PID {proc.pid}"
 
-        success, details = _taskkill_process_tree(proc)
+        success, details = _stop_process_tree(proc)
         detail_suffix = f" ({details})" if details else ""
         if success:
             killed.append(f"{name} [{proc.pid}]{detail_suffix}")
@@ -284,6 +298,35 @@ def _launch_plex() -> str:
     return (
         f"Plex executable was not found at '{config.PLEX_MEDIA_SERVER_PATH}'. "
         "Update PLEX_MEDIA_SERVER_PATH in your .env file."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Local-control capability (Task H item 5)
+# ---------------------------------------------------------------------------
+
+def local_control_available() -> tuple[bool, str]:
+    """Whether the local Launch/Exit/Hard Reset controls make sense here.
+
+    Windows: always on — the flow every existing install has used (the
+    configured default path plus process-name matching cover it), so nothing
+    changes for a Windows user. Elsewhere: only when a configured executable
+    override exists on disk or a Plex process is actually running; a
+    remote-only PLEX_SERVER_URL config gets (False, explanation) so the UI
+    disables the buttons instead of treating the server as broken."""
+    if sys.platform == "win32":
+        return True, "windows"
+    configured = (config.PLEX_MEDIA_SERVER_PATH or "").strip()
+    if configured and Path(configured).expanduser().is_file():
+        return True, f"configured executable: {configured}"
+    if not _is_plex_gone():
+        return True, "local Plex process detected"
+    return False, (
+        "No local Plex install was found on this machine. Remote features "
+        "(library, requests, watchlist) keep working through "
+        f"PLEX_SERVER_URL ({config.PLEX_SERVER_URL}); to enable local "
+        "process control, set PLEX_MEDIA_SERVER_PATH to your Plex Media "
+        "Server executable."
     )
 
 

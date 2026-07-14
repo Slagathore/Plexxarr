@@ -18,15 +18,20 @@
 import sqlite3
 from pathlib import Path
 
+import app_paths
 import config
 
 
 def db_path() -> Path:
-    """Absolute path to the shared application database."""
+    """Absolute path to the shared application database.
+
+    A relative APP_DB_PATH resolves against the DATA dir of the app_paths
+    contract — which on Windows is the executable's folder, exactly as it
+    always was."""
     path = Path(config.APP_DB_PATH)
     if path.is_absolute():
         return path
-    return config.APP_DIR / path
+    return app_paths.PATHS.data_dir / path
 
 
 def connect(path: Path | str | None = None) -> sqlite3.Connection:

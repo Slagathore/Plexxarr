@@ -20,6 +20,7 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -114,7 +115,10 @@ def _find_ffprobe() -> str | None:
     _ffprobe_resolved = True
 
     found = shutil.which("ffprobe")
-    if found is None:
+    if found is None and sys.platform == "win32":
+        # Windows-only fallback hunt (Task H item 7): these install-location
+        # globs mean nothing on POSIX, where PATH via shutil.which is the
+        # whole story and the missing tool is named by the diagnostics.
         import glob
         import os
         candidates = [

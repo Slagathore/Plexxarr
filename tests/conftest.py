@@ -11,6 +11,16 @@ from pathlib import Path
 _TEST_DB_DIR = tempfile.mkdtemp(prefix="prb-tests-")
 os.environ["APP_DB_PATH"] = str(Path(_TEST_DB_DIR) / "test_app.db")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token-not-real")
+# Task H: pin every app_paths contract dir to the temp tree too, so tests
+# never write caches/locks into the repo (Windows legacy layout) or the
+# real ~/.config//~/.cache (Linux XDG layout). Setting PLEXXARR_CONFIG_DIR
+# also stops config.py from loading a developer's real .env — tests see the
+# same clean-environment defaults CI sees.
+for _key, _sub in (("PLEXXARR_CONFIG_DIR", "config"),
+                   ("PLEXXARR_DATA_DIR", "data"),
+                   ("PLEXXARR_CACHE_DIR", "cache"),
+                   ("PLEXXARR_RUNTIME_DIR", "runtime")):
+    os.environ[_key] = str(Path(_TEST_DB_DIR) / _sub)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 

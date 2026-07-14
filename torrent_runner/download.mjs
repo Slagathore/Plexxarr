@@ -20,6 +20,26 @@
 import WebTorrent from "webtorrent";
 
 const [magnet, destDir, stallTimeoutArg] = process.argv.slice(2);
+
+// Deterministic no-network smoke mode (Task H item 9): prove the runner's
+// dependency tree loads and a client constructs/destroys cleanly, with every
+// peer-discovery mechanism disabled so nothing touches the network. CI runs
+// this; process.exit here means the download flow below never starts.
+if (magnet === "--smoke-test") {
+  const smokeClient = new WebTorrent({
+    dht: false, tracker: false, lsd: false, utPex: false, webSeeds: false,
+  });
+  console.log(JSON.stringify({ event: "smoke", ok: true, webtorrent: WebTorrent.VERSION || "unknown" }));
+  const destroyed = new Promise((resolve) => smokeClient.destroy(resolve));
+  const timedOut = new Promise((resolve) => setTimeout(() => resolve("timeout"), 10_000).unref());
+  const result = await Promise.race([destroyed, timedOut]);
+  if (result === "timeout") {
+    console.log(JSON.stringify({ event: "error", message: "smoke destroy timed out" }));
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
 if (!magnet || !destDir) {
   console.log(JSON.stringify({ event: "error", message: "usage: download.mjs <magnet> <destDir> [stallSec]" }));
   process.exit(2);

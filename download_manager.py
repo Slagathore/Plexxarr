@@ -23,6 +23,7 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -51,20 +52,35 @@ from torrent_select import SelectWant
 logger = logging.getLogger(__name__)
 
 
+def runner_install_dir() -> Path:
+    """Where a WRITABLE torrent_runner (script + node_modules) belongs.
+
+    Windows keeps the historical location beside the exe/source. On Linux a
+    packaged install sits under a read-only prefix, so the writable copy
+    lives in the DATA dir instead (npm install runs there)."""
+    import app_paths
+    if sys.platform == "win32":
+        return app_paths.PATHS.install_dir / "torrent_runner"
+    if getattr(sys, "frozen", False):
+        return app_paths.PATHS.data_dir / "torrent_runner"
+    return app_paths.PATHS.install_dir / "torrent_runner"
+
+
 def _resolve_runner_path() -> Path:
     """Locate download.mjs across the layouts it can live in.
 
-    - From source: <repo>/torrent_runner/download.mjs (APP_DIR == repo).
-    - Frozen EXE: node_modules can only sit beside the script, so we prefer a
-      writable torrent_runner NEXT TO the exe (APP_DIR/torrent_runner);
+    - From source: <repo>/torrent_runner/download.mjs (install dir == repo).
+    - Frozen build: node_modules can only sit beside the script, so we prefer
+      the writable runner dir (beside the exe on Windows, DATA dir on Linux);
       PyInstaller also bundles a read-only copy under _internal, and older
       builds used BUNDLE_DIR — check those as fallbacks so the path always
-      resolves even if the sibling folder wasn't seeded.
+      resolves even if the writable folder wasn't seeded.
     """
+    import app_paths
     candidates = [
-        Path(config.APP_DIR) / "torrent_runner" / "download.mjs",
-        Path(config.APP_DIR) / "_internal" / "torrent_runner" / "download.mjs",
-        Path(config.BUNDLE_DIR) / "torrent_runner" / "download.mjs",
+        runner_install_dir() / "download.mjs",
+        app_paths.PATHS.install_dir / "_internal" / "torrent_runner" / "download.mjs",
+        app_paths.PATHS.bundle_dir / "torrent_runner" / "download.mjs",
     ]
     for path in candidates:
         if path.is_file():
@@ -413,8 +429,9 @@ def pick_best_result(results: list[TorrentResult], media_type: str,
 
     return sorted(results, key=sort_key)[0]
 
-# Windows: suppress the console window for the Node subprocess.
-_CREATE_NO_WINDOW = 0x08000000
+# Windows: suppress the console window for the Node subprocess. On POSIX
+# creationflags must be 0 (any other value raises in subprocess.Popen).
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # ---------------------------------------------------------------------------
 # Public tracker list — appended to every magnet before download. Poorly
@@ -424,7 +441,12 @@ _CREATE_NO_WINDOW = 0x08000000
 # ---------------------------------------------------------------------------
 
 _TRACKERS_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
-_TRACKERS_CACHE = Path(config.APP_DIR) / "trackers_cache.txt"
+def _trackers_cache_path() -> Path:
+    import app_paths
+    return app_paths.PATHS.cache_dir / "trackers_cache.txt"
+
+
+_TRACKERS_CACHE = _trackers_cache_path()
 _TRACKERS_MAX_AGE_S = 24 * 3600
 
 _BUILTIN_TRACKERS = [

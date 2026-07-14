@@ -14,8 +14,10 @@
 # =============================================================================
 
 import logging
+import os
 import re
 import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,13 +67,40 @@ def movie_folder_name(title: str, year: int | None,
 _SHOW_MATCH_THRESHOLD = 0.85
 
 
+def _same_volume(a: Path, b: Path) -> bool:
+    """Do two paths live on the same disk/volume?
+
+    Windows keeps the exact drive-letter comparison it always had. POSIX has
+    no useful Path.drive (it is "" for every path — comparing it would call
+    EVERYTHING the same drive), so volumes compare by the st_dev of the
+    deepest existing ancestor: /mnt/disk1 vs /media/disk2 vs an ordinary
+    path all resolve honestly (Task H item 7).
+    """
+    if sys.platform == "win32":
+        return a.drive.upper() == b.drive.upper()
+
+    def dev_of(path: Path) -> int | None:
+        p = path
+        while True:
+            try:
+                return os.stat(p).st_dev
+            except OSError:
+                if p == p.parent:
+                    return None
+                p = p.parent
+
+    dev_a, dev_b = dev_of(a), dev_of(b)
+    return dev_a is not None and dev_a == dev_b
+
+
 def pick_root_by_free_space(candidates: list[str]) -> str | None:
     """Where NEW content should land, among the given candidate folders.
 
     DOWNLOAD_ROOT_OVERRIDE (Settings) hard-pins the choice: an exact folder
-    wins outright; a drive-root-style override ("I:\\") narrows candidates
-    to that drive. Otherwise the folder on the drive with the most free
-    space wins — drive letters can shuffle, free space follows the disk.
+    wins outright; a volume-style override ("I:\\" on Windows, a mount point
+    like "/mnt/disk1" on Linux) narrows candidates to that volume. Otherwise
+    the folder on the volume with the most free space wins — drive letters
+    and mount names can shuffle, free space follows the disk.
     """
     dirs = [c for c in candidates if Path(c).is_dir()]
     override = config.DOWNLOAD_ROOT_OVERRIDE
@@ -82,12 +111,11 @@ def pick_root_by_free_space(candidates: list[str]) -> str | None:
         for c in dirs:
             if Path(c) == override_path:
                 return c
-        on_override_drive = [
-            c for c in dirs
-            if Path(c).drive.upper() == override_path.drive.upper()
+        on_override_volume = [
+            c for c in dirs if _same_volume(Path(c), override_path)
         ]
-        if on_override_drive:
-            dirs = on_override_drive
+        if on_override_volume:
+            dirs = on_override_volume
         elif override_path.is_dir():
             return str(override_path)
     if not dirs:

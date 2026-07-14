@@ -127,7 +127,10 @@ def run_health_checks(*, bot_running: bool | None = None) -> list[CheckResult]:
     node = shutil.which(config.NODE_PATH)
     checks.append(CheckResult(bool(node), "Node.js",
                               node or f"'{config.NODE_PATH}' not found — downloads won't start"))
-    runner = Path(config.APP_DIR) / "torrent_runner" / "download.mjs"
+    # Same resolution the download pipeline itself uses (Task H: the runner
+    # can live beside the exe on Windows or in the data dir on Linux).
+    import download_manager
+    runner = download_manager._RUNNER_PATH
     modules = runner.parent / "node_modules"
     if runner.is_file():
         detail = "ready" if modules.is_dir() else "download.mjs found but node_modules missing — run 'npm install' in torrent_runner/"

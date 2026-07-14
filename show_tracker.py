@@ -360,10 +360,15 @@ def _scan_library_folders_impl(media_types: tuple[str, ...]) -> ScanResult:
 _UNIDENTIFIED_FILE = "unidentified_folders.json"
 
 
+def _unidentified_path() -> Path:
+    import app_paths
+    return app_paths.PATHS.cache_dir / _UNIDENTIFIED_FILE
+
+
 def _save_unidentified(folders: list[str]) -> None:
     import json
     try:
-        (Path(config.APP_DIR) / _UNIDENTIFIED_FILE).write_text(
+        _unidentified_path().write_text(
             json.dumps(folders, indent=1), encoding="utf-8")
     except OSError:
         logger.debug("Could not persist unidentified-folder list.", exc_info=True)
@@ -374,8 +379,7 @@ def load_unidentified() -> list[str]:
     since been mapped — e.g. identified by hand — are filtered out)."""
     import json
     try:
-        raw = json.loads((Path(config.APP_DIR) / _UNIDENTIFIED_FILE)
-                         .read_text(encoding="utf-8"))
+        raw = json.loads(_unidentified_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
     return [f for f in raw if isinstance(f, str)

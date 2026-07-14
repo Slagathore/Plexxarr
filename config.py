@@ -26,25 +26,31 @@ def _load_dotenv_func() -> Callable[..., Any] | None:
     return cast(Callable[..., Any] | None, getattr(dotenv_module, "load_dotenv", None))
 
 
-def _app_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+# Task H: every path decision lives in app_paths (the typed contract).
+# On Windows these resolve to the exact pre-Task-H layout (everything beside
+# the executable); on Linux they follow XDG. APP_DIR stays exported because
+# plenty of call sites still read config.APP_DIR for the install location.
+import app_paths
 
+APP_DIR: Path = app_paths.PATHS.install_dir
+BUNDLE_DIR: Path = app_paths.PATHS.bundle_dir
+DOTENV_PATH: Path = app_paths.PATHS.config_dir / ".env"
 
-def _bundle_dir() -> Path:
-    return Path(getattr(sys, "_MEIPASS", _app_dir()))
+# Linux source checkouts historically kept .env beside the code. Until the
+# legacy migration has moved it, fall back to that location so an existing
+# install keeps working. Skipped when CONFIG_DIR is explicitly pinned
+# (tests/CI/smoke) — an explicit pin means "only look there".
+_LEGACY_DOTENV: Path = app_paths.PATHS.install_dir / ".env"
+if (not DOTENV_PATH.is_file() and _LEGACY_DOTENV.is_file()
+        and not os.getenv("PLEXXARR_CONFIG_DIR")):
+    DOTENV_PATH = _LEGACY_DOTENV
 
-
-APP_DIR: Path = _app_dir()
-BUNDLE_DIR: Path = _bundle_dir()
-DOTENV_PATH: Path = APP_DIR / ".env"
 load_dotenv = _load_dotenv_func()
 
 if load_dotenv is not None:
     if DOTENV_PATH.is_file():
         load_dotenv(DOTENV_PATH)
-    else:
+    elif not os.getenv("PLEXXARR_CONFIG_DIR"):
         load_dotenv()
 
 
@@ -108,9 +114,16 @@ PLEX_EXIT_GRACE: float = float(os.getenv("PLEX_EXIT_GRACE", "3"))
 PLEX_LAUNCH_WAIT: float = float(os.getenv("PLEX_LAUNCH_WAIT", "5"))
 MAX_EXIT_RETRIES: int = int(os.getenv("MAX_EXIT_RETRIES", "10"))
 ADMIN_STATUS_REFRESH_SECONDS: int = int(os.getenv("ADMIN_STATUS_REFRESH_SECONDS", "15"))
+# Default Plex executable: the standard Windows install path on Windows.
+# On Linux there is no universal install location (native package, snap, and
+# Docker all differ), so the default is empty — local process control stays
+# disabled until the user configures a real path (Task H item 5).
+_DEFAULT_PLEX_EXE = (
+    r"C:\Program Files\Plex\Plex Media Server\Plex Media Server.exe"
+    if sys.platform == "win32" else ""
+)
 PLEX_MEDIA_SERVER_PATH: str = os.getenv(
-    "PLEX_MEDIA_SERVER_PATH",
-    r"C:\Program Files\Plex\Plex Media Server\Plex Media Server.exe",
+    "PLEX_MEDIA_SERVER_PATH", _DEFAULT_PLEX_EXE,
 )
 PLEX_SERVER_URL: str = os.getenv("PLEX_SERVER_URL", "http://127.0.0.1:32400").strip()
 PLEX_TOKEN: str = os.getenv("PLEX_TOKEN", "").strip()
@@ -122,7 +135,8 @@ PLEX_REQUEST_TIMEOUT_SECONDS: int = int(
 PLEX_HISTORY_FETCH_LIMIT: int = int(os.getenv("PLEX_HISTORY_FETCH_LIMIT", "200"))
 APP_DB_PATH: str = os.getenv(
     "APP_DB_PATH",
-    os.getenv("REQUESTS_DB_PATH", str(APP_DIR / "plex_reset_button.db")),
+    os.getenv("REQUESTS_DB_PATH",
+              str(app_paths.PATHS.data_dir / "plex_reset_button.db")),
 )
 REQUESTS_DB_PATH: str = APP_DB_PATH
 def _parse_media_library_paths(raw: str) -> list[MediaLibraryPath]:
@@ -375,7 +389,7 @@ LIBRARY_CHECK_HOUR: int = int(os.getenv("LIBRARY_CHECK_HOUR", "3"))
 # admin clicks Apply Route). Keeping a fixed staging dir means a confused
 # route can never scatter files somewhere hard to find.
 TORRENT_DOWNLOAD_DIR: str = os.getenv(
-    "TORRENT_DOWNLOAD_DIR", str(APP_DIR / "downloads")
+    "TORRENT_DOWNLOAD_DIR", str(app_paths.PATHS.download_dir)
 )
 # Default states for the Downloads-tab checkboxes (persisted when toggled).
 TORRENT_AUTO_RENAME: bool = _env_bool("TORRENT_AUTO_RENAME", False)

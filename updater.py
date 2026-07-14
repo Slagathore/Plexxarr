@@ -90,9 +90,18 @@ def check_for_update(timeout: int = 15) -> UpdateInfo | None:
 
 
 def can_self_update(info: UpdateInfo) -> bool:
-    """Self-update only makes sense for the packaged EXE with a zip asset;
-    source checkouts update with git pull."""
-    return bool(getattr(sys, "frozen", False) and info.zip_url)
+    """Self-update only makes sense for the packaged Windows EXE with a zip
+    asset. Source checkouts update with git pull; the packaged Linux build
+    gets update CHECKS but replaces itself manually (Task H item 6 — no
+    ad-hoc root shell script standing in for the .bat flow)."""
+    return bool(sys.platform == "win32"
+                and getattr(sys, "frozen", False) and info.zip_url)
+
+
+def manual_update_hint() -> str:
+    """Honest instructions when self-update is unavailable, per platform."""
+    import platform_adapter
+    return platform_adapter.updater_capability().hint
 
 
 def stage_self_update(info: UpdateInfo, on_status=None) -> str:
@@ -107,6 +116,11 @@ def stage_self_update(info: UpdateInfo, on_status=None) -> str:
         if on_status:
             on_status(msg)
 
+    if sys.platform != "win32":
+        # The .bat swap flow is Windows-only by design; callers gate on
+        # can_self_update() so this is a belt-and-braces guard.
+        raise RuntimeError("Self-update is only available on Windows. "
+                           + manual_update_hint())
     assert info.zip_url, "no zip asset on the release"
     work = Path(tempfile.mkdtemp(prefix="plexxarr-update-"))
     zip_path = work / "update.zip"
@@ -163,6 +177,9 @@ def stage_self_update(info: UpdateInfo, on_status=None) -> str:
 
 def launch_staged_update(bat_path: str) -> None:
     """Start the swap script detached; the caller must exit the app now."""
+    if sys.platform != "win32":
+        raise RuntimeError("Self-update is only available on Windows. "
+                           + manual_update_hint())
     subprocess.Popen(
         ["cmd", "/c", bat_path],
         creationflags=subprocess.CREATE_NEW_CONSOLE,

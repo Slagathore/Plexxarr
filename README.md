@@ -111,6 +111,27 @@ python main.py     # first run opens the Setup Wizard
 
 Build your own EXE with `build_exe.bat` (needs `pip install -r requirements-build.txt`, which is just PyInstaller). Output lands in `dist\<timestamp>\Plexxarr\Plexxarr.exe`. Register autostart-at-login with `setup_autostart.bat`; remove it with `remove_autostart.bat`.
 
+### Linux
+
+Ubuntu LTS (x86_64, Python 3.11+) is the reference target; other distros should work but are unverified until exercised. Install the OS packages first, then the Python side:
+
+```bash
+sudo apt install python3-tk ffmpeg xdg-utils
+git clone https://github.com/Slagathore/Plexxarr.git
+cd Plexxarr
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp .env.example .env
+.venv/bin/python main.py     # first run opens the Setup Wizard
+```
+
+Node.js 20+ enables the built-in download engine, same as Windows (`npm install` inside `torrent_runner/`, or use the wizard button). A few things work differently on Linux by design:
+
+- Data follows the XDG directories instead of sitting beside the code: `.env` in `~/.config/plexxarr`, databases in `~/.local/share/plexxarr`, caches in `~/.cache/plexxarr`, downloads staging in `~/.local/share/plexxarr/downloads` unless you set `TORRENT_DOWNLOAD_DIR`. An existing install that kept files beside the code gets a one-time migration offer with a full dry run before anything moves.
+- The app never runs your package manager and never asks for root. The wizard's "Check Linux dependencies" button names anything missing and prints the commands for you to run.
+- The tray icon needs an X11/XWayland session (python-xlib installs with the requirements). Without one the window still works and says "tray unavailable"; closing the window minimizes instead of hiding.
+- Local Plex buttons (Launch, Hard Reset) only enable when a local Plex install or process is found, or `PLEX_MEDIA_SERVER_PATH` points at a real executable. A remote-only Plex still gets every API feature.
+- Self update is off. Update a source checkout with `git pull`; replace a packaged build with the new artifact from the release page (CI builds one per push: the `plexxarr-linux` artifact from the linux-smoke workflow).
+
 <details>
 <summary><b>Configuration (.env)</b></summary>
 

@@ -20,7 +20,6 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-import config
 import db
 import media_identity
 
@@ -127,10 +126,7 @@ class QueueRequest:
 # ---------------------------------------------------------------------------
 
 def _db_path() -> Path:
-    path = Path(config.APP_DB_PATH)
-    if path.is_absolute():
-        return path
-    return config.APP_DIR / path
+    return db.db_path()
 
 
 # ---------------------------------------------------------------------------

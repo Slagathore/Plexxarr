@@ -23,6 +23,23 @@ import logging
 import os
 import sys
 
+# --smoke-test (Task H item 9): a bounded, network-free, display-optional
+# startup/clean-shutdown proof used by CI (xvfb) and the packaged-artifact
+# smoke. The env redirection MUST happen before any app module import —
+# config resolves every path the moment it first loads.
+if "--smoke-test" in sys.argv:
+    import tempfile as _tempfile
+    _smoke_root = _tempfile.mkdtemp(prefix="plexxarr-smoke-")
+    for _key, _sub in (("PLEXXARR_CONFIG_DIR", "config"),
+                       ("PLEXXARR_DATA_DIR", "data"),
+                       ("PLEXXARR_CACHE_DIR", "cache"),
+                       ("PLEXXARR_RUNTIME_DIR", "runtime")):
+        os.environ[_key] = os.path.join(_smoke_root, _sub)
+    os.environ["APP_DB_PATH"] = os.path.join(_smoke_root, "data", "smoke.db")
+    os.environ["TORRENT_DOWNLOAD_DIR"] = os.path.join(_smoke_root, "downloads")
+    os.environ["TELEGRAM_BOT_TOKEN"] = ""   # never start the bot
+    os.environ["PLEXXARR_SKIP_ELEVATION"] = "1"
+
 from app_logging import configure_logging
 
 configure_logging()
@@ -97,10 +114,11 @@ def _ensure_admin() -> None:
 def _already_running() -> bool:
     """Single-instance guard: two Plexxarr instances mean two Telegram
     pollers (constant conflicts), two schedulers, and two download queues
-    fighting over the same staging folder. PID lock in the app dir."""
+    fighting over the same staging folder. PID lock lives in the RUNTIME dir
+    of the path contract (beside the exe on Windows, exactly as before)."""
     import os
-    import config
-    lock = config.APP_DIR / "plexxarr.pid"
+    import app_paths
+    lock = app_paths.PATHS.runtime_dir / "plexxarr.pid"
     try:
         if lock.is_file():
             old_pid = int(lock.read_text().strip() or 0)
@@ -122,13 +140,163 @@ def _already_running() -> bool:
     return False
 
 
+def _run_smoke_test() -> int:
+    """Bounded startup/clean-shutdown proof (Task H item 9).
+
+    Every writable path was redirected to a fresh temp tree at module import
+    (above), so this run touches no real database, no real .env, and no real
+    caches. No network: the Telegram bot never starts, no refresh timers run
+    (the Tk mainloop is never entered), and the update check is never
+    scheduled. A watchdog hard-exits non-zero if anything hangs.
+    """
+    import threading
+
+    def _abort() -> None:
+        print("SMOKE FAIL: timed out after 120s", flush=True)
+        os._exit(2)
+
+    watchdog = threading.Timer(120.0, _abort)
+    watchdog.daemon = True
+    watchdog.start()
+
+    failures: list[str] = []
+
+    def check(name: str, fn) -> None:
+        try:
+            fn()
+            print(f"SMOKE OK: {name}", flush=True)
+        except Exception as exc:
+            logger.exception("Smoke check failed: %s", name)
+            failures.append(f"{name}: {exc}")
+            print(f"SMOKE FAIL: {name}: {exc}", flush=True)
+
+    import app_paths
+
+    def paths_check() -> None:
+        for d in (app_paths.PATHS.config_dir, app_paths.PATHS.data_dir,
+                  app_paths.PATHS.cache_dir, app_paths.PATHS.runtime_dir):
+            if not d.is_dir():
+                raise RuntimeError(f"contract dir missing: {d}")
+        import config
+        expected_dir = os.environ["PLEXXARR_DATA_DIR"]
+        if os.path.dirname(config.APP_DB_PATH) != expected_dir:
+            raise RuntimeError(f"DB not in smoke dir: {config.APP_DB_PATH}")
+
+    check("path contract dirs exist under the smoke temp root", paths_check)
+
+    app_holder: dict = {}
+
+    def build_app() -> None:
+        from desktop_app import DesktopApp
+        app_holder["app"] = DesktopApp()
+
+    check("DesktopApp builds (Tk UI + DB init + tray adapter)", build_app)
+
+    app = app_holder.get("app")
+    if app is not None:
+        check("Tk renders one idle pass",
+              lambda: app.root.update_idletasks())
+
+        def clean_shutdown() -> None:
+            app._shutdown(bot_timeout=1.0)
+
+        check("clean shutdown", clean_shutdown)
+
+    def db_reopen() -> None:
+        import sqlite3
+        import config
+        conn = sqlite3.connect(config.APP_DB_PATH, timeout=15)
+        try:
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        finally:
+            conn.close()
+
+    check("smoke database reopens after shutdown", db_reopen)
+
+    watchdog.cancel()
+    if failures:
+        print(f"SMOKE RESULT: FAIL ({len(failures)} check(s) failed)",
+              flush=True)
+        return 1
+    print("SMOKE RESULT: PASS", flush=True)
+    return 0
+
+
+def _run_migration_offer(items, plan_text: str, confirm, notify) -> None:
+    import legacy_migration
+    if not confirm(plan_text):
+        return
+    summary = legacy_migration.execute_migration(items)
+    logger.info("Legacy migration summary: %s", summary)
+    notify(
+        "Migration finished",
+        f"Copied {summary['copied']}, skipped {summary['skipped']} "
+        f"(already done), failed {summary['failed']}."
+        + ("\n\nFailed items are named in the log. A database that is in "
+           "use fails safely — close whatever is using it and relaunch."
+           if summary["failed"] else ""))
+
+
+def _offer_legacy_migration(confirm=None, notify=None) -> None:
+    """Linux upgrade path (Task H item 2): offer the journalled legacy-path
+    migration BEFORE the desktop app constructs — DesktopApp.__init__ runs
+    initialize_*_db(), which creates a fresh schema-only database at the
+    XDG destination and would leave the real DB copy stuck behind the
+    anti-clobber guard on every launch. This call must stay ahead of the
+    desktop_app import in main().
+
+    `confirm(plan_text) -> bool` and `notify(title, text)` default to Tk
+    dialogs and are injectable for tests. Windows never migrates (the plan
+    is empty on win32 by definition)."""
+    if sys.platform == "win32":
+        return
+    try:
+        import legacy_migration
+        items = legacy_migration.plan_migration()
+        if not items:
+            return
+        plan_text = legacy_migration.format_plan(items)
+        if confirm is not None and notify is not None:
+            _run_migration_offer(items, plan_text, confirm, notify)
+            return
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+        except Exception:
+            logger.info(
+                "Legacy data detected but no dialog is available — run from "
+                "a desktop session to migrate. Plan:\n%s", plan_text)
+            return
+        try:
+            _run_migration_offer(
+                items, plan_text,
+                confirm or (lambda text: messagebox.askyesno(
+                    "Move data to the standard Linux locations?",
+                    text + "\n\nProceed? (Choosing No keeps everything "
+                    "where it is; you'll be asked again next launch.)")),
+                notify or messagebox.showinfo)
+        finally:
+            root.destroy()
+    except Exception:
+        logger.exception("Legacy path migration offer failed.")
+
+
 def main() -> None:
+    if "--smoke-test" in sys.argv:
+        # os._exit: daemon threads (tray/psutil scans) must not block CI.
+        os._exit(_run_smoke_test())
     _ensure_admin()
     if _already_running():
-        ctypes.windll.user32.MessageBoxW(
-            None, "Plexxarr is already running (check the system tray).",
-            "Plexxarr", 0x30)
+        import platform_adapter
+        platform_adapter.show_duplicate_instance_message(
+            "Plexxarr is already running (check the system tray).")
         return
+    # Ordering matters (Task H item 2): the migration offer must precede the
+    # desktop_app import below — DesktopApp.__init__ initializes databases
+    # at the XDG destination as a side effect of construction.
+    _offer_legacy_migration()
     try:
         from desktop_app import run_desktop_app
 

@@ -697,7 +697,8 @@ _anidb_index_loaded_at: float = 0.0
 
 def _refresh_anidb_cache() -> Path:
     """Download AniDB title dump if missing or older than 24 h."""
-    cache_path = Path(config.APP_DIR) / _ANIDB_CACHE_FILE
+    import app_paths
+    cache_path = app_paths.PATHS.cache_dir / _ANIDB_CACHE_FILE
     now = time.time()
 
     if cache_path.exists() and (now - cache_path.stat().st_mtime) < _ANIDB_CACHE_MAX_AGE_S:

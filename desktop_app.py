@@ -4,12 +4,12 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 import urllib.parse
 import webbrowser
-from importlib import import_module
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Any, cast
@@ -23,6 +23,7 @@ from metrics_report import format_combined_metrics_message
 from plex_auth import (PlexPinSession, PlexTokenResult, launch_auth_browser,
                        save_plex_credentials, start_plex_pin_login,
                        wait_for_plex_token)
+import plex_control
 from plex_control import get_status, hard_reset, is_plex_running, launch_plex
 from maintenance import (
     DuplicateGroup, JunkFile, LibraryInventory, MissingEpisode,
@@ -95,12 +96,13 @@ _DOT_GRAY = "#8b949e"
 # Muted helper-text color — depends on whether the dark theme is active.
 _MUTED_TEXT = "#9a9a9a" if sv_ttk is not None else "#444"
 
-Image = cast(Any, import_module("PIL.Image"))
-ImageDraw = cast(Any, import_module("PIL.ImageDraw"))
-pystray = cast(Any, import_module("pystray"))
-Icon = pystray.Icon
-Menu = pystray.Menu
-MenuItem = pystray.MenuItem
+# Tray stack (PIL + pystray) is lazy/optional now (Task H item 3): a missing
+# Linux backend leaves the main window usable with a visible "tray
+# unavailable" note instead of an ImportError at startup. Windows installs
+# always have both packages, so nothing changes there.
+import platform_adapter
+
+_TRAY = platform_adapter.tray_support()
 PillowImage = Any
 
 
@@ -384,8 +386,17 @@ class DesktopApp:
                     f"Could not start the Telegram bot service.\n\n{exc}",
                 )
 
-        self._tray_icon.run_detached()
+        if self._tray_icon is not None:
+            try:
+                self._tray_icon.run_detached()
+            except Exception:
+                logger.warning("Tray icon failed to start — window-only mode.",
+                               exc_info=True)
+                self._tray_icon = None
         self.root.after(0, self._initialize_runtime_state)
+        # Legacy-path migration (Task H item 2) is offered in main.py BEFORE
+        # this class constructs — __init__ initializes databases at the XDG
+        # destination, which would otherwise block the main DB's copy.
         import os as _os
         if _os.environ.get("PLEXXARR_SHOT_DIR"):
             self.root.after(12000, self._screenshot_tour)
@@ -484,6 +495,13 @@ class DesktopApp:
         # clears itself when the registry goes idle.
         ttk.Label(header, textvariable=self._maint_job_indicator_var,
                   foreground=_DOT_AMBER).grid(row=6, column=0, sticky="w", pady=(4, 0))
+        if not _TRAY.available:
+            # Task H item 3: a missing tray backend is a visible state, not
+            # a crash. Closing the window minimizes instead of hiding.
+            ttk.Label(header, foreground=_DOT_AMBER, wraplength=780,
+                      text=("Tray unavailable — the window minimizes instead "
+                            f"of hiding to the tray. ({_TRAY.reason})")
+                      ).grid(row=7, column=0, sticky="w", pady=(4, 0))
 
         # Ko-fi support link — sits above the action buttons.
         kofi_row = ttk.Frame(self.root, padding=(16, 0, 16, 4))
@@ -505,20 +523,32 @@ class DesktopApp:
         for index in range(4):
             actions.columnconfigure(index, weight=1)
 
-        for col, (text, style_name, command, tip) in enumerate((
+        # Task H item 5: local process controls only claim to work when a
+        # local Plex is actually reachable. On Windows this is always True
+        # (unchanged behavior); on Linux a remote-only config gets disabled
+        # buttons with the reason as the tooltip — not a "broken" server.
+        local_ok, local_reason = plex_control.local_control_available()
+        for col, (text, style_name, command, tip, needs_local) in enumerate((
             ("Launch Plex", "Accent.TButton",
              lambda: self.run_action("Launch Plex", launch_plex),
-             "Start Plex Media Server from its configured executable path."),
+             "Start Plex Media Server from its configured executable path.",
+             True),
             ("⚠ Hard Reset", "Danger.TButton", self.confirm_hard_reset,
-             "Force-kill every Plex process and relaunch. Interrupts anyone currently watching — asks for confirmation."),
+             "Force-kill every Plex process and relaunch. Interrupts anyone currently watching — asks for confirmation.",
+             True),
             ("Refresh Status", "", self.refresh_status,
-             "Re-check whether Plex is running and update the Status tab."),
+             "Re-check whether Plex is running and update the Status tab.",
+             False),
             ("Get Plex Token", "", self.authenticate_plex_account,
-             "Open the Plex PIN login in your browser and save the API token to .env automatically."),
+             "Open the Plex PIN login in your browser and save the API token to .env automatically.",
+             False),
         )):
             btn = (ttk.Button(actions, text=text, style=style_name, command=command)
                    if style_name else ttk.Button(actions, text=text, command=command))
             btn.grid(row=0, column=col, padx=4, sticky="ew")
+            if needs_local and not local_ok:
+                btn.state(["disabled"])
+                tip = f"Disabled: {local_reason}"
             add_tooltip(btn, tip)
 
         notebook = ttk.Notebook(self.root)
@@ -982,19 +1012,26 @@ class DesktopApp:
     # Tray icon
     # =====================================================================
 
-    def _build_tray_icon(self) -> Icon:
+    def _build_tray_icon(self) -> Any | None:
+        """The pystray icon, or None when no tray backend is usable — in
+        which case the window stays the app (closing minimizes instead of
+        hiding, and a visible note explains why)."""
+        if not _TRAY.available:
+            return None
+        pystray = cast(Any, _TRAY.pystray)
         image = self._create_tray_image()
-        menu = Menu(
+        menu = pystray.Menu(
             # default=True: double-clicking the tray icon reopens the window.
-            MenuItem("Show Admin", lambda icon, item: self.show_window(),
-                     default=True),
-            MenuItem("Launch Plex", lambda icon, item: self.run_action("Launch Plex", launch_plex)),
-            MenuItem("Hard Reset", lambda icon, item: self.confirm_hard_reset(from_tray=True)),
-            MenuItem("Refresh Status", lambda icon, item: self.refresh_status()),
-            MenuItem("Get Plex Token", lambda icon, item: self.authenticate_plex_account()),
-            MenuItem("Quit", lambda icon, item: self.request_exit()),
+            pystray.MenuItem("Show Admin", lambda icon, item: self.show_window(),
+                             default=True),
+            pystray.MenuItem("Launch Plex", lambda icon, item: self.run_action("Launch Plex", launch_plex)),
+            pystray.MenuItem("Hard Reset", lambda icon, item: self.confirm_hard_reset(from_tray=True)),
+            pystray.MenuItem("Refresh Status", lambda icon, item: self.refresh_status()),
+            pystray.MenuItem("Get Plex Token", lambda icon, item: self.authenticate_plex_account()),
+            pystray.MenuItem("Quit", lambda icon, item: self.request_exit()),
         )
-        return Icon("Plexxarr", image, f"Plexxarr v{config.APP_VERSION}", menu)
+        return pystray.Icon("Plexxarr", image,
+                            f"Plexxarr v{config.APP_VERSION}", menu)
 
     def _create_tray_image(self) -> PillowImage:
         from app_icon import icon_image
@@ -1013,6 +1050,10 @@ class DesktopApp:
         self.root.focus_force()
 
     def hide_window(self) -> None:
+        if self._tray_icon is None:
+            # No tray to come back from — minimize instead of vanishing.
+            self.root.iconify()
+            return
         self.root.withdraw()
 
     def _post_to_ui(self, callback, *, delay_ms: int = 0) -> bool:
@@ -1852,7 +1893,8 @@ class DesktopApp:
     _LIB_LOWQUAL_CACHE_LEGACY = "library_lowqual.pkl"
 
     def _lib_lowqual_cache_path(self) -> Path:
-        return Path(config.APP_DIR) / self._LIB_LOWQUAL_CACHE_FILE
+        import app_paths
+        return app_paths.PATHS.cache_dir / self._LIB_LOWQUAL_CACHE_FILE
 
     def _lib_lowqual_save_cache(self, results: list[Any], scanned: int) -> None:
         json_cache.save_json_cache(
@@ -1860,7 +1902,8 @@ class DesktopApp:
             {"results": results, "scanned": scanned,
              "at": datetime.datetime.now().strftime("%b %d %H:%M")},
             version=self._LIB_LOWQUAL_CACHE_VERSION,
-            legacy_paths=[Path(config.APP_DIR) / self._LIB_LOWQUAL_CACHE_LEGACY])
+            legacy_paths=[self._lib_lowqual_cache_path().parent
+                          / self._LIB_LOWQUAL_CACHE_LEGACY])
 
     def _lib_lowqual_load_cache(self) -> dict[str, Any] | None:
         from video_quality import LowQualityMovie
@@ -2483,7 +2526,10 @@ class DesktopApp:
     def open_staging_folder(self) -> None:
         staging = Path(config.TORRENT_DOWNLOAD_DIR)
         staging.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(staging))  # noqa: S606 — local folder open on Windows
+        # os.startfile on Windows, xdg-open on Linux — adapter decides.
+        if not platform_adapter.open_path(staging):
+            self._dl_status_var.set(
+                f"Couldn't open a file manager — staging folder: {staging}")
 
     def open_downloads_search(
         self, query: str, media_type: str,
@@ -2823,10 +2869,13 @@ class DesktopApp:
         """
         if config.PLEX_LIBRARY_PATHS:
             return True
+        example = (r"PLEX_LIBRARY_PATHS=D:\Movies;D:\TV;E:\Anime"
+                   if sys.platform == "win32" else
+                   "PLEX_LIBRARY_PATHS=/mnt/media/Movies;/mnt/media/TV")
         msg = (
             f"{tool_label} needs PLEX_LIBRARY_PATHS to be set in your .env file.\n\n"
             "Add a semicolon-separated list of folders, e.g.:\n"
-            r"PLEX_LIBRARY_PATHS=D:\Movies;D:\TV;E:\Anime"
+            + example
         )
         self._maint_status_var.set(f"{tool_label}: PLEX_LIBRARY_PATHS not configured")
         self._show_warning(tool_label, msg)
@@ -2954,7 +3003,8 @@ class DesktopApp:
     )
 
     def _maint_cache_path(self) -> Path:
-        return Path(config.APP_DIR) / self._MAINT_CACHE_FILE
+        import app_paths
+        return app_paths.PATHS.cache_dir / self._MAINT_CACHE_FILE
 
     def _maint_save_cache(self) -> None:
         """Persist tool results to disk so a 30k-file walk survives an app
@@ -2964,7 +3014,8 @@ class DesktopApp:
         json_cache.save_json_cache(
             self._maint_cache_path(), self._maint_cache,
             version=self._MAINT_CACHE_VERSION,
-            legacy_paths=[Path(config.APP_DIR) / self._MAINT_CACHE_LEGACY])
+            legacy_paths=[self._maint_cache_path().parent
+                          / self._MAINT_CACHE_LEGACY])
 
     def _maint_load_cache(self) -> None:
         cache = json_cache.load_json_cache(
@@ -3384,7 +3435,8 @@ class DesktopApp:
         if focused:
             return
         try:
-            self._tray_icon.notify(message, title)
+            if self._tray_icon is not None:
+                self._tray_icon.notify(message, title)
         except Exception:
             logger.debug("Tray notification failed.", exc_info=True)
 
@@ -3529,6 +3581,13 @@ class DesktopApp:
             text="Install update" if can_self else "Open release page",
             command=self._install_update if can_self else (
                 lambda: webbrowser.open_new_tab(info.html_url)))
+        if not can_self:
+            # Task H item 6: honest per-platform instructions when in-place
+            # self-update is unavailable (Linux source: git pull; packaged
+            # Linux: download the new artifact; Windows source: git pull).
+            hint = platform_adapter.updater_capability().hint
+            if hint:
+                add_tooltip(self._update_install_btn, hint)
         self._update_banner.grid()
         if info.urgent and not self._urgent_popup_shown:
             self._urgent_popup_shown = True
@@ -5530,9 +5589,19 @@ class DesktopApp:
         ).grid(row=2, column=0, sticky="w")
         btn_row = ttk.Frame(step3)
         btn_row.grid(row=3, column=0, sticky="w", pady=(6, 0))
-        ttk.Button(btn_row, text="Install checked (via winget)",
-                   command=lambda: self._wizard_install(node_var.get(), ollama_var.get(), status_var)
-                   ).pack(side=tk.LEFT, padx=(0, 8))
+        if platform_adapter.supports_winget():
+            ttk.Button(btn_row, text="Install checked (via winget)",
+                       command=lambda: self._wizard_install(node_var.get(), ollama_var.get(), status_var)
+                       ).pack(side=tk.LEFT, padx=(0, 8))
+        else:
+            # Task H item 4: Linux never auto-runs a package manager and
+            # never asks for root — diagnostics name what's missing and
+            # show the commands, the user runs them.
+            ttk.Button(btn_row, text="Check Linux dependencies",
+                       command=lambda: self._show_info(
+                           "Linux dependencies",
+                           platform_adapter.dependency_install_guidance())
+                       ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_row, text="npm install torrent runner",
                    command=lambda: self._wizard_npm_install(status_var)).pack(side=tk.LEFT)
 
@@ -5606,6 +5675,10 @@ class DesktopApp:
         threading.Thread(target=worker, name="wizard-token", daemon=True).start()
 
     def _wizard_install(self, node: bool, ollama: bool, status_var: tk.StringVar) -> None:
+        if not platform_adapter.supports_winget():
+            status_var.set("winget is Windows-only — use 'Check Linux "
+                           "dependencies' for the install commands.")
+            return
         if not node and not ollama:
             status_var.set("Nothing checked to install.")
             return
@@ -5641,7 +5714,23 @@ class DesktopApp:
         threading.Thread(target=worker, name="wizard-install", daemon=True).start()
 
     def _wizard_npm_install(self, status_var: tk.StringVar) -> None:
-        runner_dir = Path(config.APP_DIR) / "torrent_runner"
+        import download_manager as _dm
+        runner_dir = _dm.runner_install_dir()
+        if not runner_dir.is_dir():
+            # Packaged Linux: seed the writable runner dir from the bundled
+            # read-only copy so npm install has something to install into.
+            bundled = Path(config.BUNDLE_DIR) / "torrent_runner"
+            if bundled.is_dir():
+                try:
+                    runner_dir.mkdir(parents=True, exist_ok=True)
+                    for name in ("download.mjs", "package.json",
+                                 "package-lock.json", "diag.mjs"):
+                        src = bundled / name
+                        if src.is_file():
+                            shutil.copy2(src, runner_dir / name)
+                except OSError as exc:
+                    status_var.set(f"Couldn't seed {runner_dir}: {exc}")
+                    return
         if not runner_dir.is_dir():
             status_var.set(f"torrent_runner folder not found at {runner_dir}")
             return
@@ -5765,7 +5854,8 @@ class DesktopApp:
         except Exception:
             logger.exception("Failed to stop download runners cleanly.")
         try:
-            self._tray_icon.stop()
+            if self._tray_icon is not None:
+                self._tray_icon.stop()
         except Exception:
             logger.exception("Failed to stop tray icon cleanly.")
         try:

@@ -170,8 +170,8 @@ class WatchlistTab:
     _RECS_CACHE_VERSION = 1
 
     def _recs_cache_path(self):
-        from pathlib import Path
-        return Path(config.APP_DIR) / "watchlist_recs.json"
+        import app_paths
+        return app_paths.PATHS.cache_dir / "watchlist_recs.json"
 
     def _load_persisted_recs(self) -> None:
         """Last fetch survives restarts — the tab is never empty if recs
@@ -200,14 +200,13 @@ class WatchlistTab:
 
     def _persist_recs(self) -> None:
         import datetime
-        from pathlib import Path
         import json_cache
         json_cache.save_json_cache(
             self._recs_cache_path(),
             {"recs": self._recs_all, "genres": self._top_genres,
              "at": datetime.datetime.now().strftime("%b %d %H:%M")},
             version=self._RECS_CACHE_VERSION,
-            legacy_paths=[Path(config.APP_DIR) / "watchlist_recs.pkl"])
+            legacy_paths=[self._recs_cache_path().with_suffix(".pkl")])
 
     def _load_accounts(self) -> None:
         def worker() -> None:
