@@ -99,6 +99,21 @@ MenuItem = pystray.MenuItem
 PillowImage = Any
 
 
+def _local_ts(ts: str) -> str:
+    """Render a stored timestamp in the machine's local timezone.
+
+    Stored timestamps (SQLite CURRENT_TIMESTAMP and the explicit
+    datetime.now(timezone.utc) writes) are UTC; naive values are assumed UTC.
+    """
+    try:
+        dt = datetime.datetime.fromisoformat(ts.replace("T", " ").strip())
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return ts
+
+
 class DesktopApp:
     def __init__(self) -> None:
         self.bot_service = TelegramBotService()
@@ -977,7 +992,7 @@ class DesktopApp:
                 "", "end", iid=row_id,
                 values=(
                     request.request_id, type_label, request.requester,
-                    request.created_at.replace("T", " "), display_title, in_library,
+                    _local_ts(request.created_at), display_title, in_library,
                 ),
             )
 
@@ -1005,7 +1020,7 @@ class DesktopApp:
 
         type_label = self._TYPE_LABEL.get(req.media_type, "?")
         lines = [
-            f"Request #{req.request_id}  |  {type_label} ({req.media_type})  |  {req.created_at}",
+            f"Request #{req.request_id}  |  {type_label} ({req.media_type})  |  {_local_ts(req.created_at)}",
             f"Status    : {req.status}",
             f"Requester : {req.requester}",
             f"Raw input : {req.content}",

@@ -1010,8 +1010,11 @@ def get_anime_airing(title: str, *, explicit: bool = False) -> tuple["EpisodeInf
     airing_at, episode = nxt.get("airingAt"), nxt.get("episode")
     if not airing_at or not episode:
         return None, status
-    from datetime import datetime, timezone
-    air_date = datetime.fromtimestamp(int(airing_at), tz=timezone.utc).date().isoformat()
+    from datetime import datetime
+    # Local calendar date, not UTC: every "has it aired" comparison in the app
+    # uses date.today() (local), and the UTC date can land a day later than the
+    # user's calendar for evening airings.
+    air_date = datetime.fromtimestamp(int(airing_at)).date().isoformat()
     return EpisodeInfo(season=1, episode=int(episode), title="", air_date=air_date), status
 
 
