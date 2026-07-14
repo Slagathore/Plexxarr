@@ -40,6 +40,7 @@ import show_tracker
 import shows_store
 import torrent_routing
 import torrent_select
+import verification
 from media_identity import MediaIdentity
 from queue_store import get_request, list_requests
 from torrent_search import TorrentResult, search_collect, search_torrents
@@ -228,6 +229,18 @@ def _auto_grab_query(req, *, season: int | None = None) -> str:
         if year:
             return f"{alias} {year}"
     return alias
+
+
+class _AdoptResult:
+    """Minimal TorrentResult stand-in for re-freezing a want from an existing
+    download row during quarantine adoption (Task C item 8)."""
+    def __init__(self, row) -> None:
+        self.title = row.title
+        self.media_type = row.media_type
+        self.magnet = row.magnet
+        self.source = row.source
+        self.size_bytes = 0
+        self.seeders = 0
 
 
 def _build_want_snapshot(
@@ -565,6 +578,12 @@ class DownloadManager:
             shows_store.set_episode_grab(
                 episode_context[0], episode_context[1], episode_context[2], download_id,
             )
+        # Provenance junction from the moment of grab (Task C item 3/4) so a
+        # season request's several episode downloads all trace back to it.
+        if request_id is not None:
+            role = ("episode" if episode is not None
+                    else "season_pack" if season is not None else "movie")
+            downloads_store.link_request_download(request_id, download_id, role)
 
         if config.QBITTORRENT_ENABLED:
             # qBittorrent has its own queue/active limits — hand over directly.
@@ -932,10 +951,15 @@ class DownloadManager:
             except Exception as exc:
                 logger.exception("Staged-file delete failed for #%s", download_id)
                 return f"removed row, but file delete failed: {exc}"
-        downloads_store.delete_download(download_id)
+        # Archive (tombstone) instead of hard-delete: the row + its
+        # download_files / request_downloads provenance survive, and the UI
+        # hides archived rows by default (Task C item 3).
+        downloads_store.tombstone_download(
+            download_id,
+            reason=("removed:files_recycled" if removed_files else "removed"))
         self._notify(download_id)
         note = f" + {removed_files} staged file(s) recycled" if removed_files else ""
-        return f"removed{note}"
+        return f"removed (archived — provenance kept){note}"
 
     def apply_route(self, download_id: int) -> str:
         """Manually rename+move a completed download per its (re-computed)
@@ -1078,16 +1102,291 @@ class DownloadManager:
         return {h for h, t in fails.items() if t >= cutoff}
 
     def _blocklist_for(self, want: SelectWant):
-        """Subject-scoped blocklist input for the selector.
+        """Subject-scoped blocklist input for the selector (Task C item 2).
 
-        Phase 3 defines the CALL so Phase 4 only has to swap the lookup body:
-        it will read downloads_store for permanent, subject-scoped blocklist
-        entries keyed on want.identity.subject_key and return them (or a
-        reason-aware callable). Until Task C lands that table there are no
-        automatic entries, so this returns None and the engine's blocklist gate
-        is a no-op. note: deferred - Phase 4 wires the real blocklist read here.
+        Reads the permanent, subject-scoped blocklist entries keyed on
+        want.identity.subject_key (plus any global_bad_release rows) and returns
+        them as torrent_select.BlocklistEntry objects. The engine's gate matches
+        on infohash OR (normalized title, size within 2%, group) and drops
+        non-blocking reasons itself, so a race_loser / transient row can never
+        block. Returns None when there is nothing to block (gate is a no-op).
         """
+        subject_key = want.identity.subject_key
+        rows = downloads_store.blocklist_entries_for_subject(subject_key)
+        if not rows:
+            return None
+        return [
+            torrent_select.BlocklistEntry(
+                reason_code=r.reason_code, infohash=r.infohash,
+                parsed_title=r.parsed_title, size_bytes=r.size_bytes,
+                release_group=r.release_group)
+            for r in rows
+        ]
+
+    @staticmethod
+    def _subject_type_for(identity: MediaIdentity) -> str:
+        """Blocklist subject_type for a want identity."""
+        if identity.media_type != "movie" and identity.season is not None:
+            return "show_episode" if identity.episode is not None else "show_season"
+        return "request_identity"
+
+    @staticmethod
+    def _identity_for_download(row: downloads_store.DownloadRow) -> MediaIdentity:
+        """The MediaIdentity a download was meant to satisfy: the frozen
+        want_json first, then the linked request row, finally the bare title."""
+        want_dict = downloads_store.get_want(row.download_id)
+        if want_dict:
+            return verification.identity_from_want(want_dict)
+        if row.request_id is not None:
+            req = get_request(row.request_id)
+            if req is not None:
+                return MediaIdentity(
+                    media_type=req.media_type,
+                    identity_source=getattr(req, "identity_source", None),
+                    external_id=(str(req.external_id)
+                                 if req.external_id is not None else None),
+                    canonical_title=req.resolved_title or row.title,
+                    canonical_year=getattr(req, "canonical_year", None),
+                    origin_countries=tuple(getattr(req, "origin_countries", []) or ()),
+                    season=getattr(req, "season", None))
+        return MediaIdentity(media_type=row.media_type, canonical_title=row.title)
+
+    @staticmethod
+    def _identity_blocklist_key(identity: MediaIdentity,
+                                row: downloads_store.DownloadRow) -> str | None:
+        """The subject_key a wrong/failed grab is blocked under. Prefers the
+        qualified identity key; falls back to a request-scoped key so an
+        unqualified want still stops the exact re-grab."""
+        return identity.subject_key or (
+            f"req:{row.request_id}" if row.request_id is not None else None)
+
+    def _quarantine_payload(self, row: downloads_store.DownloadRow,
+                            want_identity: MediaIdentity, reason_code: str,
+                            detail: str, *, offending=None,
+                            block_reason: str | None = None,
+                            created_by: str = "auto-verify") -> str:
+        """Verify-before-move FAILED: no move, quarantine in staging, record a
+        subject-scoped blocklist entry, reopen the request so the next pass
+        picks differently (Task C item 1). Files are KEPT (quarantine is
+        reversible / adoptable); the row is archived + flagged, not deleted."""
+        did = row.download_id
+        downloads_store.set_verification(did, "quarantined",
+                                         reason=f"{reason_code}: {detail}")
+        downloads_store.add_history(
+            did, "quarantined", before=None,
+            after=f"verify failed ({reason_code}) — kept in staging: {detail}")
+
+        subject_key = self._identity_blocklist_key(want_identity, row)
+        offending_size = None
+        parsed_title = row.title
+        if offending is not None:
+            if getattr(offending, "parsed", None) is not None:
+                parsed_title = offending.parsed.parsed_title
+            try:
+                offending_size = offending.path.stat().st_size
+            except OSError:
+                offending_size = None
+        if subject_key:
+            downloads_store.add_blocklist_entry(
+                subject_type=self._subject_type_for(want_identity),
+                subject_key=subject_key,
+                reason_code=block_reason or downloads_store.BLOCK_REASON_IDENTITY_MISMATCH,
+                infohash=_magnet_hash(row.magnet) or None,
+                parsed_title=parsed_title, size_bytes=offending_size,
+                reason_detail=f"{reason_code}: {detail}", created_by=created_by)
+
+        # Archive the row so request_ids_with_downloads ignores it (the request
+        # becomes re-grabbable) while the row + provenance survive for evidence
+        # and possible later adoption by a compatible request (item 8).
+        downloads_store.tombstone_download(did, reason=f"quarantine:{reason_code}")
+        if row.request_id is not None:
+            queue_store.set_status(row.request_id, queue_store.STATUS_OPEN)
+        self._notify(did)
+        return (f"quarantined (verify failed: {reason_code}) — blocked for "
+                f"{subject_key}, request reopened")
+
+    def mark_wrong_grab(self, download_id: int, *, recycle: bool = False,
+                        widen_global: bool = False,
+                        created_by: str = "user") -> str:
+        """User action (Task C item 7): the grab was the wrong pick. Block it
+        subject-scoped (user_wrong_pick), reopen the request, and QUARANTINE by
+        default (RESOLVED DECISION 2). `recycle=True` (the "Recycle now" button)
+        also send2trashes the staged bytes; `widen_global=True` escalates the
+        block to global_bad_release. Logic lives here, below the Tk glue."""
+        row = downloads_store.get_download(download_id)
+        if row is None:
+            return "download not found"
+        want_identity = self._identity_for_download(row)
+        if row.status in ("queued", "downloading"):
+            self.cancel(download_id)
+
+        subject_key = self._identity_blocklist_key(want_identity, row)
+        subject_type = self._subject_type_for(want_identity)
+        reason = downloads_store.BLOCK_REASON_USER_WRONG_PICK
+        if widen_global:
+            subject_key = downloads_store.SUBJECT_GLOBAL
+            subject_type = "global_bad_release"
+            reason = downloads_store.BLOCK_REASON_GLOBAL_BAD_RELEASE
+        if subject_key:
+            downloads_store.add_blocklist_entry(
+                subject_type=subject_type, subject_key=subject_key,
+                reason_code=reason, infohash=_magnet_hash(row.magnet) or None,
+                parsed_title=row.title, reason_detail="user marked wrong pick",
+                created_by=created_by)
+
+        recycled = 0
+        if recycle:
+            try:
+                from send2trash import send2trash
+                for f in self._media_files_in_staging(row):
+                    send2trash(str(f))
+                    recycled += 1
+            except Exception:
+                logger.exception("Wrong-grab recycle failed for #%s", download_id)
+            downloads_store.set_verification(download_id, "failed",
+                                             reason="user_wrong_pick (recycled)")
+            downloads_store.tombstone_download(
+                download_id, reason="user_wrong_pick:recycled")
+        else:
+            downloads_store.set_verification(download_id, "quarantined",
+                                             reason="user_wrong_pick")
+            downloads_store.tombstone_download(
+                download_id, reason="quarantine:user_wrong_pick")
+
+        if row.request_id is not None:
+            queue_store.set_status(row.request_id, queue_store.STATUS_OPEN)
+        self._notify(download_id)
+        note = f" + {recycled} staged file(s) recycled" if recycled else " (quarantined)"
+        scope = "globally" if widen_global else f"for {subject_key}"
+        return f"marked wrong pick — blocked {scope}, request reopened{note}"
+
+    def find_adoptable_quarantine(self, want: SelectWant):
+        """Task C item 8: before starting a NEW search, look for a compatible
+        quarantined payload. A `Tremors.II...` blocked for Tremors 1 is still a
+        valid Tremors 2 payload — if its staged files pass fresh identity
+        verification for THIS want, it can be adopted without a second download.
+        Returns (DownloadRow, VerificationResult) or None. Recycled quarantines
+        (no bytes) are naturally skipped (no media files on disk)."""
+        for row in downloads_store.list_quarantined_downloads():
+            files = self._media_files_in_staging(row)
+            if not files:
+                continue
+            result = verification.verify_staging(
+                files, want.identity,
+                video_exts=torrent_routing.VIDEO_EXTENSIONS,
+                subtitle_exts=torrent_routing.SUBTITLE_EXTENSIONS)
+            if result.ok:
+                return row, result
         return None
+
+    def adopt_quarantine(self, download_id: int, request_id: int) -> str:
+        """Adopt a quarantined payload for a NEW request after FRESH
+        verification (Task C item 8). The staged bytes are re-verified against
+        the new request's identity, the tombstone is cleared, the payload is
+        re-purposed (want re-frozen to the new request, selection_mode
+        reused_quarantine recorded) and moved. The subject-scoped block on the
+        ORIGINAL identity is untouched — that release stays wrong for the old
+        request. Confirmation is the caller's (UI) responsibility."""
+        row = downloads_store.get_download(download_id)
+        new_req = get_request(request_id)
+        if row is None or new_req is None:
+            return "adopt failed: row or request missing"
+
+        want = _build_want_snapshot(
+            _AdoptResult(row), new_req,
+            request_title=_row_search_alias(new_req),
+            show_id=None, season=getattr(new_req, "season", None),
+            episode=None, minutes=None)
+        files = self._media_files_in_staging(row)
+        result = verification.verify_staging(
+            files, verification.identity_from_want(want),
+            video_exts=torrent_routing.VIDEO_EXTENSIONS,
+            subtitle_exts=torrent_routing.SUBTITLE_EXTENSIONS)
+        if not result.ok:
+            return f"cannot adopt: fails verification ({result.reason_code})"
+
+        downloads_store.restore_download(download_id)
+        downloads_store.set_want(download_id, want)
+        downloads_store.set_request_id(download_id, request_id)
+        downloads_store.set_status(download_id, "downloaded")
+        # Record the adoption as its own selection decision (mode reused_quarantine).
+        from torrent_select import SelectionDecision
+        import datetime as _dt
+        decision = SelectionDecision(
+            chosen_infohash=_magnet_hash(row.magnet) or None,
+            chosen_title=row.title, mode=torrent_select.MODE_REUSED_QUARANTINE,
+            profile=torrent_select.PROFILE,
+            rtn_version=torrent_select.rtn_version(),
+            verdicts=(), scores=(),
+            pool_stats={"adopted_from_download": download_id},
+            created_at=_dt.datetime.now(_dt.timezone.utc).isoformat())
+        run_id = downloads_store.record_selection_run(
+            decision, request_id=request_id, download_id=download_id)
+        downloads_store.link_download_to_run(download_id, run_id)
+        downloads_store.add_history(
+            download_id, "adopted", before=None,
+            after=f"adopted from quarantine for request #{request_id} "
+                  f"(reused_quarantine)")
+        outcome = self._post_process(
+            download_id, force_move=True, force_rename=True,
+            request_title=_row_search_alias(new_req))
+        return f"adopted: {outcome}"
+
+    def _on_download_placed(self, row: downloads_store.DownloadRow,
+                            moved_final_paths: list[str]) -> None:
+        """A download's verified files are in place. Link provenance and let the
+        AGGREGATE decide whether the REQUEST is fulfilled (item 4)."""
+        if row.request_id is None:
+            return
+        if row.season is not None and row.episode is None:
+            role = "season_pack"
+        elif row.episode is not None:
+            role = "episode"
+        else:
+            role = "movie"
+        downloads_store.link_request_download(row.request_id, row.download_id, role)
+        queue_store.set_status(row.request_id, queue_store.STATUS_PLACED)
+        self._finalize_fulfillment(row.request_id)
+
+    def _finalize_fulfillment(self, request_id: int) -> None:
+        """AGGREGATE fulfillment (Task C item 4): moved_any is dead. A movie /
+        one-off completes on a single placed file; a season request completes
+        ONLY when its expected episode set is present (or a verified pack
+        supplied it). A first episode updates progress, never the season."""
+        req = get_request(request_id)
+        if req is None:
+            return
+        if req.media_type in ("movie", "other", "unknown"):
+            queue_store.complete_request(request_id)
+            return
+
+        from datetime import date
+        today = date.today().isoformat()
+        show = self._match_tracked_show(_row_search_alias(req))
+        want_season = req.season
+        if show is not None and want_season is not None:
+            eps = [e for e in shows_store.list_episodes(show.show_id)
+                   if e.season == want_season and e.air_date
+                   and e.air_date <= today]
+            have = [e for e in eps if e.has_file]
+            if eps and len(have) >= len(eps):
+                queue_store.complete_request(request_id)
+            # else: partial — request stays PLACED (visible progress), not done.
+            return
+        # No tracked-show set to measure against: a verified pack (>= 2 distinct
+        # episodes placed) fulfils; a lone episode never does.
+        if self._request_covers_multiple_episodes(request_id):
+            queue_store.complete_request(request_id)
+
+    @staticmethod
+    def _request_covers_multiple_episodes(request_id: int) -> bool:
+        episodes: set[int] = set()
+        for dl in downloads_store.downloads_for_request(request_id):
+            for f in downloads_store.list_download_files(dl.download_id):
+                if (f.verification_state in ("verified", "duplicate")
+                        and f.parsed_episode is not None):
+                    episodes.add(int(f.parsed_episode))
+        return len(episodes) >= 2
 
     def _run_selection(self, results, want: SelectWant, *,
                        failure_key: str | None = None,
@@ -1360,12 +1659,18 @@ class DownloadManager:
         survivors = [by_hash[s.infohash] for s in decision.scores
                      if s.infohash in by_hash]
         if chosen.seeders <= 0:
-            # The engine's best pick has no seeders: hand the gated survivors to
-            # the zero-seeder race (its own selection run + mode).
-            return self.start_zero_seeder_race(
-                survivors, show.media_type, minutes=minutes,
-                request_id=request_id,
-                episode_context=(show.show_id, ep.season, ep.episode))
+            # The engine's TOP pick has no seeders. A guaranteed copy beats a
+            # gamble: if ANY gated survivor has seeders, grab the best-scored
+            # seeded one normally and skip the race entirely (Phase 3 verifier
+            # note). Only when EVERY survivor is 0-seed do we race.
+            seeded = next((r for r in survivors if r.seeders > 0), None)
+            if seeded is not None:
+                chosen = seeded
+            else:
+                return self.start_zero_seeder_race(
+                    survivors, show.media_type, minutes=minutes,
+                    request_id=request_id,
+                    episode_context=(show.show_id, ep.season, ep.episode))
         if not self._oversize_gate(survivors, show.media_type, key, minutes=minutes):
             downloads_store.record_selection_run(decision, request_id=request_id)
             return []
@@ -1444,6 +1749,12 @@ class DownloadManager:
             chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
             if chosen is None:
                 downloads_store.record_selection_run(decision, request_id=req.request_id)
+                # Task C item 9: if a viable release existed but was BLOCKED
+                # (subject-scoped), defer a day with a reason + next-attempt
+                # (persisted for Task E) rather than hammering every 5 minutes.
+                if any(v.reason_code == "blocklisted" for v in decision.verdicts):
+                    downloads_store.check_grab_deferral(
+                        key, reason="last viable candidate blocked")
                 logger.info("Request #%s (%s): no acceptable result this pass — "
                             "will retry on the next auto-grab cycle.",
                             req.request_id, query)
@@ -1451,13 +1762,17 @@ class DownloadManager:
             survivors = [by_hash[s.infohash] for s in decision.scores
                          if s.infohash in by_hash]
             if chosen.seeders <= 0:
-                # Nothing survivable has seeders — race the gated survivors
-                # (their own selection run + zero-seeder-race mode).
-                started.extend(self.start_zero_seeder_race(
-                    survivors, media_type, minutes=minutes,
-                    request_id=req.request_id, request_title=query,
-                ))
-                continue
+                # Prefer a seeded survivor over a 0-seed gamble; race only when
+                # every survivor is 0-seed (Phase 3 verifier note).
+                seeded = next((r for r in survivors if r.seeders > 0), None)
+                if seeded is not None:
+                    chosen = seeded
+                else:
+                    started.extend(self.start_zero_seeder_race(
+                        survivors, media_type, minutes=minutes,
+                        request_id=req.request_id, request_title=query,
+                    ))
+                    continue
             if not self._oversize_gate(survivors, media_type, key, minutes=minutes):
                 downloads_store.record_selection_run(decision, request_id=req.request_id)
                 continue
@@ -1555,21 +1870,20 @@ class DownloadManager:
         episode_context: tuple[int, int, int] | None = None,
         minutes: float | None = None,
     ) -> list[int]:
-        """All results report 0 seeders: grab up to 5 and monitor for an hour.
+        """Every candidate reports 0 seeders (callers only reach here once no
+        seeded survivor exists — a guaranteed copy always wins over a gamble).
+        Grab up to 5 and race them.
 
-        Race candidates pass gates 1-8 exactly like a normal pick — the
-        selection runs through the engine in zero-seeder-race mode, so a wrong
-        release (sequel, CAM, country mismatch) can never enter the race. The
-        race REDESIGN (auto-move disable, winner verification, race_loser
-        semantics) is Phase 4; here only candidate SELECTION goes through the
-        engine and the decision is persisted.
-
-        Rules (per Cole): if one finishes, cancel the rest. At the hour mark,
-        keep the single most-progressed download (if any moved at all) and
-        cancel the others; if nothing progressed, cancel them all.
+        Redesign (Task C item 6):
+        - candidates pass gates 1-8 through the engine exactly like a normal
+          pick (zero-seeder-race mode), so a wrong release never enters;
+        - ALL race candidates grab with auto-move DISABLED regardless of
+          settings — nothing lands in a library root without a verified winner;
+        - they SHARE one selection_run_id (persisted here, linked to each row);
+        - the monitor verifies the first-finished candidate BEFORE any move; a
+          failed-verify candidate is blocked for the identity and the race
+          continues; losers cancel as race_loser and are NEVER blocklisted.
         """
-        # Rebuild the want from the originating context so the gates judge the
-        # race pool against the same identity a normal pick would.
         if episode_context is not None:
             show = shows_store.get_show(episode_context[0])
             if show is not None:
@@ -1592,9 +1906,8 @@ class DownloadManager:
 
         decision, by_hash = self._run_selection(
             list(results), want, failure_key=key)
-        # Persist the race decision (Phase 4 links every race download to this
-        # shared selection_run_id and adds winner verification). note: deferred
-        # - Phase 4 shares one selection_run_id across all race downloads.
+        # ONE shared selection_run_id across every race download (item 6.2); the
+        # pre-race decision is persisted on handoff (Phase 3 verifier note).
         run_id = downloads_store.record_selection_run(decision, request_id=request_id)
         picks = [by_hash[s.infohash] for s in decision.scores
                  if s.infohash in by_hash][:5]
@@ -1602,14 +1915,21 @@ class DownloadManager:
             logger.info("Zero-seeder race: no candidate survived the gates "
                         "(run #%s)", run_id)
             return []
-        ids = [
-            self.grab(r, request_id=request_id, request_title=request_title,
-                      episode_context=episode_context)
-            for r in picks
-        ]
-        logger.info("Zero-seeder race started: %d candidate download(s) %s", len(ids), ids)
-        threading.Thread(target=self._race_monitor, args=(ids,),
-                         name="dl-zero-seeder-race", daemon=True).start()
+        ids: list[int] = []
+        for r in picks:
+            # auto-move + auto-rename OFF for every racer: verification decides
+            # the single winner that is allowed to move.
+            did = self.grab(r, request_id=request_id, request_title=request_title,
+                            episode_context=episode_context,
+                            auto_rename=False, auto_move=False)
+            downloads_store.link_download_to_run(did, run_id)
+            ids.append(did)
+        logger.info("Zero-seeder race started (run #%s): %d candidate(s) %s",
+                    run_id, len(ids), ids)
+        threading.Thread(
+            target=self._race_monitor, args=(ids,),
+            kwargs={"request_title": request_title},
+            name="dl-zero-seeder-race", daemon=True).start()
         return ids
 
     def _race_fallback_want(self, media_type: str,
@@ -1624,43 +1944,72 @@ class DownloadManager:
             allow_cam=not config.BLOCK_CAMS,
             mode=torrent_select.MODE_ZERO_SEEDER_RACE)
 
-    def _race_monitor(self, ids: list[int], *, duration_s: int = 3600) -> None:
+    def _staged_size(self, row: downloads_store.DownloadRow) -> int:
+        """Total on-disk size of a download's staged media (race tie-break)."""
+        total = 0
+        for f in self._media_files_in_staging(row):
+            try:
+                total += f.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def _cancel_race_loser(self, download_id: int) -> None:
+        """Cancel a race loser with reason race_loser — NEVER a blocklist entry
+        and never a 'wrong pick' (Task C item 6.5)."""
+        row = downloads_store.get_download(download_id)
+        if row is not None and row.status in ("queued", "downloading", "downloaded"):
+            self.cancel(download_id)
+            downloads_store.add_history(
+                download_id, "race_loser", before=None,
+                after="zero-seeder race loser — cancelled, not blocklisted")
+
+    def _race_finish_winner(self, download_id: int) -> bool:
+        """Verify a finished race candidate BEFORE moving it. Returns True when
+        it verified and moved (the winner). A failed-verify candidate is
+        quarantined + blocked for the identity by _post_process itself, and the
+        race continues with the rest."""
+        row = downloads_store.get_download(download_id)
+        if row is None:
+            return False
+        request_title = _request_title_from_row(row)
+        self._post_process(download_id, force_move=True, force_rename=True,
+                           request_title=request_title)
+        after = downloads_store.get_download(download_id)
+        return after is not None and after.status == "moved"
+
+    def _race_monitor(self, ids: list[int], *, request_title: str | None = None,
+                      duration_s: int = 3600, poll_s: int = 120) -> None:
         deadline = time.time() + duration_s
+        remaining = list(ids)
 
-        def cancel_all_except(keep: int | None) -> None:
-            for did in ids:
-                if did == keep:
-                    continue
-                row = downloads_store.get_download(did)
-                if row is not None and row.status in ("queued", "downloading"):
-                    self.cancel(did)
-
-        while time.time() < deadline:
-            time.sleep(120)
-            rows = [downloads_store.get_download(d) for d in ids]
-            finished = [r for r in rows if r is not None
-                        and r.status in ("downloaded", "moved")]
+        while time.time() < deadline and remaining:
+            time.sleep(poll_s)
+            rows = {d: downloads_store.get_download(d) for d in remaining}
+            finished = [(d, r) for d, r in rows.items()
+                        if r is not None and r.status == "downloaded"]
             if finished:
-                # Two finished at once? Keep the bigger file (better quality).
-                winner = max(finished, key=lambda r: r.progress).download_id
-                cancel_all_except(winner)
-                logger.info("Zero-seeder race won by download #%s", winner)
+                # Tie-break among simultaneously finished: size_bytes desc, then
+                # infohash asc (the comment's real intent; item 6.6).
+                finished.sort(key=lambda dr: (-self._staged_size(dr[1]),
+                                              _magnet_hash(dr[1].magnet)))
+                for did, _row in finished:
+                    if self._race_finish_winner(did):
+                        for other in remaining:
+                            if other != did:
+                                self._cancel_race_loser(other)
+                        logger.info("Zero-seeder race won by download #%s", did)
+                        return
+                    # failed verify: already quarantined+blocked; drop it.
+                    remaining.remove(did)
+            remaining = [d for d in remaining
+                         if (r := downloads_store.get_download(d)) is not None
+                         and r.status in ("queued", "downloading", "downloaded")]
+            if not remaining:
                 return
-            alive = [r for r in rows if r is not None
-                     and r.status in ("queued", "downloading")]
-            if not alive:
-                return  # everything errored/cancelled on its own
 
-        rows = [downloads_store.get_download(d) for d in ids]
-        progressing = [r for r in rows if r is not None
-                       and r.status == "downloading" and r.progress > 0.0]
-        if progressing:
-            winner = max(progressing, key=lambda r: r.progress).download_id
-            logger.info("Zero-seeder race: keeping #%s after 1h, cancelling rest", winner)
-            cancel_all_except(winner)
-        else:
-            logger.info("Zero-seeder race: nothing progressed in 1h — cancelling all")
-            cancel_all_except(None)
+        for did in remaining:
+            self._cancel_race_loser(did)
 
     # ------------------------------------------------------------------
     # Quality replacement — swap a cam/low-bitrate movie for a proper one
@@ -2043,6 +2392,29 @@ class DownloadManager:
         if not files:
             return "no media files found in staging for this download"
 
+        # -- IDENTITY GATE (verify BEFORE any move; Design stance 5) ----------
+        # Compare the ACTUAL staged files against the immutable want_json via
+        # media_identity. A contradictory identity-gating file (a sequel payload,
+        # a wrong-country edition, a contradicting season) fails the whole
+        # download: NO move, quarantine, blocklist, request reopens.
+        want_dict = downloads_store.get_want(download_id)
+        if want_dict is not None:
+            want_identity = verification.identity_from_want(want_dict)
+            result = verification.verify_staging(
+                files, want_identity,
+                video_exts=torrent_routing.VIDEO_EXTENSIONS,
+                subtitle_exts=torrent_routing.SUBTITLE_EXTENSIONS)
+            if not result.ok:
+                if result.reason_code == "no_media":
+                    # Nothing identity-gating to place (samples/extras/subs
+                    # only): move NOTHING — non-gating files never enter a
+                    # library root on their own (verifier note N3).
+                    return ("left in staging — no primary/episode video to "
+                            "place (samples/extras/subtitles only)")
+                return self._quarantine_payload(
+                    row, want_identity, result.reason_code, result.detail,
+                    offending=result.offending)
+
         # Canonical show name for renames: the tracked show's title for
         # episode-linked grabs, else the matched library folder's name.
         show_name = None
@@ -2055,26 +2427,72 @@ class DownloadManager:
 
         video_files = [f for f in files if f.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS]
 
+        # Fresh provenance rows for this pass (idempotent re-runs).
+        downloads_store.clear_download_files(download_id)
         dest_dir = Path(plan.dest_dir)
-        moved_any = False
+        moved_gating = 0          # gating (primary/episode) files placed
+        gating_total = 0
+        skipped_gating = 0
+        moved_final_paths: list[str] = []
         for src in files:
+            suffix = src.suffix.lower()
+            is_video = suffix in torrent_routing.VIDEO_EXTENSIONS
+            is_sub = suffix in torrent_routing.SUBTITLE_EXTENSIONS
+            role = verification.classify_role(
+                src, is_video=is_video, is_subtitle=is_sub,
+                single_video=(len(video_files) == 1),
+                want=(verification.identity_from_want(want_dict)
+                      if want_dict else MediaIdentity(media_type=row.media_type)))
+            is_gating = role in verification._IDENTITY_GATING_ROLES
+            if is_gating:
+                gating_total += 1
+
+            def _record(state: str, *, final: str | None = None,
+                        reason: str | None = None) -> None:
+                import datetime as _dt
+                pf = verification.parse_file(src)
+                downloads_store.add_download_file(
+                    download_id,
+                    source_relative_path=src.name,
+                    source_absolute_path=str(src),
+                    media_role=role, parsed_title=pf.parsed_title,
+                    parsed_year=pf.year,
+                    parsed_season=(pf.seasons[0] if pf.seasons else None),
+                    parsed_episode=(pf.episodes[0] if pf.episodes else None),
+                    size_bytes=(src.stat().st_size if src.exists() else None),
+                    final_path=final, verification_state=state,
+                    verification_reason=reason,
+                    moved_at=(_dt.datetime.now(_dt.timezone.utc).isoformat()
+                              if final else None))
+
+            # ROLE GATE (verification.py contract): samples, extras, and
+            # unknown files are NEVER moved to a library root. Only verified
+            # primary/episode videos and their subtitles may move; the rest
+            # stay in staging with the skip recorded in provenance.
+            if role in (verification.ROLE_SAMPLE, verification.ROLE_EXTRA,
+                        verification.ROLE_UNKNOWN):
+                _record("skipped",
+                        reason=f"role {role} never moves to a library root")
+                continue
+
             # Multi-sub packs carry subtitles for every language — only the
             # configured language (and untagged defaults) move to the library.
-            if src.suffix.lower() in torrent_routing.SUBTITLE_EXTENSIONS:
+            if is_sub:
                 try:
                     from subtitles import subtitle_language_ok
                     if not subtitle_language_ok(src):
+                        _record("skipped", reason="subtitle language filtered")
                         continue
                 except ImportError:
                     pass
             target_name = src.name
-            if do_rename and src.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS:
+            if do_rename and is_video:
                 new_stem = self._episode_stem_for_file(
                     src, show_name=show_name, plan=plan,
                     single_video=(len(video_files) == 1),
                 )
                 if new_stem:
-                    target_name = f"{new_stem}{src.suffix.lower()}"
+                    target_name = f"{new_stem}{suffix}"
                 if target_name != src.name:
                     downloads_store.add_history(
                         download_id, "renamed", before=src.name, after=target_name,
@@ -2097,7 +2515,11 @@ class DownloadManager:
                             download_id, "duplicate", before=str(src),
                             after=f"already in library ({target}) — staged copy recycled",
                         )
-                        moved_any = True  # the episode IS in place
+                        _record("duplicate", final=str(target),
+                                reason="already in library — staged copy recycled")
+                        if is_gating:
+                            moved_gating += 1
+                            moved_final_paths.append(str(target))
                         continue
                     try:
                         target_smaller = target.stat().st_size < src.stat().st_size
@@ -2117,25 +2539,42 @@ class DownloadManager:
                             download_id, "error", before=str(src),
                             after=f"NOT moved — a DIFFERENT (larger) file exists at: {target}",
                         )
+                        _record("failed",
+                                reason=f"a different larger file exists at {target}")
+                        if is_gating:
+                            skipped_gating += 1
                         continue
                 shutil.move(str(src), str(target))
                 downloads_store.add_history(
                     download_id, "moved", before=str(src), after=str(target),
                 )
+                _record("verified", final=str(target))
+                if is_gating:
+                    moved_gating += 1
+                    moved_final_paths.append(str(target))
                 try:
                     from library_index import log_file_event
                     log_file_event("added", str(target),
                                    f"downloaded by Plexxarr (download #{download_id})")
                 except Exception:
                     pass
-                moved_any = True
             elif target_name != src.name:
                 # Rename in place (staging) without moving.
                 target = src.with_name(target_name)
                 if not target.exists():
                     src.rename(target)
+                _record("skipped", reason="renamed in staging (move off)")
+            else:
+                _record("skipped", reason="left in staging (move off)")
 
+        moved_any = moved_gating > 0
         if moved_any:
+            # Per-file rollup: partial when a gating file could not be placed.
+            partial = skipped_gating > 0 or moved_gating < gating_total
+            downloads_store.set_verification(
+                download_id, "partial" if partial else "verified",
+                reason=(f"{moved_gating}/{gating_total} gating files placed"
+                        if partial else None))
             downloads_store.set_status(download_id, "moved", completed=True)
             self._cleanup_staging_leftovers(row)
             # Quality replacement: the new file is in place — retire the old
@@ -2179,7 +2618,21 @@ class DownloadManager:
                     str(dest_dir),
                 ) or str(dest_dir)
                 shows_store.set_episode_file(row.show_id, row.season, row.episode, moved_video)
+            # Provenance link + AGGREGATE fulfillment (Task C item 4): the
+            # download is placed; whether the REQUEST is fulfilled is decided by
+            # the aggregate (a first episode never completes a season).
+            self._on_download_placed(row, moved_final_paths)
             return f"moved to {dest_dir}"
+
+        # Nothing placed. If a gating file existed but could not be moved (e.g.
+        # a different larger file already sits at every target), the request
+        # needs a human — surface it instead of silently succeeding.
+        if skipped_gating > 0:
+            downloads_store.set_verification(
+                download_id, "failed", reason="no gating file could be placed")
+            if row.request_id is not None:
+                queue_store.set_status(row.request_id,
+                                       queue_store.STATUS_NEEDS_ATTENTION)
         return f"processed (no move) — planned: {plan.describe()}"
 
     @staticmethod

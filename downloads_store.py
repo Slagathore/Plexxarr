@@ -66,6 +66,19 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # an in-flight download was for. NOTE: the table/column names in the ALTER
     # above are static literals — never interpolate user input into them.
     ("downloads", "want_json", "TEXT"),
+    # Task C item 3 — tombstones. remove() ARCHIVES the row instead of deleting
+    # it out from under its own provenance/history; the UI hides archived rows
+    # by default. A quarantined download (verify-failed, kept in staging) is a
+    # normal row whose verification landed on 'needs_attention'.
+    ("downloads", "removed_at", "TEXT"),
+    ("downloads", "removed_reason", "TEXT"),
+    # Verification outcome for the whole download (rolled up from per-file
+    # download_files rows): pending | verified | failed | partial | quarantined.
+    ("downloads", "verification_state", "TEXT"),
+    ("downloads", "verification_reason", "TEXT"),
+    # The selection_run this download came from (Task C item 6 shares one across
+    # a zero-seeder race so every racer links back to the single decision).
+    ("downloads", "selection_run_id", "INTEGER"),
 ]
 
 _SCHEMA_HISTORY = """
@@ -107,6 +120,11 @@ class DownloadRow:
     files_json: str | None = None
     failure_key: str | None = None
     want_json: str | None = None
+    removed_at: str | None = None
+    removed_reason: str | None = None
+    verification_state: str | None = None
+    verification_reason: str | None = None
+    selection_run_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -123,16 +141,26 @@ _DOWNLOAD_COLUMNS = (
     "id, request_id, title, magnet, source, media_type, status, progress, "
     "staging_dir, planned_dest, planned_name, route_reason, auto_rename, "
     "auto_move, error, created_at, completed_at, show_id, season, episode, "
-    "replace_path, files_json, failure_key, want_json"
+    "replace_path, files_json, failure_key, want_json, removed_at, "
+    "removed_reason, verification_state, verification_reason, selection_run_id"
 )
 
 
 _SCHEMA_DEFERRALS = """
 CREATE TABLE IF NOT EXISTS grab_deferrals (
-    key        TEXT PRIMARY KEY,
-    first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    key             TEXT PRIMARY KEY,
+    first_seen      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    reason          TEXT,
+    next_attempt_at TEXT
 )
 """
+# Deferrals gained reason + next_attempt_at (Task C item 9 / Task E) so the grab
+# queue can render WHY a request is held and WHEN it will next be tried. Applied
+# via ALTER on upgrade for tables that predate the columns.
+_DEFERRAL_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("grab_deferrals", "reason", "TEXT"),
+    ("grab_deferrals", "next_attempt_at", "TEXT"),
+]
 
 # ---------------------------------------------------------------------------
 # Selection provenance (Task B item 4 / RESOLVED DECISION 12): normalized
@@ -178,6 +206,80 @@ CREATE TABLE IF NOT EXISTS candidate_decisions (
 """
 
 
+# ---------------------------------------------------------------------------
+# Blocklist (Task C item 2) — scoped, reason-coded. A release wrong for one
+# identity can be right for another (Angry Birds 2 is wrong for movie 1, correct
+# for a later movie-2 request), so every entry carries a subject scope. Race
+# losers and transient failures NEVER land here (Design stance 7).
+# ---------------------------------------------------------------------------
+_SCHEMA_BLOCKLIST = """
+CREATE TABLE IF NOT EXISTS blocklist (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_type  TEXT NOT NULL,   -- request_identity | show_season | show_episode | global_bad_release
+    subject_key   TEXT NOT NULL,   -- e.g. 'tmdb:153518', 'show:12:s19:e03', '*'
+    infohash      TEXT,
+    parsed_title  TEXT,
+    size_bytes    INTEGER,
+    release_group TEXT,
+    reason_code   TEXT NOT NULL,
+    reason_detail TEXT,
+    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by    TEXT
+)
+"""
+
+# Reason codes that MEAN a permanent, subject-scoped blocklist entry.
+BLOCK_REASON_IDENTITY_MISMATCH = "identity_mismatch"
+BLOCK_REASON_USER_WRONG_PICK = "user_wrong_pick"
+BLOCK_REASON_PAYLOAD_NAME_MISMATCH = "payload_name_mismatch"
+BLOCK_REASON_USER_CANCEL_AND_BLOCK = "user_cancel_and_block"
+BLOCK_REASON_GLOBAL_BAD_RELEASE = "global_bad_release"
+# Reason codes that must NEVER create an entry.
+NON_BLOCKING_REASONS = frozenset({
+    "race_loser", "user_cancel_no_block",
+    "download_stalled", "tracker_timeout", "client_error",
+})
+
+SUBJECT_GLOBAL = "*"
+
+# ---------------------------------------------------------------------------
+# Provenance (Task C item 3) — a file-link table, not a JSON blob. Supports
+# several episode downloads fulfilling one season request, one pack fulfilling
+# one request, and one deduplicated download satisfying two household requests.
+# ---------------------------------------------------------------------------
+_SCHEMA_DOWNLOAD_FILES = """
+CREATE TABLE IF NOT EXISTS download_files (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    download_id          INTEGER NOT NULL,
+    source_relative_path TEXT,
+    source_absolute_path TEXT,
+    final_path           TEXT,
+    media_role           TEXT,    -- primary_video | episode | subtitle | sample | extra | unknown
+    parsed_title         TEXT,
+    parsed_year          INTEGER,
+    parsed_season        INTEGER,
+    parsed_episode       INTEGER,
+    language             TEXT,
+    flags_json           TEXT,
+    size_bytes           INTEGER,
+    verification_state   TEXT,    -- verified | failed | duplicate | skipped
+    verification_reason  TEXT,
+    moved_at             TEXT,
+    removed_at           TEXT
+)
+"""
+
+_SCHEMA_REQUEST_DOWNLOADS = """
+CREATE TABLE IF NOT EXISTS request_downloads (
+    request_id  INTEGER NOT NULL,
+    download_id INTEGER NOT NULL,
+    role        TEXT,
+    created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (request_id, download_id)
+)
+"""
+
+
 def _init_failed_grabs(conn) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS failed_grabs (
@@ -217,17 +319,33 @@ def failed_grab_times(context_key: str) -> dict[str, float]:
     return {str(r[0]): float(r[1]) for r in rows}
 
 
-def check_grab_deferral(key: str, *, wait_hours: float = 24.0) -> bool:
+def _ensure_deferral_columns(conn) -> None:
+    conn.execute(_SCHEMA_DEFERRALS)
+    existing = {r[1] for r in conn.execute(
+        "PRAGMA table_info(grab_deferrals)").fetchall()}
+    for _t, col, col_def in _DEFERRAL_MIGRATIONS:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE grab_deferrals ADD COLUMN {col} {col_def}")
+
+
+def check_grab_deferral(key: str, *, wait_hours: float = 24.0,
+                        reason: str | None = None) -> bool:
     """Oversize-only-result cooldown for ROUTINE grabs: first sighting
-    records the key and returns False (wait); once wait_hours have passed
-    it returns True (go ahead). Cleared on a successful grab."""
+    records the key (with an optional reason + a computed next_attempt_at) and
+    returns False (wait); once wait_hours have passed it returns True (go
+    ahead). Cleared on a successful grab. reason + next_attempt_at feed the
+    grab-queue view (Task E)."""
     import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
     with _DL_LOCK, db.connect() as conn:
-        conn.execute(_SCHEMA_DEFERRALS)
+        _ensure_deferral_columns(conn)
         row = conn.execute(
             "SELECT first_seen FROM grab_deferrals WHERE key = ?", (key,)).fetchone()
         if row is None:
-            conn.execute("INSERT INTO grab_deferrals (key) VALUES (?)", (key,))
+            next_at = (now + _dt.timedelta(hours=wait_hours)).isoformat()
+            conn.execute(
+                "INSERT INTO grab_deferrals (key, reason, next_attempt_at)"
+                " VALUES (?, ?, ?)", (key, reason, next_at))
             conn.commit()
             return False
     try:
@@ -235,8 +353,20 @@ def check_grab_deferral(key: str, *, wait_hours: float = 24.0) -> bool:
         first = _dt.datetime.fromisoformat(row[0]).replace(tzinfo=_dt.timezone.utc)
     except ValueError:
         return True
-    now = _dt.datetime.now(_dt.timezone.utc)
     return (now - first).total_seconds() >= wait_hours * 3600
+
+
+def get_grab_deferral(key: str) -> dict | None:
+    """Deferral detail (reason + next_attempt_at) for the grab-queue view."""
+    with _DL_LOCK, db.connect() as conn:
+        _ensure_deferral_columns(conn)
+        row = conn.execute(
+            "SELECT key, first_seen, reason, next_attempt_at"
+            " FROM grab_deferrals WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return None
+    return {"key": row[0], "first_seen": row[1],
+            "reason": row[2], "next_attempt_at": row[3]}
 
 
 def clear_grab_deferral(key: str) -> None:
@@ -253,7 +383,10 @@ def initialize_downloads_db() -> None:
         conn.execute(_SCHEMA_DEFERRALS)
         conn.execute(_SCHEMA_SELECTION_RUNS)
         conn.execute(_SCHEMA_CANDIDATE_DECISIONS)
-        for table, column, col_def in _MIGRATIONS:
+        conn.execute(_SCHEMA_BLOCKLIST)
+        conn.execute(_SCHEMA_DOWNLOAD_FILES)
+        conn.execute(_SCHEMA_REQUEST_DOWNLOADS)
+        for table, column, col_def in (_MIGRATIONS + _DEFERRAL_MIGRATIONS):
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if existing and column not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
@@ -269,7 +402,9 @@ def _row_to_download(row) -> DownloadRow:
         error=row[14], created_at=row[15], completed_at=row[16],
         show_id=row[17], season=row[18], episode=row[19],
         replace_path=row[20], files_json=row[21], failure_key=row[22],
-        want_json=row[23],
+        want_json=row[23], removed_at=row[24], removed_reason=row[25],
+        verification_state=row[26], verification_reason=row[27],
+        selection_run_id=row[28],
     )
 
 
@@ -281,6 +416,7 @@ def create_download(
     show_id: int | None = None, season: int | None = None,
     episode: int | None = None, replace_path: str | None = None,
     failure_key: str | None = None, want_json: str | None = None,
+    selection_run_id: int | None = None,
 ) -> int:
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
@@ -289,13 +425,14 @@ def create_download(
             INSERT INTO downloads
                 (request_id, title, magnet, source, media_type, staging_dir,
                  planned_dest, planned_name, route_reason, auto_rename, auto_move,
-                 show_id, season, episode, replace_path, failure_key, want_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 show_id, season, episode, replace_path, failure_key, want_json,
+                 selection_run_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (request_id, title, magnet, source, media_type, staging_dir,
              planned_dest, planned_name, route_reason,
              int(auto_rename), int(auto_move), show_id, season, episode,
-             replace_path, failure_key, want_json),
+             replace_path, failure_key, want_json, selection_run_id),
         )
         conn.commit()
         download_id = int(cursor.lastrowid or 0)
@@ -327,10 +464,71 @@ def get_want(download_id: int) -> dict | None:
 
 
 def delete_download(download_id: int) -> None:
-    """Drop a download row (torrent-client 'remove'). History rows stay —
-    the audit trail must survive the row."""
+    """Hard-delete a download row. Retained for callers that truly want the row
+    gone; the DEFAULT removal path is tombstone_download (Task C item 3), which
+    keeps the row + its provenance and merely archives it."""
     with _DL_LOCK, db.connect() as conn:
         conn.execute("DELETE FROM downloads WHERE id = ?", (download_id,))
+        conn.commit()
+
+
+def list_quarantined_downloads(*, limit: int = 200) -> list[DownloadRow]:
+    """Archived rows whose bytes are KEPT for possible adoption (Task C item 8):
+    verify-failed / wrong-pick quarantines, not user recycles. The grab-queue
+    quarantine browser renders these with age + size + total usage."""
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_DOWNLOAD_COLUMNS} FROM downloads"
+            " WHERE removed_at IS NOT NULL AND removed_reason LIKE 'quarantine:%'"
+            " ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [_row_to_download(r) for r in rows]
+
+
+def restore_download(download_id: int) -> None:
+    """Un-archive a tombstoned row (quarantine adoption clears the tombstone)."""
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute(
+            "UPDATE downloads SET removed_at = NULL, removed_reason = NULL"
+            " WHERE id = ?", (download_id,))
+        conn.commit()
+
+
+def set_request_id(download_id: int, request_id: int | None) -> None:
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute("UPDATE downloads SET request_id = ? WHERE id = ?",
+                     (request_id, download_id))
+        conn.commit()
+
+
+def tombstone_download(download_id: int, *, reason: str) -> None:
+    """Archive a download instead of deleting it (Task C item 3). The row and
+    its download_files / request_downloads provenance survive; the UI hides
+    archived rows by default. History and links are never touched."""
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute(
+            "UPDATE downloads SET removed_at = CURRENT_TIMESTAMP,"
+            " removed_reason = ? WHERE id = ?", (reason, download_id))
+        conn.commit()
+
+
+def set_verification(download_id: int, state: str,
+                     reason: str | None = None) -> None:
+    """Roll-up verification outcome for the whole download
+    (pending|verified|failed|partial|quarantined)."""
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute(
+            "UPDATE downloads SET verification_state = ?,"
+            " verification_reason = ? WHERE id = ?",
+            (state, reason, download_id))
+        conn.commit()
+
+
+def link_download_to_run(download_id: int, selection_run_id: int) -> None:
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute(
+            "UPDATE downloads SET selection_run_id = ? WHERE id = ?",
+            (selection_run_id, download_id))
         conn.commit()
 
 
@@ -409,26 +607,31 @@ def get_download(download_id: int) -> DownloadRow | None:
     return _row_to_download(row) if row else None
 
 
-def list_downloads(*, limit: int = 100) -> list[DownloadRow]:
+def list_downloads(*, limit: int = 100,
+                   include_removed: bool = False) -> list[DownloadRow]:
     initialize_downloads_db()
+    where = "" if include_removed else "WHERE removed_at IS NULL"
     with _DL_LOCK, db.connect() as conn:
         rows = conn.execute(
-            f"SELECT {_DOWNLOAD_COLUMNS} FROM downloads ORDER BY id DESC LIMIT ?",
+            f"SELECT {_DOWNLOAD_COLUMNS} FROM downloads {where} "
+            f"ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [_row_to_download(r) for r in rows]
 
 
 def request_ids_with_downloads() -> set[int]:
-    """Request IDs that already have a grab — used by auto-grab to skip them."""
+    """Request IDs that already have a live grab — used by auto-grab to skip
+    them. error/cancelled rows don't count (a failed grab must not strand its
+    request forever; the blocklist, not the row's mere existence, is what stops
+    a re-grab of a WRONG release). Archived (tombstoned) rows don't count."""
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
-        # error/cancelled rows don't count — a failed grab must not strand
-        # its request forever; the next auto-grab pass retries it.
         rows = conn.execute(
             "SELECT DISTINCT request_id FROM downloads"
             " WHERE request_id IS NOT NULL"
             " AND status NOT IN ('error', 'cancelled')"
+            " AND removed_at IS NULL"
         ).fetchall()
     return {int(r[0]) for r in rows}
 
@@ -627,3 +830,237 @@ def get_selection_run_for_download(download_id: int) -> SelectionRunRow | None:
             (download_id,),
         ).fetchone()
     return SelectionRunRow(*row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Blocklist API (Task C item 2) — scoped, reason-coded
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BlocklistRow:
+    blocklist_id: int
+    subject_type: str
+    subject_key: str
+    infohash: str | None
+    parsed_title: str | None
+    size_bytes: int | None
+    release_group: str | None
+    reason_code: str
+    reason_detail: str | None
+    created_at: str
+    created_by: str | None
+
+
+_BLOCKLIST_COLS = ("id, subject_type, subject_key, infohash, parsed_title, "
+                   "size_bytes, release_group, reason_code, reason_detail, "
+                   "created_at, created_by")
+
+
+def add_blocklist_entry(*, subject_type: str, subject_key: str,
+                        reason_code: str, infohash: str | None = None,
+                        parsed_title: str | None = None,
+                        size_bytes: int | None = None,
+                        release_group: str | None = None,
+                        reason_detail: str | None = None,
+                        created_by: str | None = None) -> int:
+    """Record a permanent, subject-scoped blocklist entry. Reasons in
+    NON_BLOCKING_REASONS (race_loser + the transient failures) are refused here
+    — they must never create an entry (Design stance 7). Returns the new row id,
+    or 0 when the reason is non-blocking (a deliberate no-op)."""
+    if reason_code in NON_BLOCKING_REASONS:
+        return 0
+    initialize_downloads_db()
+    ih = infohash.lower() if infohash else None
+    with _DL_LOCK, db.connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO blocklist (subject_type, subject_key, infohash,"
+            " parsed_title, size_bytes, release_group, reason_code,"
+            " reason_detail, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (subject_type, subject_key, ih, parsed_title, size_bytes,
+             release_group, reason_code, reason_detail, created_by))
+        conn.commit()
+        return int(cursor.lastrowid or 0)
+
+
+def _row_to_blocklist(r) -> BlocklistRow:
+    return BlocklistRow(
+        blocklist_id=r[0], subject_type=r[1], subject_key=r[2], infohash=r[3],
+        parsed_title=r[4], size_bytes=r[5], release_group=r[6],
+        reason_code=r[7], reason_detail=r[8], created_at=r[9], created_by=r[10])
+
+
+def blocklist_entries_for_subject(subject_key: str | None) -> list[BlocklistRow]:
+    """Every entry that applies to a want with this subject_key: the
+    subject-scoped rows PLUS any global_bad_release rows (which apply to
+    everything). A None/empty subject_key still returns the globals."""
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        if subject_key:
+            rows = conn.execute(
+                f"SELECT {_BLOCKLIST_COLS} FROM blocklist"
+                " WHERE subject_key = ? OR subject_type = 'global_bad_release'",
+                (subject_key,)).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {_BLOCKLIST_COLS} FROM blocklist"
+                " WHERE subject_type = 'global_bad_release'").fetchall()
+    return [_row_to_blocklist(r) for r in rows]
+
+
+def list_blocklist(*, limit: int = 500) -> list[BlocklistRow]:
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_BLOCKLIST_COLS} FROM blocklist"
+            " ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [_row_to_blocklist(r) for r in rows]
+
+
+def remove_blocklist_entry(blocklist_id: int) -> None:
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute("DELETE FROM blocklist WHERE id = ?", (blocklist_id,))
+        conn.commit()
+
+
+def widen_blocklist_to_global(blocklist_id: int) -> None:
+    """Promote a subject-scoped entry to global_bad_release (Task C item 8:
+    only an explicit, separately confirmed user action may do this)."""
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute(
+            "UPDATE blocklist SET subject_type = 'global_bad_release',"
+            " subject_key = ?, reason_code = ? WHERE id = ?",
+            (SUBJECT_GLOBAL, BLOCK_REASON_GLOBAL_BAD_RELEASE, blocklist_id))
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Provenance API (Task C item 3) — download_files + request_downloads junction
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DownloadFileRow:
+    file_id: int
+    download_id: int
+    source_relative_path: str | None
+    source_absolute_path: str | None
+    final_path: str | None
+    media_role: str | None
+    parsed_title: str | None
+    parsed_year: int | None
+    parsed_season: int | None
+    parsed_episode: int | None
+    language: str | None
+    flags_json: str | None
+    size_bytes: int | None
+    verification_state: str | None
+    verification_reason: str | None
+    moved_at: str | None
+    removed_at: str | None
+
+
+_DOWNLOAD_FILE_COLS = (
+    "id, download_id, source_relative_path, source_absolute_path, final_path, "
+    "media_role, parsed_title, parsed_year, parsed_season, parsed_episode, "
+    "language, flags_json, size_bytes, verification_state, verification_reason, "
+    "moved_at, removed_at")
+
+
+def add_download_file(download_id: int, *, source_relative_path: str | None,
+                      source_absolute_path: str | None,
+                      media_role: str | None, parsed_title: str | None = None,
+                      parsed_year: int | None = None,
+                      parsed_season: int | None = None,
+                      parsed_episode: int | None = None,
+                      language: str | None = None,
+                      flags_json: str | None = None,
+                      size_bytes: int | None = None,
+                      final_path: str | None = None,
+                      verification_state: str | None = None,
+                      verification_reason: str | None = None,
+                      moved_at: str | None = None) -> int:
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO download_files (download_id, source_relative_path,"
+            " source_absolute_path, final_path, media_role, parsed_title,"
+            " parsed_year, parsed_season, parsed_episode, language, flags_json,"
+            " size_bytes, verification_state, verification_reason, moved_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (download_id, source_relative_path, source_absolute_path,
+             final_path, media_role, parsed_title, parsed_year, parsed_season,
+             parsed_episode, language, flags_json, size_bytes,
+             verification_state, verification_reason, moved_at))
+        conn.commit()
+        return int(cursor.lastrowid or 0)
+
+
+def _row_to_download_file(r) -> DownloadFileRow:
+    return DownloadFileRow(
+        file_id=r[0], download_id=r[1], source_relative_path=r[2],
+        source_absolute_path=r[3], final_path=r[4], media_role=r[5],
+        parsed_title=r[6], parsed_year=r[7], parsed_season=r[8],
+        parsed_episode=r[9], language=r[10], flags_json=r[11], size_bytes=r[12],
+        verification_state=r[13], verification_reason=r[14], moved_at=r[15],
+        removed_at=r[16])
+
+
+def list_download_files(download_id: int, *,
+                        include_removed: bool = False) -> list[DownloadFileRow]:
+    initialize_downloads_db()
+    where = "WHERE download_id = ?"
+    if not include_removed:
+        where += " AND removed_at IS NULL"
+    with _DL_LOCK, db.connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_DOWNLOAD_FILE_COLS} FROM download_files {where}"
+            " ORDER BY id", (download_id,)).fetchall()
+    return [_row_to_download_file(r) for r in rows]
+
+
+def clear_download_files(download_id: int) -> None:
+    """Drop the per-file rows for a download (a fresh post-process pass rebuilds
+    them; keeps re-runs idempotent instead of duplicating file rows)."""
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute("DELETE FROM download_files WHERE download_id = ?",
+                     (download_id,))
+        conn.commit()
+
+
+def link_request_download(request_id: int, download_id: int,
+                          role: str | None = None) -> None:
+    """Junction row tying a request to a download (Task C item 3/4). Idempotent
+    on (request_id, download_id)."""
+    if request_id is None or download_id is None:
+        return
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute(
+            "INSERT INTO request_downloads (request_id, download_id, role)"
+            " VALUES (?, ?, ?) ON CONFLICT(request_id, download_id)"
+            " DO UPDATE SET role = excluded.role",
+            (request_id, download_id, role))
+        conn.commit()
+
+
+def downloads_for_request(request_id: int, *,
+                          include_removed: bool = True) -> list[DownloadRow]:
+    """Every download linked to a request via the junction OR the legacy
+    downloads.request_id column (so pre-junction rows still resolve)."""
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        ids = {r[0] for r in conn.execute(
+            "SELECT download_id FROM request_downloads WHERE request_id = ?",
+            (request_id,)).fetchall()}
+        ids |= {r[0] for r in conn.execute(
+            "SELECT id FROM downloads WHERE request_id = ?",
+            (request_id,)).fetchall()}
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        where = f"WHERE id IN ({placeholders})"
+        if not include_removed:
+            where += " AND removed_at IS NULL"
+        rows = conn.execute(
+            f"SELECT {_DOWNLOAD_COLUMNS} FROM downloads {where} ORDER BY id",
+            tuple(ids)).fetchall()
+    return [_row_to_download(r) for r in rows]

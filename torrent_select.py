@@ -77,10 +77,14 @@ MODE_AUTOMATIC_EPISODE = "automatic-episode"
 MODE_AUTOMATIC_REPLACEMENT = "automatic-replacement"
 MODE_ZERO_SEEDER_RACE = "zero-seeder-race"
 MODE_MANUAL_USER_PICK = "manual-user-pick"
+# Task C item 8: a compatible quarantined payload adopted for a NEW request
+# after fresh verification, without a second download.
+MODE_REUSED_QUARANTINE = "reused_quarantine"
 
 _SELECTION_MODES = frozenset({
     MODE_AUTOMATIC_SINGLE, MODE_AUTOMATIC_SEASON_PACK, MODE_AUTOMATIC_EPISODE,
     MODE_AUTOMATIC_REPLACEMENT, MODE_ZERO_SEEDER_RACE, MODE_MANUAL_USER_PICK,
+    MODE_REUSED_QUARANTINE,
 })
 
 # ---------------------------------------------------------------------------

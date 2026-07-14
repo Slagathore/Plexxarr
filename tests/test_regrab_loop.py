@@ -89,9 +89,6 @@ def _dm(monkeypatch, results):
     return dm
 
 
-@pytest.mark.xfail(strict=True,
-                   reason="failure (c): cancelled wrong grab re-grabbed forever "
-                          "— fix lands with Task C")
 def test_wrong_grab_does_not_regrab_the_same_release(monkeypatch):
     """grab -> wrong-grab/cancel -> next pass must pick a DIFFERENT release."""
     req = request_intake.add_matched_request(

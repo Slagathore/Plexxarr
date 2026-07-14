@@ -127,50 +127,193 @@ class LibraryInventory:
 # Daily library check
 # ---------------------------------------------------------------------------
 
+def _request_want_identity(req):
+    """Build the MediaIdentity a request is asking for (reconciliation compares
+    library evidence against THIS, never a raw substring)."""
+    import media_identity
+    return media_identity.MediaIdentity(
+        media_type=req.media_type or "unknown",
+        identity_source=getattr(req, "identity_source", None),
+        external_id=(str(req.external_id) if req.external_id is not None else None),
+        canonical_title=req.resolved_title or req.content,
+        canonical_year=getattr(req, "canonical_year", None),
+        origin_countries=tuple(getattr(req, "origin_countries", []) or ()),
+        season=getattr(req, "season", None),
+    )
+
+
+def _core_title(name: str) -> str:
+    """Normalized title core of a library entry/name, year + release-junk
+    stripped but any sequel number KEPT (so 'Movie' and 'Movie 2' differ)."""
+    import media_identity
+    import torrent_routing
+    core = torrent_routing.parse_torrent_name(name).show_title or name
+    core = re.sub(r"[\(\[]?(?:19|20)\d{2}[\)\]]?", " ", core)
+    return media_identity.normalize_title(core)
+
+
+def _library_identity_eval(want, entries) -> tuple[bool, list]:
+    """Compare library entries against a want by IDENTITY (normalized-title
+    equality + media_identity's sequel/numeric/year guards), not substring.
+
+    Returns (matched, contradicting) where `matched` means a real same-identity
+    entry is present, and `contradicting` are entries that share the base title
+    but are a DIFFERENT entry in the series (the sequel that poisoned the old
+    substring check) — those get blocklisted for the identity.
+    """
+    import media_identity
+    import verification
+    want_core = media_identity.normalize_title(want.canonical_title)
+    matched = False
+    contradicting = []
+    for e in entries:
+        name = getattr(e, "name", "") or ""
+        entry_core = _core_title(name)
+        parsed = verification.parse_file(Path(name))
+        verdict = media_identity.compare_media_identity(want, parsed)
+        if not want_core:
+            continue
+        if entry_core == want_core and verdict.ok:
+            matched = True
+        elif (entry_core.startswith(want_core + " ") and not verdict.ok
+              and verdict.reason_code in ("sequel_mismatch",
+                                          "numeric_title_mismatch")):
+            contradicting.append(e)
+    return matched, contradicting
+
+
 def daily_library_check() -> dict:
-    """
-    Scan all open requests against the Plex library (or file index fallback)
-    and update the found_in_library flag in the DB.
+    """Reconcile requests against the library BY IDENTITY (Task C item 5).
 
-    Returns a summary dict:
-        {
-            "checked": int,
-            "newly_found": int,
-            "errors": list[str],
-        }
+    The old substring test (`title in entry.name`) is gone: it matched a sequel
+    ("Angry Birds Movie" is a substring of "Angry Birds Movie 2") and even
+    false-positived on requests whose only download never left staging. This
+    version compares library evidence against each request's MediaIdentity, so:
+
+    - found_in_library is set only after a REAL identity match;
+    - a request whose only "match" is a contradicting sequel has its poisoned
+      found flag CLEARED, the sequel BLOCKLISTED for that identity, and the
+      request stays open/grabbable;
+    - fulfilled/placed requests are re-verified against what is on disk NOW; a
+      broken or contradicted link is reopened;
+    - needs_identity rows can never be 'found' (no identity to match) — a stale
+      flag is cleared.
     """
+    import downloads_store
+    import queue_store as qs
     from library_index import search_library
-    from queue_store import get_requests_needing_library_check, update_library_status
 
-    requests = get_requests_needing_library_check()
     checked = 0
     newly_found = 0
+    cleared_false_found = 0
+    reopened = 0
+    sequels_blocked = 0
     errors: list[str] = []
 
-    for req in requests:
+    def _block_contradictions(want, entries) -> int:
+        n = 0
+        if not want.subject_key:
+            return 0
+        for e in entries:
+            downloads_store.add_blocklist_entry(
+                subject_type=("request_identity" if want.media_type == "movie"
+                              else "show_season"),
+                subject_key=want.subject_key,
+                reason_code=downloads_store.BLOCK_REASON_IDENTITY_MISMATCH,
+                parsed_title=getattr(e, "name", None),
+                reason_detail="reconcile: contradicting entry in library",
+                created_by="reconcile")
+            n += 1
+        return n
+
+    # 1. Identity-based found check for checkable (non-needs_identity) requests.
+    for req in qs.get_requests_needing_library_check():
         try:
-            search_title = req.resolved_title or req.content
-            results = search_library(search_title, limit=5)
-
-            # Simple match: any result whose name contains the search title
-            title_lower = search_title.casefold()
-            found = any(title_lower in entry.name.casefold() for entry in results)
-
-            update_library_status(req.request_id, found=found)
+            want = _request_want_identity(req)
+            entries = search_library(req.resolved_title or req.content, limit=8)
+            matched, contradicting = _library_identity_eval(want, entries)
+            qs.update_library_status(req.request_id, found=matched)
             checked += 1
-            if found and not req.found_in_library:
+            if matched and not req.found_in_library:
                 newly_found += 1
-                logger.info(
-                    "Library check: request #%d (%s) is now in the library.",
-                    req.request_id,
-                    search_title,
-                )
+            elif req.found_in_library and not matched:
+                cleared_false_found += 1
+                if contradicting:
+                    sequels_blocked += _block_contradictions(want, contradicting)
+                    logger.info(
+                        "Reconcile: request #%s had a POISONED found flag "
+                        "(contradicting entry in library) — cleared and blocked.",
+                        req.request_id)
         except Exception as exc:
-            msg = f"Error checking request #{req.request_id}: {exc}"
-            logger.error(msg)
-            errors.append(msg)
+            errors.append(f"Error checking request #{req.request_id}: {exc}")
+            logger.exception("Library check failed for request #%s", req.request_id)
 
-    return {"checked": checked, "newly_found": newly_found, "errors": errors}
+    # 2. Reconcile placement links + re-verify EVERY found flag by identity
+    #    (independent of check age — poison predating this build must be
+    #    corrected even if it was 'checked' recently).
+    for req in qs.list_requests(status="all", limit=2000):
+        try:
+            if req.status == qs.STATUS_NEEDS_IDENTITY:
+                if req.found_in_library:
+                    qs.update_library_status(req.request_id, found=False)
+                    cleared_false_found += 1
+                continue
+            if req.found_in_library:
+                want = _request_want_identity(req)
+                entries = search_library(req.resolved_title or req.content,
+                                         limit=8)
+                matched, contradicting = _library_identity_eval(want, entries)
+                if not matched:
+                    qs.update_library_status(req.request_id, found=False)
+                    cleared_false_found += 1
+                    if contradicting:
+                        sequels_blocked += _block_contradictions(want, contradicting)
+                        logger.info(
+                            "Reconcile: request #%s had a POISONED found flag — "
+                            "cleared and blocked the contradicting entry.",
+                            req.request_id)
+            if req.status in (qs.STATUS_FULFILLED, qs.STATUS_PLACED):
+                if not _placement_still_valid(req):
+                    qs.set_status(req.request_id, qs.STATUS_OPEN)
+                    reopened += 1
+                    logger.info("Reconcile: request #%s no longer verifies on "
+                                "disk — reopened.", req.request_id)
+        except Exception as exc:
+            errors.append(f"Error reconciling request #{req.request_id}: {exc}")
+
+    return {"checked": checked, "newly_found": newly_found,
+            "cleared_false_found": cleared_false_found, "reopened": reopened,
+            "sequels_blocked": sequels_blocked, "errors": errors}
+
+
+def _placement_still_valid(req) -> bool:
+    """A fulfilled/placed request still verifies when at least one of its linked
+    downloads has a moved file that (a) still exists on disk and (b) still
+    matches the request's identity.
+
+    Legacy rows with NO recorded placement provenance return True (no evidence
+    to contradict them — the identity found-check in step 1 handles those). A
+    request that HAS placement links but every one is now broken or contradicted
+    returns False and is reopened.
+    """
+    import downloads_store
+    import media_identity
+    import verification
+    want = _request_want_identity(req)
+    have_links = False
+    for dl in downloads_store.downloads_for_request(req.request_id):
+        for f in downloads_store.list_download_files(dl.download_id):
+            if f.verification_state not in ("verified", "duplicate"):
+                continue
+            if not f.final_path:
+                continue
+            have_links = True
+            if not Path(f.final_path).exists():
+                continue
+            parsed = verification.parse_file(Path(f.final_path))
+            if media_identity.compare_media_identity(want, parsed).ok:
+                return True
+    return not have_links
 
 
 # ---------------------------------------------------------------------------
