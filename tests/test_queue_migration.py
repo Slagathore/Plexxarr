@@ -5,6 +5,7 @@ All migration runs use TEMP copies. The live plex_reset_button.db is NEVER
 touched — the upgraded-DB case copies the verified upgrade-test backup.
 """
 import logging
+import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -14,10 +15,14 @@ import pytest
 import config
 import queue_store
 
-_UPGRADE_BACKUP = Path(
-    "C:/Users/Cole/CodeStuff/_backups/PlexResetButton-20260713/"
-    "plex_reset_button.upgrade-test.db"
-)
+# The live-DB backup fixture lives outside the repo. PLEXXARR_LIVE_BACKUP_DIR
+# points somewhere else on machines/runners that keep a copy; when the file is
+# absent these tests SKIP with a missing-fixture reason. They are NOT
+# platform-marked — they run anywhere the fixture exists.
+_LIVE_BACKUP_DIR = Path(os.environ.get(
+    "PLEXXARR_LIVE_BACKUP_DIR",
+    "C:/Users/Cole/CodeStuff/_backups/PlexResetButton-20260713"))
+_UPGRADE_BACKUP = _LIVE_BACKUP_DIR / "plex_reset_button.upgrade-test.db"
 
 # The 14 open rows that lacked an external identity on the live DB (bootstrap
 # section 0), re-confirmed against the upgrade-test copy.
@@ -68,7 +73,9 @@ def test_fresh_db_boots_and_is_idempotent(monkeypatch, tmp_path):
 @pytest.fixture()
 def upgraded_db(monkeypatch, tmp_path) -> Path:
     if not _UPGRADE_BACKUP.exists():
-        pytest.skip(f"upgrade-test backup not present at {_UPGRADE_BACKUP}")
+        pytest.skip(
+            f"live-DB backup fixture not present at {_UPGRADE_BACKUP} "
+            "(set PLEXXARR_LIVE_BACKUP_DIR to point at a copy)")
     db = tmp_path / "upgrade.db"
     shutil.copy(_UPGRADE_BACKUP, db)
     _point_at(monkeypatch, db)
