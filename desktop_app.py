@@ -5714,44 +5714,15 @@ class DesktopApp:
         threading.Thread(target=worker, name="wizard-install", daemon=True).start()
 
     def _wizard_npm_install(self, status_var: tk.StringVar) -> None:
+        """Seed + npm install the torrent runner. Shares ONE implementation with
+        the automatic first-grab path (download_manager.ensure_runner_ready), so
+        the button and the self-heal can never drift apart."""
         import download_manager as _dm
-        runner_dir = _dm.runner_install_dir()
-        if not runner_dir.is_dir():
-            # Packaged Linux: seed the writable runner dir from the bundled
-            # read-only copy so npm install has something to install into.
-            bundled = Path(config.BUNDLE_DIR) / "torrent_runner"
-            if bundled.is_dir():
-                try:
-                    runner_dir.mkdir(parents=True, exist_ok=True)
-                    for name in ("download.mjs", "package.json",
-                                 "package-lock.json", "diag.mjs"):
-                        src = bundled / name
-                        if src.is_file():
-                            shutil.copy2(src, runner_dir / name)
-                except OSError as exc:
-                    status_var.set(f"Couldn't seed {runner_dir}: {exc}")
-                    return
-        if not runner_dir.is_dir():
-            status_var.set(f"torrent_runner folder not found at {runner_dir}")
-            return
-        # Task S item 2: resolve the real npm binary and run it with
-        # shell=False — no cmd.exe in the middle to reinterpret anything.
-        npm_path = shutil.which("npm") or shutil.which("npm.cmd")
-        if npm_path is None:
-            status_var.set("npm not found on PATH — install Node.js 20+ first.")
-            return
-        status_var.set("Running npm install in torrent_runner/…")
+        status_var.set("Setting up the torrent runner (npm install)…")
 
         def worker() -> None:
-            try:
-                result = subprocess.run(
-                    [npm_path, "install"], cwd=str(runner_dir), shell=False,
-                    capture_output=True, text=True, timeout=600,
-                )
-                msg = ("Torrent runner ready ✔" if result.returncode == 0
-                       else f"npm install failed: {result.stderr[-200:]}")
-            except Exception as exc:
-                msg = f"npm install failed: {exc}"
+            ok, why = _dm.ensure_runner_ready()
+            msg = "Torrent runner ready ✔" if ok else why
             self._post_to_ui(lambda: status_var.set(msg))
 
         threading.Thread(target=worker, name="wizard-npm", daemon=True).start()

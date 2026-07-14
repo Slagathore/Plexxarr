@@ -171,9 +171,14 @@ def test_no_pickle_usage_remains_in_the_cache_owners():
 
 
 def test_npm_install_runs_without_a_shell():
-    src = _source("desktop_app.py")
-    assert "shell=True" not in src
-    assert 'shutil.which("npm")' in src
+    # The npm invocation lives in download_manager.ensure_runner_ready — ONE
+    # implementation shared by the automatic first-grab bootstrap and the setup
+    # wizard's button, so the two can't drift apart on this.
+    dm_src = _source("download_manager.py")
+    assert 'shutil.which("npm")' in dm_src
+    assert "shell=False" in dm_src
+    for module in ("download_manager.py", "desktop_app.py"):
+        assert "shell=True" not in _source(module), f"shell=True in {module}"
 
 
 # ---------------------------------------------------------------------------

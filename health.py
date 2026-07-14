@@ -130,13 +130,13 @@ def run_health_checks(*, bot_running: bool | None = None) -> list[CheckResult]:
     # Same resolution the download pipeline itself uses (Task H: the runner
     # can live beside the exe on Windows or in the data dir on Linux).
     import download_manager
-    runner = download_manager._RUNNER_PATH
-    modules = runner.parent / "node_modules"
-    if runner.is_file():
-        detail = "ready" if modules.is_dir() else "download.mjs found but node_modules missing — run 'npm install' in torrent_runner/"
-        checks.append(CheckResult(modules.is_dir(), "Torrent runner", detail))
+    if download_manager.runner_missing_deps():
+        detail = ("dependencies not installed yet — the first download installs "
+                  "them automatically (needs Node.js 20+ on PATH), or use the "
+                  "setup wizard's 'npm install torrent runner'")
+        checks.append(CheckResult(False, "Torrent runner", detail))
     else:
-        checks.append(CheckResult(False, "Torrent runner", f"missing: {runner}"))
+        checks.append(CheckResult(True, "Torrent runner", "ready"))
 
     # Library paths + free space
     for entry in config.MEDIA_LIBRARY_PATHS:

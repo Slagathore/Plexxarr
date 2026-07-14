@@ -90,6 +90,108 @@ def _resolve_runner_path() -> Path:
 
 _RUNNER_PATH = _resolve_runner_path()
 
+# Runner readiness is checked once per process, then cached: a grab must not
+# shell out to npm on every attempt.
+_RUNNER_READY: bool | None = None
+_RUNNER_READY_LOCK = threading.Lock()
+
+
+def runner_missing_deps(runner_dir: Path | None = None) -> bool:
+    """True when the runner script is there but its node_modules are not.
+
+    This is the state a fresh install lands in: the packaged app ships
+    download.mjs but never node_modules (they are platform-specific native
+    builds), so the first grab used to die with a raw ERR_MODULE_NOT_FOUND and
+    'runner exit code 1'.
+    """
+    runner_dir = runner_dir or runner_install_dir()
+    script = runner_dir / "download.mjs"
+    if not script.is_file():
+        # A packaged install may not have seeded the writable copy yet — that
+        # is still "deps missing" as far as the caller is concerned.
+        return True
+    return not (runner_dir / "node_modules" / "webtorrent").is_dir()
+
+
+def seed_runner_dir(runner_dir: Path | None = None) -> Path:
+    """Copy the runner scripts out of the read-only bundle into the writable
+    runner dir (packaged installs: the bundle may sit under a read-only prefix,
+    and npm needs somewhere it can write node_modules)."""
+    runner_dir = runner_dir or runner_install_dir()
+    if (runner_dir / "download.mjs").is_file():
+        return runner_dir
+    import app_paths
+    sources = [
+        app_paths.PATHS.install_dir / "_internal" / "torrent_runner",
+        app_paths.PATHS.bundle_dir / "torrent_runner",
+        app_paths.PATHS.install_dir / "torrent_runner",
+    ]
+    bundled = next((s for s in sources if (s / "download.mjs").is_file()), None)
+    if bundled is None:
+        return runner_dir
+    runner_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("download.mjs", "diag.mjs", "package.json", "package-lock.json"):
+        src = bundled / name
+        if src.is_file():
+            shutil.copy2(src, runner_dir / name)
+    logger.info("Seeded torrent runner into %s from %s", runner_dir, bundled)
+    return runner_dir
+
+
+def ensure_runner_ready(*, timeout: int = 600) -> tuple[bool, str]:
+    """Make the Node runner usable, installing its dependencies if needed.
+
+    Called automatically before the first grab of a process (and by the setup
+    wizard's button, which shares this one implementation). Returns
+    (ok, message); a False result carries a message written for a human, not a
+    stack trace, because it lands on the download row the user is staring at.
+    """
+    global _RUNNER_READY, _RUNNER_PATH
+    with _RUNNER_READY_LOCK:
+        if _RUNNER_READY:
+            return True, "runner ready"
+
+        runner_dir = seed_runner_dir()
+        if not (runner_dir / "download.mjs").is_file():
+            return False, (
+                "the torrent runner script is missing and no bundled copy was "
+                f"found to restore it (looked in {runner_dir})")
+
+        if not runner_missing_deps(runner_dir):
+            _RUNNER_PATH = runner_dir / "download.mjs"
+            _RUNNER_READY = True
+            return True, "runner ready"
+
+        npm = shutil.which("npm") or shutil.which("npm.cmd")
+        if npm is None:
+            return False, (
+                "Node.js 20+ is required for downloads but npm was not found on "
+                "PATH. Install Node.js, then either restart Plexxarr or use "
+                "Settings > Setup wizard > 'npm install torrent runner'.")
+
+        logger.info("Torrent runner dependencies missing — running npm install "
+                    "in %s (first run only).", runner_dir)
+        try:
+            # Task S item 2: real binary, no shell in the middle.
+            result = subprocess.run(
+                [npm, "install", "--no-audit", "--no-fund"],
+                cwd=str(runner_dir), shell=False, capture_output=True,
+                text=True, timeout=timeout, creationflags=_CREATE_NO_WINDOW)
+        except subprocess.TimeoutExpired:
+            return False, (f"npm install timed out after {timeout}s in "
+                           f"{runner_dir} — run it by hand and try again.")
+        except OSError as exc:
+            return False, f"couldn't run npm install: {exc}"
+
+        if result.returncode != 0 or runner_missing_deps(runner_dir):
+            tail = (result.stderr or result.stdout or "")[-300:].strip()
+            return False, (f"npm install failed in {runner_dir}: {tail}")
+
+        _RUNNER_PATH = runner_dir / "download.mjs"
+        _RUNNER_READY = True
+        logger.info("Torrent runner dependencies installed.")
+        return True, "runner dependencies installed"
+
 
 def _size_prefs(media_type: str) -> tuple[float, float, int]:
     """(preferred MB/min, max MB/min, fallback runtime minutes) per type.
@@ -2508,6 +2610,20 @@ class DownloadManager:
 
     def _run_download_node(self, download_id: int, magnet: str, staging: str,
                            request_title: str | None) -> None:
+        # A fresh install ships the runner script without node_modules (they are
+        # platform-specific native builds). Install them on the first grab
+        # instead of failing with a raw ERR_MODULE_NOT_FOUND behind an opaque
+        # "runner exit code 1".
+        ready, why = ensure_runner_ready()
+        if not ready:
+            downloads_store.set_status(
+                download_id, "error", error=why, completed=True)
+            downloads_store.add_history(
+                download_id, "error", before=None, after=why)
+            self._notify(download_id)
+            self._maybe_start_next()
+            return
+
         cmd = [
             config.NODE_PATH, str(_RUNNER_PATH), magnet, staging,
             str(config.TORRENT_STALL_TIMEOUT_SECONDS),
@@ -2571,6 +2687,14 @@ class DownloadManager:
             return
 
         if error_message or proc.returncode not in (0, None):
+            # A missing-module exit is a setup problem, not a torrent problem —
+            # say so plainly instead of leaving "exit code 1" on the row.
+            if (error_message is None and proc.returncode not in (0, None)
+                    and runner_missing_deps()):
+                error_message = (
+                    "the torrent runner's dependencies are missing. Install "
+                    "Node.js 20+ and restart Plexxarr, or use Settings > Setup "
+                    "wizard > 'npm install torrent runner'.")
             downloads_store.set_status(
                 download_id, "error",
                 error=error_message or f"runner exit code {proc.returncode}",
