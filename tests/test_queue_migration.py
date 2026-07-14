@@ -171,6 +171,17 @@ def test_auto_grab_skips_needs_identity_with_logged_reason(
         download_manager.DownloadManager, "_recover_previous_session",
         lambda self: None)
     monkeypatch.setattr(download_manager, "search_torrents", lambda *a, **k: [])
+    # Phase 3 routes every automatic path through search_collect (not
+    # search_torrents above) — the upgraded-DB copy carries real open
+    # requests with identities, so without this auto_grab_open_requests
+    # performs a real YTS/TPB/nyaa search per row.
+    from torrent_search import CollectedPool
+    monkeypatch.setattr(
+        download_manager, "search_collect",
+        lambda *a, **k: CollectedPool(results=tuple(), pool_stats={}))
+    # And the movie-runtime lookup (real TMDB call) for each open movie row.
+    monkeypatch.setattr(
+        download_manager, "_request_movie_minutes", lambda *a, **k: None)
     grabbed_request_ids = []
     monkeypatch.setattr(
         download_manager.DownloadManager, "grab",
