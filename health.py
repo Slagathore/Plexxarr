@@ -131,9 +131,9 @@ def run_health_checks(*, bot_running: bool | None = None) -> list[CheckResult]:
     # can live beside the exe on Windows or in the data dir on Linux).
     import download_manager
     if download_manager.runner_missing_deps():
-        detail = ("dependencies not installed yet — the first download installs "
+        detail = ("dependencies not installed yet. The first download installs "
                   "them automatically (needs Node.js 20+ on PATH), or use the "
-                  "setup wizard's 'npm install torrent runner'")
+                  "setup wizard's 'npm install torrent runner'.")
         checks.append(CheckResult(False, "Torrent runner", detail))
     else:
         checks.append(CheckResult(True, "Torrent runner", "ready"))

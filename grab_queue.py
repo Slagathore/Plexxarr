@@ -118,8 +118,8 @@ def request_rows() -> list[GrabQueueRow]:
         if req.status == queue_store.STATUS_NEEDS_IDENTITY:
             rows.append(GrabQueueRow(
                 row_type=ROW_NEEDS_IDENTITY,
-                reason="no provider-qualified identity — resolve to enable "
-                       "auto-grab",
+                reason="no provider-qualified identity. Resolve it to enable "
+                       "auto-grab.",
                 **common))
         elif req.status == queue_store.STATUS_NEEDS_ATTENTION:
             rows.append(GrabQueueRow(
