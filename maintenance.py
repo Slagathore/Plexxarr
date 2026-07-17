@@ -234,7 +234,7 @@ def daily_library_check() -> dict:
     def _close_if_satisfied(req) -> bool:
         """A request whose identity is genuinely in the library is DONE — close
         it (fulfilled, library_verified_at stamped, placed_at left NULL so it
-        reads as 'you already had this' rather than 'Plexxarr placed it'). Only
+        reads as 'you already had this' rather than 'Sensarr placed it'). Only
         from open/deferred; never yanks an in-flight grab. Returns True if it
         closed one."""
         if (_closeable_on_library_match(req)
@@ -809,7 +809,7 @@ def delete_files_with_cleanup(
             try:
                 from library_index import log_file_event
                 log_file_event("removed", raw_path,
-                               "deleted via Plexxarr (user-confirmed, recycle bin)")
+                               "deleted via Sensarr (user-confirmed, recycle bin)")
             except Exception:
                 pass
         except OSError as exc:

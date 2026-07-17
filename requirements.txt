@@ -1,4 +1,4 @@
-# Core dependencies for PlexResetButton
+# Core dependencies for Sensarr
 # Install with: pip install -r requirements.txt
 
 # Telegram bot framework

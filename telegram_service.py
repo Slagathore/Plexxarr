@@ -235,7 +235,7 @@ class TelegramBotService:
             if app.updater is None:
                 raise RuntimeError("Telegram updater was not created.")
             await app.updater.start_polling()
-            logger.info("PlexResetButton bot started. Waiting for commands...")
+            logger.info("Sensarr bot started. Waiting for commands...")
             self._ready.set()
             await self._stop_event.wait()
         finally:

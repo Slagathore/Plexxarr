@@ -1,36 +1,38 @@
-; Plexxarr Windows installer (Inno Setup 6)
+; Sensarr Windows installer (Inno Setup 6)
 ;
 ; Wraps the PyInstaller onedir bundle (the same folder zipped into
-; Plexxarr-<ver>-windows-x64.zip) in a per-user installer with Start Menu
+; Sensarr-<ver>-windows-x64.zip) in a per-user installer with Start Menu
 ; shortcuts and a clean uninstaller. This does NOT rebuild the app -- point
 ; SourceDir at an already-built (and already-signed, if you're doing a real
-; release) bundle folder that contains Plexxarr.exe directly.
+; release) bundle folder that contains Sensarr.exe directly.
 ;
 ; Required command-line defines (ISCC /D...):
 ;   AppVersion  e.g. 1.2          -- must match config.py APP_VERSION
-;   SourceDir   e.g. C:\...\dist\20260713-...\Plexxarr   -- the onedir bundle
-;                (the folder that directly contains Plexxarr.exe)
+;   SourceDir   e.g. C:\...\dist\20260713-...\Sensarr   -- the onedir bundle
+;                (the folder that directly contains Sensarr.exe)
 ;
 ; Example:
-;   ISCC.exe /DAppVersion=1.2 /DSourceDir="C:\path\to\dist\...\Plexxarr" ^
+;   ISCC.exe /DAppVersion=1.2 /DSourceDir="C:\path\to\dist\...\Sensarr" ^
 ;            packaging\installer.iss
 ;
-; Output: Plexxarr-<AppVersion>-Setup.exe in packaging\Output\
+; Output: Sensarr-<AppVersion>-Setup.exe in packaging\Output\
 
 #ifndef AppVersion
   #error AppVersion is required, e.g. ISCC /DAppVersion=1.2 installer.iss
 #endif
 
 #ifndef SourceDir
-  #error SourceDir is required, e.g. ISCC /DSourceDir="C:\path\to\dist\...\Plexxarr" installer.iss
+  #error SourceDir is required, e.g. ISCC /DSourceDir="C:\path\to\dist\...\Sensarr" installer.iss
 #endif
 
-#define AppName "Plexxarr"
+#define AppName "Sensarr"
 #define AppPublisher "Charles Chambers"
-#define AppURL "https://github.com/Slagathore/Plexxarr"
-#define AppExeName "Plexxarr.exe"
+#define AppURL "https://github.com/Slagathore/Sensarr"
+#define AppExeName "Sensarr.exe"
 
 [Setup]
+; AppId is the original Plexxarr install GUID on purpose: existing installs
+; upgrade in place under the new name. Never change it.
 AppId={{8F2B6C7A-6E3D-4C6E-9C0E-3B7E6F1A9D2A}
 AppName={#AppName}
 AppVersion={#AppVersion}
@@ -44,7 +46,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=Output
 OutputBaseFilename={#AppName}-{#AppVersion}-Setup
-SetupIconFile=..\assets\plexxarr.ico
+SetupIconFile=..\assets\sensarr.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 Compression=lzma2
 SolidCompression=yes

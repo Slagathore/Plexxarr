@@ -370,7 +370,7 @@ def test_reconcile_closes_movie_already_in_library(monkeypatch):
     assert r.status == queue_store.STATUS_FULFILLED       # actually closes now
     assert r.found_in_library is True
     assert r.library_verified_at is not None              # library-satisfied
-    assert r.placed_at is None                            # not a Plexxarr placement
+    assert r.placed_at is None                            # not a Sensarr placement
     assert summary["fulfilled_from_library"] >= 1
 
 

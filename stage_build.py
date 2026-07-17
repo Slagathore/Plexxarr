@@ -1,7 +1,7 @@
 # =============================================================================
 # stage_build.py
 # =============================================================================
-# Prepares the newest dist\<timestamp>\Plexxarr bundle for actual use:
+# Prepares the newest dist\<timestamp>\Sensarr bundle for actual use:
 #
 #   1. Copies your .env next to the EXE (the EXE reads config from ITS OWN
 #      folder), then pins APP_DB_PATH and TORRENT_DOWNLOAD_DIR to absolute
@@ -10,7 +10,7 @@
 #   2. Copies the offline AniDB title dump and tracker cache so the new
 #      bundle doesn't need to re-download them.
 #
-# Run directly (python stage_build.py) or let update_plexxarr.bat call it.
+# Run directly (python stage_build.py) or let update_sensarr.bat call it.
 # =============================================================================
 
 import shutil
@@ -26,7 +26,7 @@ def newest_bundle() -> Path | None:
         return None
     for stamp in sorted((d for d in dist.iterdir() if d.is_dir()),
                         key=lambda d: d.name, reverse=True):
-        for name in ("Plexxarr", "PlexResetButton"):
+        for name in ("Sensarr", "Plexxarr", "PlexResetButton"):
             exe = stamp / name / f"{name}.exe"
             if exe.is_file():
                 return exe.parent

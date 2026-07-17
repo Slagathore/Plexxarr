@@ -22,7 +22,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-GITHUB_REPO = "Slagathore/Plexxarr"
+GITHUB_REPO = "Slagathore/Sensarr"
 
 _PLEX_DOWNLOADS_URL = "https://plex.tv/api/downloads/5.json"
 _TIMEOUT = 10

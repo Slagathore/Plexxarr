@@ -71,6 +71,7 @@ anime_meta.sqlite-*
 unidentified_folders.json
 watchlist_recs.pkl
 watchlist_recs.json
+sensarr.pid
 plexxarr.pid
 
 # Private audit notes, never commit

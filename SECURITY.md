@@ -1,6 +1,6 @@
 # Security notes
 
-Plexxarr is a single user desktop app that runs on the same box as your Plex
+Sensarr is a single user desktop app that runs on the same box as your Plex
 server, on Windows or Linux. There is no cloud service, no account, and no
 telemetry. Everything below is about what the app does on your machine and what
 it talks to, so you can decide if that trust model works for you.
@@ -49,8 +49,8 @@ sees your library contents, only request text.
 On Windows everything sits in the install folder: the SQLite database (requests,
 shows, downloads, run history), the JSON caches, and .env. On Linux the app
 follows the XDG directories instead, because a packaged install must never write
-beside read only code: .env lives in ~/.config/plexxarr, the databases in
-~/.local/share/plexxarr, caches in ~/.cache/plexxarr, and those folders are
+beside read only code: .env lives in ~/.config/sensarr, the databases in
+~/.local/share/sensarr, caches in ~/.cache/sensarr, and those folders are
 created with permissions only your user can read.
 
 The database and .env are plaintext on both platforms. .env holds your Plex
@@ -82,7 +82,7 @@ lands, the pin moves.
 ## Reporting an issue
 
 If you find a security problem, open an issue at
-https://github.com/Slagathore/Plexxarr/issues. If it is something you would
+https://github.com/Slagathore/Sensarr/issues. If it is something you would
 rather not post publicly, open a bare issue that just says "security, want a
 private channel" and I will sort one out. Please include your app version and
 enough detail to reproduce.

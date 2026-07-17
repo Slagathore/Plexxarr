@@ -1,5 +1,5 @@
 # =============================================================================
-# PlexResetButton — bot.py
+# Sensarr — bot.py
 # =============================================================================
 # Mission: Provide a Telegram bot interface for remotely controlling Plex Media
 # Server on a Windows machine. Goals: launch, optional hard reset (admin-gated

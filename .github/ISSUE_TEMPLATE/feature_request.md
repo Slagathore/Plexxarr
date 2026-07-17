@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: Something Plexxarr should do
+about: Something Sensarr should do
 labels: enhancement
 ---
 

@@ -7,8 +7,8 @@
 # the zipped build attached. Every installed copy checks during the nightly
 # pass and shows a dismissable banner on the Status tab.
 #
-# Emergencies: put a line starting with  PLEXXARR-URGENT:  in the release
-# notes ("PLEXXARR-URGENT: fixes a bug that can delete library files —
+# Emergencies: put a line starting with  SENSARR-URGENT:  in the release
+# notes ("SENSARR-URGENT: fixes a bug that can delete library files —
 # update today"). Urgent releases ignore the user's dismiss/mute choices,
 # show a red banner every launch, and pop the message once per session.
 # =============================================================================
@@ -29,8 +29,8 @@ import config
 
 logger = logging.getLogger(__name__)
 
-REPO = "Slagathore/Plexxarr"
-URGENT_MARKER = "PLEXXARR-URGENT:"
+REPO = "Slagathore/Sensarr"
+URGENT_MARKER = "SENSARR-URGENT:"
 _API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
 
 
@@ -122,7 +122,7 @@ def stage_self_update(info: UpdateInfo, on_status=None) -> str:
         raise RuntimeError("Self-update is only available on Windows. "
                            + manual_update_hint())
     assert info.zip_url, "no zip asset on the release"
-    work = Path(tempfile.mkdtemp(prefix="plexxarr-update-"))
+    work = Path(tempfile.mkdtemp(prefix="sensarr-update-"))
     zip_path = work / "update.zip"
 
     status(f"Downloading v{info.version}…")
@@ -165,7 +165,7 @@ def stage_self_update(info: UpdateInfo, on_status=None) -> str:
         f"echo Installing v{info.version}...\r\n"
         f"robocopy \"{src_dir}\" \"{install_dir}\" /E /R:3 /W:2 "
         "/XF .env *.db *.db-shm *.db-wal *.pkl *.sqlite *.sqlite-* "
-        "plexxarr.pid unidentified_folders.json trackers_cache.txt "
+        "sensarr.pid plexxarr.pid unidentified_folders.json trackers_cache.txt "
         "maintenance_cache.json library_lowqual.json watchlist_recs.json\r\n"
         f"start \"\" \"{install_dir / exe_name}\"\r\n"
         f"rmdir /S /Q \"{work}\"\r\n",

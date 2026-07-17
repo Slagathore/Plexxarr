@@ -30,7 +30,7 @@ import media_identity
 
 logger = logging.getLogger(__name__)
 
-_USER_AGENT = f"PlexResetButton/{config.APP_VERSION} (household-media-manager)"
+_USER_AGENT = f"Sensarr/{config.APP_VERSION} (household-media-manager)"
 
 
 # ---------------------------------------------------------------------------

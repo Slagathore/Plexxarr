@@ -42,7 +42,7 @@ DOTENV_PATH: Path = app_paths.PATHS.config_dir / ".env"
 # (tests/CI/smoke) — an explicit pin means "only look there".
 _LEGACY_DOTENV: Path = app_paths.PATHS.install_dir / ".env"
 if (not DOTENV_PATH.is_file() and _LEGACY_DOTENV.is_file()
-        and not os.getenv("PLEXXARR_CONFIG_DIR")):
+        and not os.getenv("SENSARR_CONFIG_DIR")):
     DOTENV_PATH = _LEGACY_DOTENV
 
 load_dotenv = _load_dotenv_func()
@@ -105,7 +105,7 @@ def _parse_id_list(raw: str) -> tuple[int, ...]:
 TELEGRAM_ALLOWED_USER_IDS: tuple[int, ...] = _parse_id_list(
     os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
 )
-APP_PRODUCT_NAME: str = "Plexxarr"
+APP_PRODUCT_NAME: str = "Sensarr"
 APP_VERSION: str = "1.3.2"
 
 # How long (seconds) to pause between each process-gone check after Exit is clicked.
@@ -187,7 +187,7 @@ PLEX_LIBRARY_PATHS: list[str] = [p.path for p in MEDIA_LIBRARY_PATHS]
 
 # In-app update notifications (nightly GitHub release check). SKIPPED
 # remembers "dismiss until next release"; NOTIFY=false mutes non-urgent
-# banners forever. Urgent releases (PLEXXARR-URGENT marker) ignore both.
+# banners forever. Urgent releases (SENSARR-URGENT marker) ignore both.
 UPDATE_NOTIFY: bool = _env_bool("UPDATE_NOTIFY", True)
 UPDATE_SKIPPED_VERSION: str = os.getenv("UPDATE_SKIPPED_VERSION", "").strip()
 

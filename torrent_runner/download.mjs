@@ -1,5 +1,5 @@
 // =============================================================================
-// download.mjs — headless webtorrent downloader for PlexResetButton
+// download.mjs — headless webtorrent downloader for Sensarr
 // =============================================================================
 // Usage: node download.mjs <magnet-uri> <destination-dir> [stallTimeoutSec]
 //

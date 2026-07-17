@@ -61,7 +61,7 @@ _SOURCE_ID_RES = {
 
 def _db_path() -> Path:
     # DATA dir of the path contract — the executable's folder on Windows
-    # (unchanged layout), ~/.local/share/plexxarr on Linux.
+    # (unchanged layout), ~/.local/share/sensarr on Linux.
     import app_paths
     return app_paths.PATHS.data_dir / DB_FILE
 

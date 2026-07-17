@@ -166,7 +166,7 @@ def ensure_runner_ready(*, timeout: int = 600) -> tuple[bool, str]:
         if npm is None:
             return False, (
                 "Node.js 20+ is required for downloads but npm was not found on "
-                "PATH. Install Node.js, then either restart Plexxarr or use "
+                "PATH. Install Node.js, then either restart Sensarr or use "
                 "Settings > Setup wizard > 'npm install torrent runner'.")
 
         logger.info("Torrent runner dependencies missing — running npm install "
@@ -569,7 +569,7 @@ def _public_trackers() -> list[str]:
     try:
         if (not _TRACKERS_CACHE.is_file()
                 or time.time() - _TRACKERS_CACHE.stat().st_mtime > _TRACKERS_MAX_AGE_S):
-            req = urllib.request.Request(_TRACKERS_URL, headers={"User-Agent": "PlexResetButton"})
+            req = urllib.request.Request(_TRACKERS_URL, headers={"User-Agent": "Sensarr"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 _TRACKERS_CACHE.write_bytes(resp.read())
     except Exception as exc:
@@ -2693,7 +2693,7 @@ class DownloadManager:
                     and runner_missing_deps()):
                 error_message = (
                     "the torrent runner's dependencies are missing. Install "
-                    "Node.js 20+ and restart Plexxarr, or use Settings > Setup "
+                    "Node.js 20+ and restart Sensarr, or use Settings > Setup "
                     "wizard > 'npm install torrent runner'.")
             downloads_store.set_status(
                 download_id, "error",
@@ -3081,7 +3081,7 @@ class DownloadManager:
                 try:
                     from library_index import log_file_event
                     log_file_event("added", str(target),
-                                   f"downloaded by Plexxarr (download #{download_id})")
+                                   f"downloaded by Sensarr (download #{download_id})")
                 except Exception:
                     pass
             elif target_name != src.name:
@@ -3124,7 +3124,7 @@ class DownloadManager:
                             remove_from_index([str(old)])
                             log_file_event(
                                 "replaced", str(old),
-                                f"low-quality copy recycled by Plexxarr — "
+                                f"low-quality copy recycled by Sensarr — "
                                 f"superseded by download #{download_id}")
                         except Exception:
                             pass

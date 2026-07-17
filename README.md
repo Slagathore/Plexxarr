@@ -1,8 +1,8 @@
-# Plexxarr
+# Sensarr
 
-**Your whole media-server stack in one Windows app.** Plexxarr is a free, open source Plex companion that replaces the Sonarr + Radarr + request-portal + indexer + download-client pile with a single EXE. Your household requests shows over Telegram; Plexxarr finds them, downloads them, names them properly, files them into the right library, and keeps every tracked show complete. Anime gets first-class treatment from a bundled 41,000-title offline database.
+**Your whole media-server stack in one Windows app.** Sensarr is a free, open source Plex companion that replaces the Sonarr + Radarr + request-portal + indexer + download-client pile with a single EXE. Your household requests shows over Telegram; Sensarr finds them, downloads them, names them properly, files them into the right library, and keeps every tracked show complete. Anime gets first-class treatment from a bundled 41,000-title offline database.
 
-[![Latest release](https://img.shields.io/github/v/release/Slagathore/Plexxarr)](../../releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/Slagathore/Sensarr)](../../releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
 ![Python](https://img.shields.io/badge/python-3.11+-3776ab)
@@ -10,11 +10,11 @@
 
 ![Demo](docs/demo.gif)
 
-*(formerly PlexResetButton; the old repo URL redirects)*
+*(formerly Plexxarr, and PlexResetButton before that; old repo URLs redirect)*
 
 ## Quick start
 
-1. Download the [latest release](../../releases/latest). The installer (`Plexxarr-<ver>-Setup.exe`) is the easiest path: it installs to your user folder and adds Start Menu shortcuts. The zip has everything (unzip anywhere, run `Plexxarr.exe`); the portable exe is a single file that fetches its anime database on first run. All three are code-signed (publisher: Charles Chambers; see [SIGNING.md](SIGNING.md)). Accept the UAC prompt; it needs that to manage Plex.
+1. Download the [latest release](../../releases/latest). The installer (`Sensarr-<ver>-Setup.exe`) is the easiest path: it installs to your user folder and adds Start Menu shortcuts. The zip has everything (unzip anywhere, run `Sensarr.exe`); the portable exe is a single file that fetches its anime database on first run. All three are code-signed (publisher: Charles Chambers; see [SIGNING.md](SIGNING.md)). Accept the UAC prompt; it needs that to manage Plex.
 2. The Setup Wizard opens on first run and walks you through the annoying parts: it opens [@BotFather](https://t.me/BotFather) so you can create your Telegram bot (paste the token back and it validates it live), offers one-click winget installs of Node.js and Ollama, and won't save a config that doesn't work. Telegram is skippable; the desktop app works fine on its own.
 3. In Settings: add your library folders (tagged movie / tv / anime) and click **Get Plex Token**. A browser PIN page opens, you approve it, done.
 
@@ -60,7 +60,7 @@ No Docker, no YAML, no reverse proxy. Message your bot from the couch.
 
 ## Why not just run the *arr stack?
 
-If Sonarr + Radarr + Prowlarr + Overseerr + qBittorrent behind Docker fits your life, run it; it's the power-user standard for a reason. Plexxarr is for the other case: one Windows machine, Plex already on it, and no appetite for maintaining five services to automate one library. One EXE, one wizard, and the pieces already know about each other. If you're attached to qBittorrent, Plexxarr will use it as the download engine.
+If Sonarr + Radarr + Prowlarr + Overseerr + qBittorrent behind Docker fits your life, run it; it's the power-user standard for a reason. Sensarr is for the other case: one Windows machine, Plex already on it, and no appetite for maintaining five services to automate one library. One EXE, one wizard, and the pieces already know about each other. If you're attached to qBittorrent, Sensarr will use it as the download engine.
 
 <details>
 <summary><b>Screenshots</b></summary>
@@ -91,25 +91,25 @@ If Sonarr + Radarr + Prowlarr + Overseerr + qBittorrent behind Docker fits your 
 
 ## Privacy
 
-Everything runs and stays on your machine. No server of ours, no accounts, no telemetry. Your config lives in a local `.env` (git-ignored); your request, show, and download history live in local SQLite files next to the app. The network connections Plexxarr makes, each only when the feature is used: the Telegram Bot API (your bot), your own Plex server and plex.tv (auth, watchlists), the metadata sources (TMDB/TVDB keys optional; AniList/Jikan/AniDB for anime), torrent indexers when a search runs, a public tracker-list refresh, and the weekly anime-database rebuild from GitHub. The optional LLM categorization runs on your own Ollama with a ~1 GB local model by default (`gemma3:1b`); request text never leaves your machine unless you deliberately configure a `:cloud` model tag.
+Everything runs and stays on your machine. No server of ours, no accounts, no telemetry. Your config lives in a local `.env` (git-ignored); your request, show, and download history live in local SQLite files next to the app. The network connections Sensarr makes, each only when the feature is used: the Telegram Bot API (your bot), your own Plex server and plex.tv (auth, watchlists), the metadata sources (TMDB/TVDB keys optional; AniList/Jikan/AniDB for anime), torrent indexers when a search runs, a public tracker-list refresh, and the weekly anime-database rebuild from GitHub. The optional LLM categorization runs on your own Ollama with a ~1 GB local model by default (`gemma3:1b`); request text never leaves your machine unless you deliberately configure a `:cloud` model tag.
 
 ## Disclaimer
 
-Plexxarr is an unofficial tool, not affiliated with or endorsed by Plex, Inc. (or Telegram, TMDB, TVDB, AniDB, AniList, or any indexer). It includes a general-purpose BitTorrent client and searches public indexers. BitTorrent is a neutral protocol, and you are solely responsible for what you search for, download, and share. Use it for content you have the rights to, in accordance with the laws where you live. The software is provided as is, with no warranty of any kind.
+Sensarr is an unofficial tool, not affiliated with or endorsed by Plex, Inc. (or Telegram, TMDB, TVDB, AniDB, AniList, or any indexer). Plex is a trademark of Plex, Inc.; the name appears here only to say what the app works with. It includes a general-purpose BitTorrent client and searches public indexers. BitTorrent is a neutral protocol, and you are solely responsible for what you search for, download, and share. Use it for content you have the rights to, in accordance with the laws where you live. The software is provided as is, with no warranty of any kind.
 
 ## Running from source
 
 Packaged builds need nothing installed. From source: Python 3.11+, plus Node.js if you use the built-in download engine (`npm install` inside `torrent_runner/`; the wizard can do this for you).
 
 ```powershell
-git clone https://github.com/Slagathore/Plexxarr.git
-cd Plexxarr
+git clone https://github.com/Slagathore/Sensarr.git
+cd Sensarr
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 python main.py     # first run opens the Setup Wizard
 ```
 
-Build your own EXE with `build_exe.bat` (needs `pip install -r requirements-build.txt`, which is just PyInstaller). Output lands in `dist\<timestamp>\Plexxarr\Plexxarr.exe`. Register autostart-at-login with `setup_autostart.bat`; remove it with `remove_autostart.bat`.
+Build your own EXE with `build_exe.bat` (needs `pip install -r requirements-build.txt`, which is just PyInstaller). Output lands in `dist\<timestamp>\Sensarr\Sensarr.exe`. Register autostart-at-login with `setup_autostart.bat`; remove it with `remove_autostart.bat`.
 
 ### Linux
 
@@ -117,8 +117,8 @@ Ubuntu LTS (x86_64, Python 3.11+) is the reference target; other distros should 
 
 ```bash
 sudo apt install python3-tk ffmpeg xdg-utils
-git clone https://github.com/Slagathore/Plexxarr.git
-cd Plexxarr
+git clone https://github.com/Slagathore/Sensarr.git
+cd Sensarr
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env
 .venv/bin/python main.py     # first run opens the Setup Wizard
@@ -126,11 +126,11 @@ cp .env.example .env
 
 Node.js 20+ enables the built-in download engine, same as Windows (`npm install` inside `torrent_runner/`, or use the wizard button). A few things work differently on Linux by design:
 
-- Data follows the XDG directories instead of sitting beside the code: `.env` in `~/.config/plexxarr`, databases in `~/.local/share/plexxarr`, caches in `~/.cache/plexxarr`, downloads staging in `~/.local/share/plexxarr/downloads` unless you set `TORRENT_DOWNLOAD_DIR`. An existing install that kept files beside the code gets a one-time migration offer with a full dry run before anything moves.
+- Data follows the XDG directories instead of sitting beside the code: `.env` in `~/.config/sensarr`, databases in `~/.local/share/sensarr`, caches in `~/.cache/sensarr`, downloads staging in `~/.local/share/sensarr/downloads` unless you set `TORRENT_DOWNLOAD_DIR`. An existing install that kept files beside the code gets a one-time migration offer with a full dry run before anything moves.
 - The app never runs your package manager and never asks for root. The wizard's "Check Linux dependencies" button names anything missing and prints the commands for you to run.
 - The tray icon needs an X11/XWayland session (python-xlib installs with the requirements). Without one the window still works and says "tray unavailable"; closing the window minimizes instead of hiding.
 - Local Plex buttons (Launch, Hard Reset) only enable when a local Plex install or process is found, or `PLEX_MEDIA_SERVER_PATH` points at a real executable. A remote-only Plex still gets every API feature.
-- Self update is off. Update a source checkout with `git pull`; replace a packaged build with the new artifact from the release page (CI builds one per push: the `plexxarr-linux` artifact from the linux-smoke workflow).
+- Self update is off. Update a source checkout with `git pull`; replace a packaged build with the new artifact from the release page (CI builds one per push: the `sensarr-linux` artifact from the linux-smoke workflow).
 
 <details>
 <summary><b>Configuration (.env)</b></summary>
@@ -227,7 +227,7 @@ Anime identification runs on a local database rebuilt weekly from these communit
 
 ## Acknowledgements
 
-The download pipeline is modeled on [torlink](https://github.com/baairon/torlink) by **bairon** ([bairon.dev](https://bairon.dev), MIT). The per-category source registry, the webtorrent engine choice, and stop-seeding-on-complete all follow torlink's design. torlink is an interactive terminal app, so Plexxarr reimplements the pipeline headlessly rather than embedding his code, but the architecture is his. Thanks, bairon.
+The download pipeline is modeled on [torlink](https://github.com/baairon/torlink) by **bairon** ([bairon.dev](https://bairon.dev), MIT). The per-category source registry, the webtorrent engine choice, and stop-seeding-on-complete all follow torlink's design. torlink is an interactive terminal app, so Sensarr reimplements the pipeline headlessly rather than embedding his code, but the architecture is his. Thanks, bairon.
 
 ## Support
 

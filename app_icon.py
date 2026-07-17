@@ -1,16 +1,18 @@
 # =============================================================================
 # app_icon.py
 # =============================================================================
-# The one Plexxarr mark, drawn in code so the tray icon, the window/taskbar
-# icon, and the generated .ico can never drift apart: Plex-orange rounded
-# square, white play triangle, double-chevron ">>" tail (the "arr").
-# Run this file directly to regenerate assets/plexxarr.ico for the EXE build.
+# The one Sensarr mark, drawn in code so the tray icon, the window/taskbar
+# icon, and the generated .ico can never drift apart: deep indigo rounded
+# square with a white double chevron ">>" — the "arr" motion. Nothing in it
+# borrows from anyone's brand; the pre-rename mark used Plex's amber and
+# play triangle, and both went out with the name.
+# Run this file directly to regenerate assets/sensarr.ico for the EXE build.
 # =============================================================================
 
 from PIL import Image, ImageDraw
 
-_BG = (229, 160, 13, 255)      # plex amber
-_FG = (24, 28, 36, 255)        # near-black marks
+_BG = (91, 79, 207, 255)       # deep indigo
+_FG = (245, 246, 250, 255)     # near-white marks
 
 
 def icon_image(size: int = 64) -> Image.Image:
@@ -20,19 +22,17 @@ def icon_image(size: int = 64) -> Image.Image:
     d = ImageDraw.Draw(img)
     d.rounded_rectangle((2 * s, 2 * s, 62 * s, 62 * s),
                         radius=14 * s, fill=_BG)
-    # play triangle, weighted left
-    d.polygon([(18 * s, 16 * s), (18 * s, 48 * s), (40 * s, 32 * s)], fill=_FG)
-    # the "arr": two chevrons continuing the motion
-    for x0 in (38, 48):
+    # the ">>": two chevrons, centered, carrying the motion
+    for x0 in (15, 33):
         d.polygon([
-            (x0 * s, 20 * s), (x0 * s + 8 * s, 32 * s), (x0 * s, 44 * s),
-            (x0 * s + 4 * s, 44 * s), (x0 * s + 12 * s, 32 * s),
-            (x0 * s + 4 * s, 20 * s),
+            (x0 * s, 16 * s), (x0 * s + 9 * s, 32 * s), (x0 * s, 48 * s),
+            (x0 * s + 5 * s, 48 * s), (x0 * s + 14 * s, 32 * s),
+            (x0 * s + 5 * s, 16 * s),
         ], fill=_FG)
     return img
 
 
-def write_ico(dest: str = "assets/plexxarr.ico") -> str:
+def write_ico(dest: str = "assets/sensarr.ico") -> str:
     from pathlib import Path
     path = Path(__file__).parent / dest
     path.parent.mkdir(parents=True, exist_ok=True)

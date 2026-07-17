@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 echo ============================================
-echo  Plexxarr - Autostart Setup
+echo  Sensarr - Autostart Setup
 echo ============================================
 echo.
 
@@ -16,11 +16,12 @@ echo Project directory: %SCRIPT_DIR%
 echo.
 
 :: --------------------------------------------------------------------------
-:: Find the NEWEST built EXE. Builds land in dist\<timestamp>\PlexResetButton\
+:: Find the NEWEST built EXE. Builds land in dist\<timestamp>\Sensarr\
 :: (timestamp names sort chronologically), so the last match is the newest.
-:: A legacy build at dist\PlexResetButton\ is used only if no timestamped
-:: build exists. This means every rebuild is picked up automatically and you
-:: never accidentally auto-start a stale binary.
+:: Pre-rename builds (Plexxarr, PlexResetButton) still count as fallbacks,
+:: with the Sensarr build winning inside the same timestamp. This means every
+:: rebuild is picked up automatically and you never accidentally auto-start a
+:: stale binary.
 :: --------------------------------------------------------------------------
 set "EXE_PATH="
 for /f "delims=" %%D in ('dir /b /ad /on "%SCRIPT_DIR%\dist" 2^>nul') do (
@@ -29,6 +30,9 @@ for /f "delims=" %%D in ('dir /b /ad /on "%SCRIPT_DIR%\dist" 2^>nul') do (
     )
     if exist "%SCRIPT_DIR%\dist\%%D\Plexxarr\Plexxarr.exe" (
         set "EXE_PATH=%SCRIPT_DIR%\dist\%%D\Plexxarr\Plexxarr.exe"
+    )
+    if exist "%SCRIPT_DIR%\dist\%%D\Sensarr\Sensarr.exe" (
+        set "EXE_PATH=%SCRIPT_DIR%\dist\%%D\Sensarr\Sensarr.exe"
     )
 )
 if not defined EXE_PATH (
@@ -56,10 +60,14 @@ if defined EXE_PATH (
     set "TASK_TARGET=\"!PYTHONW!\" \"%MAIN_PY%\""
 )
 
+:: Clear autostart entries left by the app's old names so only one survives.
+schtasks /delete /tn "Plexxarr" /f >nul 2>nul
+schtasks /delete /tn "PlexResetButton" /f >nul 2>nul
+
 :: Recreate the task (/f overwrites any existing one so re-running this after
 :: a new build repoints autostart at the newest binary).
 schtasks /create ^
-  /tn "Plexxarr" ^
+  /tn "Sensarr" ^
   /tr "!TASK_TARGET!" ^
   /sc onlogon ^
   /rl highest ^
@@ -74,7 +82,7 @@ if %errorlevel% neq 0 (
 
 echo.
 echo ============================================
-echo  Done! Plexxarr will start at logon
+echo  Done! Sensarr will start at logon
 echo  from the newest build. Re-run this script
 echo  after each rebuild to repoint autostart.
 echo.

@@ -15,12 +15,12 @@ import pytest
 import config
 import queue_store
 
-# The live-DB backup fixture lives outside the repo. PLEXXARR_LIVE_BACKUP_DIR
+# The live-DB backup fixture lives outside the repo. SENSARR_LIVE_BACKUP_DIR
 # points somewhere else on machines/runners that keep a copy; when the file is
 # absent these tests SKIP with a missing-fixture reason. They are NOT
 # platform-marked — they run anywhere the fixture exists.
 _LIVE_BACKUP_DIR = Path(os.environ.get(
-    "PLEXXARR_LIVE_BACKUP_DIR",
+    "SENSARR_LIVE_BACKUP_DIR",
     "C:/Users/Cole/CodeStuff/_backups/PlexResetButton-20260713"))
 _UPGRADE_BACKUP = _LIVE_BACKUP_DIR / "plex_reset_button.upgrade-test.db"
 
@@ -75,7 +75,7 @@ def upgraded_db(monkeypatch, tmp_path) -> Path:
     if not _UPGRADE_BACKUP.exists():
         pytest.skip(
             f"live-DB backup fixture not present at {_UPGRADE_BACKUP} "
-            "(set PLEXXARR_LIVE_BACKUP_DIR to point at a copy)")
+            "(set SENSARR_LIVE_BACKUP_DIR to point at a copy)")
     db = tmp_path / "upgrade.db"
     shutil.copy(_UPGRADE_BACKUP, db)
     _point_at(monkeypatch, db)

@@ -30,7 +30,7 @@ def is_windows() -> bool:
 # Duplicate-instance dialog (main.py guard)
 # ---------------------------------------------------------------------------
 
-def show_duplicate_instance_message(message: str, title: str = "Plexxarr") -> None:
+def show_duplicate_instance_message(message: str, title: str = "Sensarr") -> None:
     """Tell the user a second instance was refused. Windows keeps the exact
     ctypes MessageBoxW call it always used; elsewhere try a Tk messagebox and
     fall back to stderr — the message must never crash the guard itself."""

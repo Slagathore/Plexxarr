@@ -1,6 +1,6 @@
 # Release signing
 
-Release executables (`Plexxarr.exe` in the zip, `Plexxarr-portable.exe`) are
+Release executables (`Sensarr.exe` in the zip, `Sensarr-portable.exe`) are
 Authenticode-signed (publisher `CN=Charles Chambers`) using Azure Artifact
 Signing, timestamped so signatures outlive the short-lived certificates.
 
@@ -11,6 +11,6 @@ zipped/uploaded. The account details, environment workarounds, and the exact
 in the `job_finder_v2` repo). Verify any release binary with:
 
 ```powershell
-Get-AuthenticodeSignature .\Plexxarr.exe | Format-List Status, SignerCertificate
+Get-AuthenticodeSignature .\Sensarr.exe | Format-List Status, SignerCertificate
 # Expect: Status Valid, CN=Charles Chambers
 ```

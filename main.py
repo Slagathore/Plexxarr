@@ -1,7 +1,7 @@
 # =============================================================================
-# PlexResetButton — main.py
+# Sensarr — main.py
 # =============================================================================
-# Mission: Entry point for PlexResetButton, a Windows system-tray application
+# Mission: Entry point for Sensarr, a Windows system-tray application
 # and Telegram bot that lets you remotely control Plex Media Server from your
 # phone. Goals: start the desktop app with sufficient OS privileges, ensure
 # clean startup, and delegate all functionality to the desktop layer.
@@ -29,16 +29,16 @@ import sys
 # config resolves every path the moment it first loads.
 if "--smoke-test" in sys.argv:
     import tempfile as _tempfile
-    _smoke_root = _tempfile.mkdtemp(prefix="plexxarr-smoke-")
-    for _key, _sub in (("PLEXXARR_CONFIG_DIR", "config"),
-                       ("PLEXXARR_DATA_DIR", "data"),
-                       ("PLEXXARR_CACHE_DIR", "cache"),
-                       ("PLEXXARR_RUNTIME_DIR", "runtime")):
+    _smoke_root = _tempfile.mkdtemp(prefix="sensarr-smoke-")
+    for _key, _sub in (("SENSARR_CONFIG_DIR", "config"),
+                       ("SENSARR_DATA_DIR", "data"),
+                       ("SENSARR_CACHE_DIR", "cache"),
+                       ("SENSARR_RUNTIME_DIR", "runtime")):
         os.environ[_key] = os.path.join(_smoke_root, _sub)
     os.environ["APP_DB_PATH"] = os.path.join(_smoke_root, "data", "smoke.db")
     os.environ["TORRENT_DOWNLOAD_DIR"] = os.path.join(_smoke_root, "downloads")
     os.environ["TELEGRAM_BOT_TOKEN"] = ""   # never start the bot
-    os.environ["PLEXXARR_SKIP_ELEVATION"] = "1"
+    os.environ["SENSARR_SKIP_ELEVATION"] = "1"
 
 from app_logging import configure_logging
 
@@ -92,7 +92,7 @@ def _ensure_admin() -> None:
     """
     if sys.platform != "win32":
         return
-    if os.environ.get("PLEXXARR_SKIP_ELEVATION") == "1":
+    if os.environ.get("SENSARR_SKIP_ELEVATION") == "1":
         return  # capture/dev run — admin-only actions degrade gracefully
     if getattr(sys, "frozen", False):
         # PyInstaller EXE is already running with the privileges the spec
@@ -100,7 +100,7 @@ def _ensure_admin() -> None:
         return
     if not _is_admin():
         logger.info(
-            "PlexResetButton requires administrator privileges to force-kill "
+            "Sensarr requires administrator privileges to force-kill "
             "Plex processes. Requesting UAC elevation now…"
         )
         _relaunch_as_admin()
@@ -112,28 +112,39 @@ def _ensure_admin() -> None:
 # ---------------------------------------------------------------------------
 
 def _already_running() -> bool:
-    """Single-instance guard: two Plexxarr instances mean two Telegram
+    """Single-instance guard: two Sensarr instances mean two Telegram
     pollers (constant conflicts), two schedulers, and two download queues
     fighting over the same staging folder. PID lock lives in the RUNTIME dir
-    of the path contract (beside the exe on Windows, exactly as before)."""
+    of the path contract (beside the exe on Windows, exactly as before).
+    The pre-rename lock (plexxarr.pid) is honoured too, so launching the
+    renamed build beside a still-running old instance refuses the same way
+    instead of double-polling the bot."""
     import os
     import app_paths
-    lock = app_paths.PATHS.runtime_dir / "plexxarr.pid"
+
+    def _holds_live_instance(pid_file) -> bool:
+        try:
+            if not pid_file.is_file():
+                return False
+            old_pid = int(pid_file.read_text().strip() or 0)
+            if not old_pid or old_pid == os.getpid():
+                return False
+            import psutil
+            proc = psutil.Process(old_pid)
+            blob = ((proc.name() or "") + " "
+                    + " ".join(proc.cmdline())).lower()
+            # Frozen EXE under either name, or a source run of main.py.
+            return bool(proc.is_running() and (
+                "sensarr" in blob or "plexxarr" in blob
+                or "main.py" in blob))
+        except Exception:
+            return False  # stale/undecodable lock — take it over
+
+    lock = app_paths.PATHS.runtime_dir / "sensarr.pid"
+    legacy_lock = app_paths.PATHS.runtime_dir / "plexxarr.pid"
+    if _holds_live_instance(lock) or _holds_live_instance(legacy_lock):
+        return True
     try:
-        if lock.is_file():
-            old_pid = int(lock.read_text().strip() or 0)
-            if old_pid and old_pid != os.getpid():
-                try:
-                    import psutil
-                    proc = psutil.Process(old_pid)
-                    blob = ((proc.name() or "") + " "
-                            + " ".join(proc.cmdline())).lower()
-                    # Frozen EXE ("plexxarr.exe") or a source run of main.py.
-                    if proc.is_running() and (
-                            "plexxarr" in blob or "main.py" in blob):
-                        return True
-                except Exception:
-                    pass  # stale/undecodable lock — take it over
         lock.write_text(str(os.getpid()), encoding="ascii")
     except OSError:
         pass
@@ -178,7 +189,7 @@ def _run_smoke_test() -> int:
             if not d.is_dir():
                 raise RuntimeError(f"contract dir missing: {d}")
         import config
-        expected_dir = os.environ["PLEXXARR_DATA_DIR"]
+        expected_dir = os.environ["SENSARR_DATA_DIR"]
         if os.path.dirname(config.APP_DB_PATH) != expected_dir:
             raise RuntimeError(f"DB not in smoke dir: {config.APP_DB_PATH}")
 
@@ -291,7 +302,7 @@ def main() -> None:
     if _already_running():
         import platform_adapter
         platform_adapter.show_duplicate_instance_message(
-            "Plexxarr is already running (check the system tray).")
+            "Sensarr is already running (check the system tray).")
         return
     # Ordering matters (Task H item 2): the migration offer must precede the
     # desktop_app import below — DesktopApp.__init__ initializes databases

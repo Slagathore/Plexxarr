@@ -1,25 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Single-file "portable" build: one Sensarr-portable.exe, nothing to unzip.
+# Same contents as the folder build minus the anime database (it rebuilds
+# itself on first launch). Slower to start than the folder build — onefile
+# extracts to a temp dir each run — but the easiest thing to hand someone.
 
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
-
 spec_file = globals().get("__file__")
 project_dir = Path(spec_file).resolve().parent if spec_file else Path.cwd().resolve()
 
 datas = []
-# sv-ttk ships its Sun Valley theme as Tcl data files; without collecting them
-# the dark theme silently falls back to the stock gray ttk look in the EXE.
 datas += collect_data_files("sv_ttk")
-# rank-torrent-name + its parser parsett carry regex/pattern data files that
-# the analysis misses; collect them so the selection engine parses in the EXE.
+# rank-torrent-name + parsett pattern data files (selection engine).
 datas += collect_data_files("RTN")
 datas += collect_data_files("parsett")
-# The Node webtorrent downloader lives beside the app; ship the script +
-# manifest so the Downloads pipeline works from the bundle. (node_modules is
-# NOT bundled — run `npm install` in torrent_runner/ next to the EXE once, and
-# Node.js must be on PATH.)
 for _rf in ("download.mjs", "package.json", "package-lock.json", "diag.mjs"):
     _src = project_dir / "torrent_runner" / _rf
     if _src.is_file():
@@ -28,25 +24,17 @@ for _rf in ("download.mjs", "package.json", "package-lock.json", "diag.mjs"):
 hiddenimports = (
     collect_submodules("telegram")
     + collect_submodules("pystray")
-    # rank-torrent-name (selection engine) + its transitive deps. parsett is
-    # the parser; pydantic/pydantic_core back the models; the rest are RTN's
-    # runtime deps that get imported dynamically.
+    # rank-torrent-name (selection engine) + transitive deps.
     + collect_submodules("RTN")
     + collect_submodules("parsett")
     + collect_submodules("pydantic")
     + ["pydantic_core", "orjson", "Levenshtein", "arrow", "pymediainfo"]
-    # New modules are imported dynamically enough that we pin them explicitly.
     + ["sv_ttk", "send2trash", "shows_tab", "shows_store", "show_tracker",
        "downloads_store", "download_manager", "torrent_search", "torrent_routing",
        "auth_store", "db", "ui_helpers", "health", "watchlist_tab", "video_quality",
        "subtitles", "anime_db", "media_identity"]
 )
 
-
-# Heavyweight packages from OTHER projects in the global site-packages that
-# PyInstaller's analysis reaches via entry-point/plugin scanning (subliminal's
-# stevedore loader etc.). None are Plexxarr dependencies — excluding them cuts
-# minutes off the build and a lot of megabytes off the bundle.
 _EXCLUDE_HEAVY = [
     "torch", "torchvision", "torchaudio", "torchao", "triton",
     "tensorflow", "tensorflow-plugins", "keras", "transformers", "timm",
@@ -76,9 +64,10 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
-    name="Plexxarr",
+    name="Sensarr-portable",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -90,15 +79,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=True,
-    icon="assets/plexxarr.ico",
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="Plexxarr",
+    icon="assets/sensarr.ico",
 )

@@ -8,7 +8,7 @@ set "DIST_ROOT=%SCRIPT_DIR%\dist\%BUILD_STAMP%"
 set "WORK_ROOT=%SCRIPT_DIR%\build\%BUILD_STAMP%"
 
 echo ============================================
-echo  Plexxarr - Windows EXE Build
+echo  Sensarr - Windows EXE Build
 echo ============================================
 echo.
 
@@ -33,7 +33,7 @@ if %errorlevel% neq 0 (
 
 del "%PYINSTALLER_CHECK_LOG%" >nul 2>nul
 
-python -m PyInstaller --noconfirm --clean --distpath "%DIST_ROOT%" --workpath "%WORK_ROOT%" "%SCRIPT_DIR%\Plexxarr.spec"
+python -m PyInstaller --noconfirm --clean --distpath "%DIST_ROOT%" --workpath "%WORK_ROOT%" "%SCRIPT_DIR%\Sensarr.spec"
 if %errorlevel% neq 0 (
     echo.
     echo ERROR: Build failed.
@@ -48,7 +48,7 @@ if %errorlevel% neq 0 (
 :: _internal, so we copy them out and npm install here. This makes every build
 :: self-sufficient for the Downloads pipeline (Node.js must be on PATH).
 :: --------------------------------------------------------------------------
-set "EXE_RUNNER=%DIST_ROOT%\Plexxarr\torrent_runner"
+set "EXE_RUNNER=%DIST_ROOT%\Sensarr\torrent_runner"
 where node >nul 2>nul
 if %errorlevel% neq 0 (
     echo.
@@ -68,7 +68,7 @@ if %errorlevel% neq 0 (
     popd
 )
 
-:: Delete PyInstaller's scratch dir — it contains a half-built Plexxarr.exe
+:: Delete PyInstaller's scratch dir — it contains a half-built Sensarr.exe
 :: stub that fails with "Failed to load Python DLL" if launched by mistake,
 :: and it wastes a few hundred MB per build. Only dist\ matters.
 rmdir /s /q "%WORK_ROOT%" >nul 2>nul
@@ -93,13 +93,13 @@ if not exist "%ISCC%" (
     ) else (
         echo.
         echo Building installer for version !APP_VERSION!...
-        "%ISCC%" "/DAppVersion=!APP_VERSION!" "/DSourceDir=%DIST_ROOT%\Plexxarr" "%SCRIPT_DIR%\packaging\installer.iss"
+        "%ISCC%" "/DAppVersion=!APP_VERSION!" "/DSourceDir=%DIST_ROOT%\Sensarr" "%SCRIPT_DIR%\packaging\installer.iss"
         if errorlevel 1 (
             echo.
             echo WARNING: Installer build failed. Folder bundle and portable exe are unaffected.
         ) else (
             echo.
-            echo Installer: %SCRIPT_DIR%\packaging\Output\Plexxarr-!APP_VERSION!-Setup.exe
+            echo Installer: %SCRIPT_DIR%\packaging\Output\Sensarr-!APP_VERSION!-Setup.exe
             echo Sign it per SIGNING.md before shipping.
         )
     )
@@ -108,7 +108,7 @@ if not exist "%ISCC%" (
 
 echo.
 echo Build complete.
-echo Executable bundle: %DIST_ROOT%\Plexxarr
+echo Executable bundle: %DIST_ROOT%\Sensarr
 echo Run setup_autostart.bat to point logon-autostart at this new build.
 pause
 endlocal

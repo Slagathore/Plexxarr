@@ -11,18 +11,18 @@
 #
 # Linux uses the XDG base directories, because a packaged install under /opt
 # or /usr must never write beside read-only code:
-#   CONFIG_DIR  = $XDG_CONFIG_HOME/plexxarr   (~/.config/plexxarr)    .env
-#   DATA_DIR    = $XDG_DATA_HOME/plexxarr     (~/.local/share/plexxarr)
+#   CONFIG_DIR  = $XDG_CONFIG_HOME/sensarr   (~/.config/sensarr)    .env
+#   DATA_DIR    = $XDG_DATA_HOME/sensarr     (~/.local/share/sensarr)
 #                 SQLite databases, durable job/provenance state
-#   CACHE_DIR   = $XDG_CACHE_HOME/plexxarr    (~/.cache/plexxarr)
+#   CACHE_DIR   = $XDG_CACHE_HOME/sensarr    (~/.cache/sensarr)
 #                 expendable scan caches, downloaded metadata dumps
-#   RUNTIME_DIR = $XDG_RUNTIME_DIR/plexxarr   (fallback: CACHE_DIR/runtime)
+#   RUNTIME_DIR = $XDG_RUNTIME_DIR/sensarr   (fallback: CACHE_DIR/runtime)
 #                 pid/lock files
 #   DOWNLOAD_DIR default = DATA_DIR/downloads (TORRENT_DOWNLOAD_DIR overrides)
 #
 # Explicit environment overrides always win, on every platform:
-#   PLEXXARR_CONFIG_DIR / PLEXXARR_DATA_DIR / PLEXXARR_CACHE_DIR /
-#   PLEXXARR_RUNTIME_DIR — direct directory pins (tests, CI, the smoke run).
+#   SENSARR_CONFIG_DIR / SENSARR_DATA_DIR / SENSARR_CACHE_DIR /
+#   SENSARR_RUNTIME_DIR — direct directory pins (tests, CI, the smoke run).
 #   APP_DB_PATH and TORRENT_DOWNLOAD_DIR keep working exactly as before
 #   (config.py applies them after .env loads).
 # =============================================================================
@@ -33,7 +33,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-APP_NAME = "plexxarr"
+APP_NAME = "sensarr"
+
+# XDG folder names this app shipped under before the rename; legacy_migration
+# scans them so a pre-rename Linux install's data follows the app over.
+LEGACY_APP_NAMES = ("plexxarr",)
 
 
 def _install_dir() -> Path:
@@ -66,10 +70,11 @@ def _dir_from_env(environ: Mapping[str, str], key: str) -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
-def _xdg(environ: Mapping[str, str], key: str, fallback: Path) -> Path:
+def _xdg(environ: Mapping[str, str], key: str, fallback: Path,
+         app_name: str = APP_NAME) -> Path:
     raw = (environ.get(key) or "").strip()
     base = Path(raw).expanduser() if raw else fallback
-    return base / APP_NAME
+    return base / app_name
 
 
 def compute_paths(platform: str | None = None,
@@ -98,10 +103,10 @@ def compute_paths(platform: str | None = None,
             runtime_dir = cache_dir / "runtime"
 
     # Explicit directory pins beat the platform layout everywhere.
-    config_dir = _dir_from_env(environ, "PLEXXARR_CONFIG_DIR") or config_dir
-    data_dir = _dir_from_env(environ, "PLEXXARR_DATA_DIR") or data_dir
-    cache_dir = _dir_from_env(environ, "PLEXXARR_CACHE_DIR") or cache_dir
-    runtime_dir = _dir_from_env(environ, "PLEXXARR_RUNTIME_DIR") or runtime_dir
+    config_dir = _dir_from_env(environ, "SENSARR_CONFIG_DIR") or config_dir
+    data_dir = _dir_from_env(environ, "SENSARR_DATA_DIR") or data_dir
+    cache_dir = _dir_from_env(environ, "SENSARR_CACHE_DIR") or cache_dir
+    runtime_dir = _dir_from_env(environ, "SENSARR_RUNTIME_DIR") or runtime_dir
 
     # Download staging default. TORRENT_DOWNLOAD_DIR is ALSO honoured by
     # config.py after .env loads; catching a process-level value here keeps
@@ -119,6 +124,24 @@ def compute_paths(platform: str | None = None,
         data_dir=data_dir, cache_dir=cache_dir, runtime_dir=runtime_dir,
         download_dir=download_dir,
     )
+
+
+def legacy_xdg_dirs(platform: str | None = None,
+                    environ: Mapping[str, str] | None = None
+                    ) -> list[tuple[Path, Path, Path]]:
+    """(config, data, cache) triplets for the old app names, for the
+    legacy migration to scan. Empty on Windows, where the layout is the
+    install folder and never moved."""
+    platform = platform if platform is not None else sys.platform
+    environ = os.environ if environ is None else environ
+    if platform == "win32":
+        return []
+    home = Path((environ.get("HOME") or "").strip() or Path.home())
+    return [(
+        _xdg(environ, "XDG_CONFIG_HOME", home / ".config", name),
+        _xdg(environ, "XDG_DATA_HOME", home / ".local" / "share", name),
+        _xdg(environ, "XDG_CACHE_HOME", home / ".cache", name),
+    ) for name in LEGACY_APP_NAMES]
 
 
 def ensure_dirs(paths: AppPaths) -> None:

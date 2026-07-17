@@ -1,8 +1,8 @@
 {
-  "name": "plexresetbutton-torrent-runner",
+  "name": "sensarr-torrent-runner",
   "version": "1.0.0",
   "private": true,
-  "description": "Headless webtorrent downloader used by PlexResetButton's download pipeline",
+  "description": "Headless webtorrent downloader used by Sensarr's download pipeline",
   "type": "module",
   "dependencies": {
     "webtorrent": "2.8.5"

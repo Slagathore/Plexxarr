@@ -11,7 +11,7 @@
 #   4. The platform process adapter starts and stops a harmless fixture tree.
 #   5. Source startup/clean-shutdown under Xvfb via `main.py --smoke-test`
 #      (bounded, network-free, writes only to its own temp dirs).
-#   6. PyInstaller builds the Linux artifact from Plexxarr-linux.spec
+#   6. PyInstaller builds the Linux artifact from Sensarr-linux.spec
 #      (PyInstaller is not a cross-compiler — this MUST run on Linux).
 #   7. The built artifact itself passes --smoke-test under Xvfb.
 name: linux-smoke
@@ -59,14 +59,14 @@ jobs:
         run: xvfb-run -a .venv/bin/python main.py --smoke-test
 
       - name: Build the Linux artifact
-        run: .venv/bin/pyinstaller --noconfirm Plexxarr-linux.spec
+        run: .venv/bin/pyinstaller --noconfirm Sensarr-linux.spec
 
       - name: Packaged-artifact smoke under Xvfb
-        run: xvfb-run -a dist/Plexxarr/Plexxarr --smoke-test
+        run: xvfb-run -a dist/Sensarr/Sensarr --smoke-test
 
       - name: Upload the Linux artifact
         uses: actions/upload-artifact@v4
         with:
-          name: plexxarr-linux
-          path: dist/Plexxarr
+          name: sensarr-linux
+          path: dist/Sensarr
           retention-days: 14

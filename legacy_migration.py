@@ -49,7 +49,8 @@ ARCHIVE_SUFFIX = ".migrated"
 
 # Legacy filename -> which contract dir owns it now. Databases and durable
 # state go to DATA, .env to CONFIG, expendable/refreshable files to CACHE.
-# plexxarr.pid is runtime state: never migrated, just left behind.
+# sensarr.pid (and the pre-rename plexxarr.pid) is runtime state: never
+# migrated, just left behind.
 _CONFIG_FILES = (".env",)
 _CACHE_FILES = (
     "trackers_cache.txt",
@@ -61,7 +62,7 @@ _CACHE_FILES = (
 )
 # plex_reset_button.db + anime_meta.sqlite + any sibling SQLite file.
 _DATA_GLOBS = ("*.db", "*.sqlite")
-_SKIP_NAMES = {"plexxarr.pid"}
+_SKIP_NAMES = {"sensarr.pid", "plexxarr.pid"}
 _SQLITE_SUFFIXES = {".db", ".sqlite"}
 
 
@@ -85,9 +86,12 @@ def _sha256(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def plan_migration(paths: app_paths.AppPaths | None = None,
-                   platform: str | None = None) -> list[MigrationItem]:
-    """Legacy files beside the executable that belong in the contract dirs.
-    Empty on Windows (the dirs are the same place) and on fresh installs."""
+                   platform: str | None = None,
+                   environ=None) -> list[MigrationItem]:
+    """Legacy files beside the executable, plus files under the pre-rename
+    XDG dirs (~/.config/plexxarr and friends), that belong in the contract
+    dirs. Empty on Windows (the dirs are the same place) and on fresh
+    installs."""
     platform = platform if platform is not None else sys.platform
     paths = paths or app_paths.PATHS
     if platform == "win32":
@@ -110,6 +114,17 @@ def plan_migration(paths: app_paths.AppPaths | None = None,
             add(f, paths.data_dir, "data")
     for name in _CACHE_FILES:
         add(legacy_dir / name, paths.cache_dir, "cache")
+    # Pre-rename XDG homes: same contract, old folder name. add()'s guards
+    # keep this idempotent, and the pid locks are skip-listed like any other.
+    for old_config, old_data, old_cache in app_paths.legacy_xdg_dirs(
+            platform, environ):
+        for name in _CONFIG_FILES:
+            add(old_config / name, paths.config_dir, "config")
+        for pattern in _DATA_GLOBS:
+            for f in sorted(old_data.glob(pattern)):
+                add(f, paths.data_dir, "data")
+        for name in _CACHE_FILES:
+            add(old_cache / name, paths.cache_dir, "cache")
     return items
 
 
@@ -127,8 +142,9 @@ def format_plan(items: list[MigrationItem]) -> str:
 
 
 def migration_pending(paths: app_paths.AppPaths | None = None,
-                      platform: str | None = None) -> bool:
-    return bool(plan_migration(paths, platform))
+                      platform: str | None = None,
+                      environ=None) -> bool:
+    return bool(plan_migration(paths, platform, environ))
 
 
 # ---------------------------------------------------------------------------

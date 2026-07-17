@@ -1,18 +1,4 @@
 # -*- mode: python ; coding: utf-8 -*-
-# =============================================================================
-# Plexxarr-linux.spec — Task H item 8
-# =============================================================================
-# The Linux build. MUST be built ON Linux (PyInstaller is not a
-# cross-compiler) — CI does this in .github/workflows/linux-smoke.yml and
-# runs the artifact under Xvfb with --smoke-test.
-#
-# Differences from the Windows specs (which stay Windows-specific):
-#   - no uac_admin (a UAC manifest means nothing on Linux; the app never
-#     elevates there)
-#   - no .ico icon (Windows resource format)
-#   - the bundled torrent_runner is the read-only seed copy; the writable
-#     one (with node_modules) lives in the XDG data dir per app_paths.
-# =============================================================================
 
 from pathlib import Path
 
@@ -24,16 +10,16 @@ project_dir = Path(spec_file).resolve().parent if spec_file else Path.cwd().reso
 
 datas = []
 # sv-ttk ships its Sun Valley theme as Tcl data files; without collecting them
-# the dark theme silently falls back to the stock gray ttk look in the build.
+# the dark theme silently falls back to the stock gray ttk look in the EXE.
 datas += collect_data_files("sv_ttk")
 # rank-torrent-name + its parser parsett carry regex/pattern data files that
-# the analysis misses; collect them so the selection engine parses in the build.
+# the analysis misses; collect them so the selection engine parses in the EXE.
 datas += collect_data_files("RTN")
 datas += collect_data_files("parsett")
-# The Node webtorrent downloader: ship the script + manifests as the
-# read-only seed. node_modules is NOT bundled — the app seeds a writable
-# copy under the XDG data dir and `npm install` runs there (Node.js 20+
-# must be on PATH).
+# The Node webtorrent downloader lives beside the app; ship the script +
+# manifest so the Downloads pipeline works from the bundle. (node_modules is
+# NOT bundled — run `npm install` in torrent_runner/ next to the EXE once, and
+# Node.js must be on PATH.)
 for _rf in ("download.mjs", "package.json", "package-lock.json", "diag.mjs"):
     _src = project_dir / "torrent_runner" / _rf
     if _src.is_file():
@@ -42,6 +28,9 @@ for _rf in ("download.mjs", "package.json", "package-lock.json", "diag.mjs"):
 hiddenimports = (
     collect_submodules("telegram")
     + collect_submodules("pystray")
+    # rank-torrent-name (selection engine) + its transitive deps. parsett is
+    # the parser; pydantic/pydantic_core back the models; the rest are RTN's
+    # runtime deps that get imported dynamically.
     + collect_submodules("RTN")
     + collect_submodules("parsett")
     + collect_submodules("pydantic")
@@ -50,11 +39,14 @@ hiddenimports = (
     + ["sv_ttk", "send2trash", "shows_tab", "shows_store", "show_tracker",
        "downloads_store", "download_manager", "torrent_search", "torrent_routing",
        "auth_store", "db", "ui_helpers", "health", "watchlist_tab", "video_quality",
-       "subtitles", "anime_db", "media_identity",
-       "app_paths", "platform_adapter", "legacy_migration"]
+       "subtitles", "anime_db", "media_identity"]
 )
 
-# Same heavyweight excludes as the Windows spec — none are Plexxarr deps.
+
+# Heavyweight packages from OTHER projects in the global site-packages that
+# PyInstaller's analysis reaches via entry-point/plugin scanning (subliminal's
+# stevedore loader etc.). None are Sensarr dependencies — excluding them cuts
+# minutes off the build and a lot of megabytes off the bundle.
 _EXCLUDE_HEAVY = [
     "torch", "torchvision", "torchaudio", "torchao", "triton",
     "tensorflow", "tensorflow-plugins", "keras", "transformers", "timm",
@@ -86,17 +78,19 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="Plexxarr",
+    name="Sensarr",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    uac_admin=True,
+    icon="assets/sensarr.ico",
 )
 
 coll = COLLECT(
@@ -106,5 +100,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="Plexxarr",
+    name="Sensarr",
 )

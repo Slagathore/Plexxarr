@@ -4,7 +4,7 @@ about: Something broke or behaved wrong
 labels: bug
 ---
 
-**Plexxarr version** (window title shows it, e.g. v1.2):
+**Sensarr version** (window title shows it, e.g. v1.2):
 
 **What happened:**
 

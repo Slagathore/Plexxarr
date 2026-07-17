@@ -116,7 +116,7 @@ class DesktopApp:
     def __init__(self) -> None:
         self.bot_service = TelegramBotService()
         self.root = tk.Tk()
-        self.root.title(f"Plexxarr v{config.APP_VERSION}")
+        self.root.title(f"Sensarr v{config.APP_VERSION}")
         try:
             # Taskbar/alt-tab icon — same mark as the tray and the EXE.
             from PIL import ImageTk
@@ -293,14 +293,14 @@ class DesktopApp:
         walk(root_widget)
 
     def _screenshot_tour(self) -> None:
-        """Docs capture (PLEXXARR_SHOT_DIR set): maximize, walk the tabs,
+        """Docs capture (SENSARR_SHOT_DIR set): maximize, walk the tabs,
         save one PNG per stop, then exit. Drives the real app so the README
         screenshots always show live data."""
         import os
         import time as _time
         from PIL import ImageGrab
 
-        outdir = Path(os.environ["PLEXXARR_SHOT_DIR"])
+        outdir = Path(os.environ["SENSARR_SHOT_DIR"])
         outdir.mkdir(parents=True, exist_ok=True)
         self.root.state("zoomed")
         self.root.lift()
@@ -398,7 +398,7 @@ class DesktopApp:
         # this class constructs — __init__ initializes databases at the XDG
         # destination, which would otherwise block the main DB's copy.
         import os as _os
-        if _os.environ.get("PLEXXARR_SHOT_DIR"):
+        if _os.environ.get("SENSARR_SHOT_DIR"):
             self.root.after(12000, self._screenshot_tour)
         try:
             self.root.mainloop()
@@ -469,7 +469,7 @@ class DesktopApp:
 
         ttk.Label(
             header,
-            text="Plexxarr",
+            text="Sensarr",
             font=("Segoe UI", 18, "bold"),
         ).grid(row=0, column=0, sticky="w")
 
@@ -995,7 +995,7 @@ class DesktopApp:
         ttk.Label(missing_frame, text=(
             "Files that USED to be indexed but are gone — renames and replacements "
             "are excluded (they're paired automatically). 'Outside the app' means "
-            "no Plexxarr action touched it."),
+            "no Sensarr action touched it."),
             wraplength=900, font=("Segoe UI", 9, "italic")).grid(row=0, column=0, sticky="w", pady=(0, 4))
         missing_tree = ttk.Treeview(
             missing_frame, columns=("at", "path", "detail"), show="headings")
@@ -1040,8 +1040,8 @@ class DesktopApp:
             pystray.MenuItem("Get Plex Token", lambda icon, item: self.authenticate_plex_account()),
             pystray.MenuItem("Quit", lambda icon, item: self.request_exit()),
         )
-        return pystray.Icon("Plexxarr", image,
-                            f"Plexxarr v{config.APP_VERSION}", menu)
+        return pystray.Icon("Sensarr", image,
+                            f"Sensarr v{config.APP_VERSION}", menu)
 
     def _create_tray_image(self) -> PillowImage:
         from app_icon import icon_image
@@ -3414,7 +3414,7 @@ class DesktopApp:
         if self._maint_banner_label is not None:
             self._maint_banner_label.configure(foreground=color)
         if not job.meta.get("idle"):
-            self._notify_if_unfocused(f"Plexxarr — {job.label}", toast)
+            self._notify_if_unfocused(f"Sensarr — {job.label}", toast)
 
         if job.state == "done":
             try:
@@ -3591,7 +3591,7 @@ class DesktopApp:
 
     def _show_update_banner(self, info) -> None:
         """Show the update banner, honouring dismiss/skip/mute — unless the
-        release is marked urgent (PLEXXARR-URGENT in its notes), which
+        release is marked urgent (SENSARR-URGENT in its notes), which
         overrides every quieting choice and pops the message once."""
         import updater as _updater
         self._update_info = info
@@ -3626,7 +3626,7 @@ class DesktopApp:
             self._urgent_popup_shown = True
             self._show_warning(
                 "Urgent update",
-                f"Plexxarr v{info.version} is an urgent release:\n\n"
+                f"Sensarr v{info.version} is an urgent release:\n\n"
                 f"{info.urgent_message}\n\n"
                 "Please update as soon as possible.")
 

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT = 15
-_USER_AGENT = "PlexResetButton/1.0"
+_USER_AGENT = "Sensarr/1.0"
 
 # Standard open trackers appended to magnets built from a bare info-hash.
 _TRACKERS = [

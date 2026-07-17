@@ -40,7 +40,7 @@ class TestWin32Layout:
         assert p.config_dir == install          # .env beside the exe
         assert p.data_dir == install            # plex_reset_button.db beside the exe
         assert p.cache_dir == install           # caches beside the exe
-        assert p.runtime_dir == install         # plexxarr.pid beside the exe
+        assert p.runtime_dir == install         # sensarr.pid beside the exe
         assert p.download_dir == install / "downloads"
 
     def test_legacy_derivations_reproduced_exactly(self):
@@ -49,7 +49,7 @@ class TestWin32Layout:
         legacy = app_paths._install_dir()
         assert p.config_dir / ".env" == legacy / ".env"
         assert p.data_dir / "plex_reset_button.db" == legacy / "plex_reset_button.db"
-        assert p.runtime_dir / "plexxarr.pid" == legacy / "plexxarr.pid"
+        assert p.runtime_dir / "sensarr.pid" == legacy / "sensarr.pid"
         assert p.cache_dir / "trackers_cache.txt" == legacy / "trackers_cache.txt"
         assert p.cache_dir / "maintenance_cache.json" == legacy / "maintenance_cache.json"
         assert p.data_dir / "anime_meta.sqlite" == legacy / "anime_meta.sqlite"
@@ -72,25 +72,25 @@ class TestLinuxLayout:
                "XDG_CACHE_HOME": "/xdg/cache", "XDG_RUNTIME_DIR": "/xdg/run",
                "HOME": "/home/user"}
         p = app_paths.compute_paths("linux", env)
-        assert p.config_dir == Path("/xdg/config/plexxarr")
-        assert p.data_dir == Path("/xdg/data/plexxarr")
-        assert p.cache_dir == Path("/xdg/cache/plexxarr")
-        assert p.runtime_dir == Path("/xdg/run/plexxarr")
-        assert p.download_dir == Path("/xdg/data/plexxarr/downloads")
+        assert p.config_dir == Path("/xdg/config/sensarr")
+        assert p.data_dir == Path("/xdg/data/sensarr")
+        assert p.cache_dir == Path("/xdg/cache/sensarr")
+        assert p.runtime_dir == Path("/xdg/run/sensarr")
+        assert p.download_dir == Path("/xdg/data/sensarr/downloads")
 
     def test_documented_home_fallbacks(self):
         env = {"HOME": "/home/cole"}
         p = app_paths.compute_paths("linux", env)
-        assert p.config_dir == Path("/home/cole/.config/plexxarr")
-        assert p.data_dir == Path("/home/cole/.local/share/plexxarr")
-        assert p.cache_dir == Path("/home/cole/.cache/plexxarr")
+        assert p.config_dir == Path("/home/cole/.config/sensarr")
+        assert p.data_dir == Path("/home/cole/.local/share/sensarr")
+        assert p.cache_dir == Path("/home/cole/.cache/sensarr")
         # No XDG_RUNTIME_DIR (headless/CI): documented cache-tree fallback.
-        assert p.runtime_dir == Path("/home/cole/.cache/plexxarr/runtime")
+        assert p.runtime_dir == Path("/home/cole/.cache/sensarr/runtime")
 
-    def test_plexxarr_dir_overrides_win_everywhere(self):
+    def test_sensarr_dir_overrides_win_everywhere(self):
         env = {"HOME": "/home/cole",
-               "PLEXXARR_CONFIG_DIR": "/pin/c", "PLEXXARR_DATA_DIR": "/pin/d",
-               "PLEXXARR_CACHE_DIR": "/pin/k", "PLEXXARR_RUNTIME_DIR": "/pin/r"}
+               "SENSARR_CONFIG_DIR": "/pin/c", "SENSARR_DATA_DIR": "/pin/d",
+               "SENSARR_CACHE_DIR": "/pin/k", "SENSARR_RUNTIME_DIR": "/pin/r"}
         for platform in ("linux", "win32"):
             p = app_paths.compute_paths(platform, env)
             assert p.config_dir == Path("/pin/c")
@@ -343,7 +343,7 @@ def _seed_legacy(install: Path) -> None:
     conn.commit()
     conn.close()
     (install / "trackers_cache.txt").write_text("udp://x\n", encoding="utf-8")
-    (install / "plexxarr.pid").write_text("123", encoding="ascii")
+    (install / "sensarr.pid").write_text("123", encoding="ascii")
 
 
 class TestLegacyMigration:
@@ -366,6 +366,33 @@ class TestLegacyMigration:
         assert (paths.install_dir / ".env").is_file()
         assert not paths.config_dir.exists()
 
+    def test_plan_includes_pre_rename_xdg_dirs(self, tmp_path):
+        # A pre-rename Linux install left its data under ~/.config/plexxarr
+        # and ~/.local/share/plexxarr — the plan moves it to the new names.
+        paths = _fake_paths(tmp_path)
+        paths.install_dir.mkdir(parents=True, exist_ok=True)
+        env = {"XDG_CONFIG_HOME": str(tmp_path / "xdgc"),
+               "XDG_DATA_HOME": str(tmp_path / "xdgd"),
+               "XDG_CACHE_HOME": str(tmp_path / "xdgk"),
+               "HOME": str(tmp_path)}
+        old_config = tmp_path / "xdgc" / "plexxarr"
+        old_data = tmp_path / "xdgd" / "plexxarr"
+        old_config.mkdir(parents=True)
+        old_data.mkdir(parents=True)
+        (old_config / ".env").write_text("PLEX_TOKEN=abc\n", encoding="utf-8")
+        (old_data / "plex_reset_button.db").write_bytes(b"placeholder")
+        items = legacy_migration.plan_migration(paths, platform="linux",
+                                                environ=env)
+        dests = {Path(i.src).name: i.dest for i in items}
+        assert dests[".env"] == str(paths.config_dir / ".env")
+        assert dests["plex_reset_button.db"] == str(
+            paths.data_dir / "plex_reset_button.db")
+        # Old pid locks never migrate, same as the install-dir rule.
+        (old_data / "plexxarr.pid").write_text("123", encoding="ascii")
+        items = legacy_migration.plan_migration(paths, platform="linux",
+                                                environ=env)
+        assert "plexxarr.pid" not in {Path(i.src).name for i in items}
+
     def test_execute_copies_verifies_and_archives(self, tmp_path):
         paths = _fake_paths(tmp_path)
         _seed_legacy(paths.install_dir)
@@ -380,7 +407,7 @@ class TestLegacyMigration:
         # Originals archived (never deleted), pid lock untouched.
         assert (paths.install_dir / ".env.migrated").is_file()
         assert not (paths.install_dir / ".env").exists()
-        assert (paths.install_dir / "plexxarr.pid").is_file()
+        assert (paths.install_dir / "sensarr.pid").is_file()
         # Journal recorded every op as done.
         journal = (paths.data_dir /
                    legacy_migration.JOURNAL_FILE).read_text(encoding="utf-8")
@@ -782,7 +809,7 @@ def _tk_available() -> bool:
            "CI job runs this exact flag under xvfb with everything installed")
 def test_smoke_flag_exits_zero_in_bounded_time():
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith("PLEXXARR_") and k != "APP_DB_PATH"}
+           if not k.startswith("SENSARR_") and k != "APP_DB_PATH"}
     result = subprocess.run(
         [sys.executable, str(REPO / "main.py"), "--smoke-test"],
         capture_output=True, text=True, timeout=150, cwd=str(REPO), env=env)
@@ -800,16 +827,16 @@ def test_packaged_run_never_loads_env_from_cwd(tmp_path):
     trap_cwd = tmp_path / "cwd"
     trap_cwd.mkdir()
     (trap_cwd / ".env").write_text(
-        "PLEXXARR_ENV_TRAP=leaked\n", encoding="utf-8")
+        "SENSARR_ENV_TRAP=leaked\n", encoding="utf-8")
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith("PLEXXARR_") and k != "PLEXXARR_ENV_TRAP"}
-    env["PLEXXARR_CONFIG_DIR"] = str(config_dir)   # empty: no .env here
+           if not k.startswith("SENSARR_") and k != "SENSARR_ENV_TRAP"}
+    env["SENSARR_CONFIG_DIR"] = str(config_dir)   # empty: no .env here
     env["PYTHONPATH"] = str(REPO)
     env["APP_DB_PATH"] = str(tmp_path / "trap.db")
     code = ("import os, config; "
-            "print('TRAP=' + repr(os.getenv('PLEXXARR_ENV_TRAP')))")
+            "print('TRAP=' + repr(os.getenv('SENSARR_ENV_TRAP')))")
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True,
         timeout=60, cwd=str(trap_cwd), env=env)
@@ -818,7 +845,7 @@ def test_packaged_run_never_loads_env_from_cwd(tmp_path):
 
     # The pinned CONFIG_DIR home still loads normally.
     (config_dir / ".env").write_text(
-        "PLEXXARR_ENV_TRAP=from_config_home\n", encoding="utf-8")
+        "SENSARR_ENV_TRAP=from_config_home\n", encoding="utf-8")
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True,
         timeout=60, cwd=str(trap_cwd), env=env)
