@@ -1,0 +1,76 @@
+name: anime-db
+
+# Publishes the weekly manami-only anime metadata artifact that anime_db.py's
+# manifest-first refresh() path pulls instead of every install rebuilding
+# from all three upstream sources itself (Task I / FIX_SPRINT_BOOTSTRAP.md
+# section I; publish_anime_db.py does the actual build).
+#
+# Licensing (checked 2026-07-18): manami-project/anime-offline-database is
+# ODbL 1.0 (+ DbCL for contents) — a derived SQLite DB may be redistributed,
+# but as a "derivative database" share-alike applies: released under ODbL
+# 1.0 with attribution (see publish_anime_db.py's NOTICE text / the NOTICE
+# asset below). Fribb/anime-lists and Anime-Lists/anime-lists have NO
+# license file at all (GitHub's license API 404s on both) — there is no
+# permission-by-license to redistribute their id mappings, so this
+# artifact NEVER includes them. Every client fetches those two small dumps
+# from their own canonical raw.githubusercontent URLs at refresh time and
+# merges them locally on top of this artifact, exactly like the old
+# all-local build did for all three sources.
+#
+# Tag choice: a single ROLLING tag (anime-db-latest), not a dated tag, always
+# published with --latest=false. Two reasons:
+#   1. Fixed asset URLs (latest.json, anime-db.sqlite.gz) mean clients never
+#      call the GitHub API for this — no rate limiting, cheap manifest polls.
+#   2. A dated tag would become GitHub's "latest" release on every run. That
+#      would break updater.py's check_for_update(), which reads
+#      /repos/{repo}/releases/latest for the newest APP version — an
+#      anime-db release marked latest would shadow the real app release and
+#      every installed copy would stop seeing update notifications.
+#
+# 60-day scheduled-workflow keepalive: GitHub auto-disables a cron trigger
+# after 60 days with no repository activity. workflow_dispatch lets this run
+# by hand any time, but a manual dispatch does NOT itself re-enable a
+# disabled schedule — see RELEASING.md's "Anime DB workflow keepalive" note
+# for the manual Actions-tab step if the repo ever goes quiet that long.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # every Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python publish_anime_db.py --output-dir dist-anime-db
+      - name: Publish (or update) the rolling anime-db-latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TAG=anime-db-latest
+          BUILT=$(python -c "import json; print(json.load(open('dist-anime-db/latest.json'))['built'])")
+          NOTES="Rebuilt $BUILT — manami-only (ODbL 1.0, see NOTICE). Fribb + Anime-Lists id mappings are merged locally by each client, not shipped here."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              dist-anime-db/anime-db.sqlite.gz \
+              dist-anime-db/latest.json \
+              dist-anime-db/NOTICE \
+              --clobber
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" \
+              dist-anime-db/anime-db.sqlite.gz \
+              dist-anime-db/latest.json \
+              dist-anime-db/NOTICE \
+              --title "Anime DB (rolling)" \
+              --notes "$NOTES" \
+              --latest=false
+          fi

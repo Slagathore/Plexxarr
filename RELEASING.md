@@ -43,3 +43,16 @@ before zipping, and never zip a staged folder (staging injects the local
 9. **Locally**: `python stage_build.py` re-stages the new build with the
    local `.env`, and running `setup_autostart.bat` (elevated) repoints the
    autostart task at it.
+
+## Anime DB workflow keepalive
+
+`.github/workflows/anime-db.yml` (Task I) rebuilds and republishes the
+weekly anime metadata artifact on a Monday cron, under the rolling
+`anime-db-latest` tag (never marked "latest" release — that stays on the
+app's own version tag, see the workflow's header comment). GitHub disables a
+scheduled workflow automatically after 60 days with no repository activity.
+If the repo goes quiet that long: open the Actions tab, find "anime-db" in
+the left sidebar, and click "Enable workflow" (a `workflow_dispatch` run by
+hand does NOT re-enable a disabled cron by itself). A normal `git push` to
+master before the 60-day mark keeps the schedule alive with no action
+needed.
