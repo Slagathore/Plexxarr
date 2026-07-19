@@ -4,21 +4,24 @@
 # Builds the weekly anime-metadata artifact that .github/workflows/anime-db.yml
 # attaches to a GitHub Release (Task I / FIX_SPRINT_BOOTSTRAP.md section I).
 #
-# Contains ONLY manami-project/anime-offline-database tables (ODbL 1.0, with
-# a NOTICE, share-alike). Fribb/anime-lists and Anime-Lists/anime-lists
-# publish no license file at all — there is no permission to redistribute
-# their id mappings — so this artifact never includes them. Every Sensarr
-# client fetches those two small dumps directly from their own canonical
-# raw.githubusercontent URLs and merges them locally after downloading this
-# artifact (anime_db._merge_local_id_sources), exactly like the full local
-# build always did for all three sources.
+# Bundles ALL THREE sources: manami-project/anime-offline-database (ODbL
+# 1.0, share-alike, attribution required — see NOTICE) plus the Fribb/
+# anime-lists and Anime-Lists/anime-lists id mappings. Neither of the latter
+# two publishes a license file, so there is no permission-by-license to
+# redistribute their data. DECISION (Cole, 2026-07-19): bundle them anyway,
+# knowingly accepting that risk, with attribution to both projects in the
+# NOTICE — see NOTICE_TEXT below and .github/workflows/anime-db.yml's header
+# comment. Fribb/Anime-Lists are fetched with graceful degradation: either
+# (or both) being unreachable at build time still produces a valid artifact
+# (manami tables alone are enough), it just ships without that source's
+# mappings until the next successful weekly build.
 #
 # Headless, no upload logic: the workflow does the `gh release` calls. This
 # script only produces the four files a release needs in --output-dir:
 #   anime-db.sqlite      (uncompressed, for local inspection — not uploaded)
 #   anime-db.sqlite.gz   (the artifact clients actually download)
 #   latest.json          (the manifest: schema_version, built, sha256, url, bytes)
-#   NOTICE                (ODbL attribution — covers manami only, see above)
+#   NOTICE                (attribution for all three sources, see NOTICE_TEXT)
 #
 # Run: python publish_anime_db.py --output-dir dist-anime-db
 # =============================================================================
@@ -42,28 +45,27 @@ MANIFEST_NAME = "latest.json"
 NOTICE_NAME = "NOTICE"
 
 NOTICE_TEXT = """\
-This file (anime-db.sqlite.gz) is a derivative database built from:
+This file (anime-db.sqlite.gz) contains data derived from anime-offline-database
+by manami-project (https://github.com/manami-project/anime-offline-database),
+made available under the Open Database License (ODbL) v1.0:
+https://opendatacommons.org/licenses/odbl/1-0/
+Individual contents are licensed under the Database Contents License (DbCL)
+v1.0: https://opendatacommons.org/licenses/dbcl/1-0/
 
-  anime-offline-database
-  https://github.com/manami-project/anime-offline-database
-  Copyright (c) manami-project and contributors
-  Database structure licensed under the Open Database License (ODbL) v1.0:
-  https://opendatacommons.org/licenses/odbl/1-0/
-  Individual contents licensed under the Database Contents License (DbCL) v1.0:
-  https://opendatacommons.org/licenses/dbcl/1-0/
+As a derivative database, this artifact (Sensarr's weekly anime-db.sqlite.gz
+release, published from github.com/{repo}) is likewise made available under
+the Open Database License v1.0. You are free to share, create, and adapt it
+under that license, which requires attribution and share-alike
+redistribution of anything you publish derived from it.
 
-As a share-alike derivative database, this artifact (Sensarr's weekly
-anime-db.sqlite.gz release, published from github.com/{repo}) is ALSO
-distributed under the Open Database License v1.0. You are free to share,
-create, and adapt it under that license, which requires attribution and
-share-alike redistribution of anything you publish derived from it.
-
-This artifact does NOT contain data from Fribb/anime-lists or
-Anime-Lists/anime-lists. Neither project publishes a license file, so
-Sensarr does not redistribute their id mappings. Sensarr clients fetch those
-two small dumps directly from their own canonical GitHub URLs at refresh
-time and merge them locally on your machine — they are never part of this
-published artifact.
+It also contains ID mappings from Fribb/anime-lists
+(https://github.com/Fribb/anime-lists) and Anime-Lists/anime-lists
+(https://github.com/Anime-Lists/anime-lists), which do not declare a
+license for their data. Those mappings are treated as factual data (ids are
+not copyrightable expression) and are redistributed here with attribution
+to their sources above — a deliberate, informed choice by the Sensarr
+maintainer, not a claim that either project has licensed its data for
+redistribution.
 
 Built by: Sensarr (https://github.com/{repo})
 """
@@ -101,15 +103,36 @@ def _checkpoint_and_vacuum(db_path: Path) -> None:
         db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
 
 
-def package_artifact(manami: dict, output_dir: Path, *, tag: str = DEFAULT_TAG,
+def package_artifact(manami: dict, output_dir: Path, *, fribb: list | None = None,
+                     xml_root=None, tag: str = DEFAULT_TAG,
                      repo: str = DEFAULT_REPO) -> dict:
-    """Build the manami-only DB, checkpoint+vacuum+gzip+hash it, and write
-    latest.json + NOTICE into output_dir. Returns the manifest dict."""
+    """Build the FULL DB (manami + Fribb + Anime-Lists merge — Cole's
+    2026-07-19 decision to bundle all three, see the module header),
+    checkpoint+vacuum+gzip+hash it, and write latest.json + NOTICE into
+    output_dir. Returns the manifest dict.
+
+    fribb/xml_root default to a live fetch (anime_db._fetch_fribb /
+    _fetch_anime_lists_xml, both already degrade to an empty/None result on
+    their own on any failure — never raise) so a normal CI run needs no
+    extra wiring. Tests pass them in directly to stay fully offline and to
+    exercise the degraded (manami-only) publish path on demand.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     db_path = output_dir / ARTIFACT_NAME
     db_path.unlink(missing_ok=True)
 
-    anime_db.build_manami_artifact(manami, db_path)
+    if fribb is None:
+        fribb = anime_db._fetch_fribb()
+    if not fribb:
+        print("  Fribb id mappings unavailable/empty — publishing without "
+              "that source's mappings (degraded, not fatal).")
+    if xml_root is None:
+        xml_root = anime_db._fetch_anime_lists_xml()
+    if xml_root is None:
+        print("  Anime-Lists XML unavailable — publishing without curated "
+              "season/episode offsets from that source (degraded, not fatal).")
+
+    anime_db._build_database(manami, fribb, xml_root, db_path)
     _checkpoint_and_vacuum(db_path)
 
     db_bytes = db_path.read_bytes()
@@ -132,7 +155,7 @@ def package_artifact(manami: dict, output_dir: Path, *, tag: str = DEFAULT_TAG,
         NOTICE_TEXT.format(repo=repo), encoding="utf-8")
 
     print(f"Built {ARTIFACT_NAME}: {len(manami.get('data', []))} entries, "
-          f"schema {anime_db._SCHEMA_VERSION}")
+          f"{len(fribb)} Fribb mappings, schema {anime_db._SCHEMA_VERSION}")
     print(f"  {GZ_NAME}: {len(gz_bytes):,} bytes, sha256 {sha256}")
     print(f"  {MANIFEST_NAME} + {NOTICE_NAME} written to {output_dir}")
     return manifest
@@ -140,7 +163,8 @@ def package_artifact(manami: dict, output_dir: Path, *, tag: str = DEFAULT_TAG,
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Build the weekly manami-only anime-db release artifact.")
+        description="Build the weekly anime-db release artifact "
+                    "(manami + Fribb + Anime-Lists).")
     parser.add_argument("--output-dir", required=True, type=Path,
                         help="Directory to write anime-db.sqlite(.gz)/latest.json/NOTICE into.")
     parser.add_argument("--tag", default=DEFAULT_TAG,

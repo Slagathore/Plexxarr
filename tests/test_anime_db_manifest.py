@@ -45,10 +45,12 @@ def db_path(tmp_path, monkeypatch) -> Path:
     return path
 
 
-def _gz_of(manami: dict, tmp_path: Path, name: str = "artifact.sqlite") -> tuple[bytes, str]:
-    """Build a manami-only artifact and return (gz_bytes, sha256_hex)."""
+def _gz_of(manami: dict, tmp_path: Path, *, fribb: list | None = None,
+          xml_root=None, name: str = "artifact.sqlite") -> tuple[bytes, str]:
+    """Build an artifact — manami-only by default, or with bundled mappings
+    when fribb/xml_root are given — and return (gz_bytes, sha256_hex)."""
     dest = tmp_path / name
-    anime_db.build_manami_artifact(manami, dest)
+    anime_db._build_database(manami, fribb or [], xml_root, dest)
     raw = dest.read_bytes()
     gz = gzip.compress(raw, compresslevel=9, mtime=0)
     return gz, hashlib.sha256(gz).hexdigest()
@@ -338,8 +340,12 @@ def test_merge_failure_after_swap_does_not_undo_swap(db_path, tmp_path, monkeypa
 # ---------------------------------------------------------------------------
 
 def test_publish_script_package_artifact_round_trip(tmp_path):
+    """Normal publish: Cole's 2026-07-19 decision bundles all three sources,
+    so a successful build with both mapping sources available must ship
+    with `mappings` populated, not empty."""
     out_dir = tmp_path / "dist-anime-db"
-    manifest = publish_anime_db.package_artifact(SAMPLE_MANAMI, out_dir)
+    manifest = publish_anime_db.package_artifact(
+        SAMPLE_MANAMI, out_dir, fribb=SAMPLE_FRIBB, xml_root=SAMPLE_XML)
 
     gz_path = out_dir / publish_anime_db.GZ_NAME
     db_path_out = out_dir / publish_anime_db.ARTIFACT_NAME
@@ -359,8 +365,6 @@ def test_publish_script_package_artifact_round_trip(tmp_path):
     assert not (out_dir / (publish_anime_db.ARTIFACT_NAME + "-shm")).exists()
 
     decompressed = gzip.decompress(gz_bytes)
-    conn = sqlite3.connect(":memory:")
-    conn.close()
     tmp_db = tmp_path / "roundtrip.sqlite"
     tmp_db.write_bytes(decompressed)
     conn = sqlite3.connect(str(tmp_db))
@@ -374,30 +378,89 @@ def test_publish_script_package_artifact_round_trip(tmp_path):
         title_row = conn.execute(
             "SELECT title FROM anime WHERE title='Mashle'").fetchone()
         assert title_row is not None
-        # Manami-only: mappings table exists (schema parity) but is empty.
-        mapping_count = conn.execute("SELECT COUNT(*) FROM mappings").fetchone()[0]
-        assert mapping_count == 0
+        # Bundled: Fribb + Anime-Lists mappings ship IN the artifact now.
+        mapping_row = conn.execute(
+            "SELECT tvdb_id FROM mappings WHERE anidb_id=17478").fetchone()
+        assert mapping_row and mapping_row[0] == 421737
     finally:
         conn.close()
 
     notice = notice_path.read_text(encoding="utf-8")
     assert "ODbL" in notice
-    assert "does NOT contain data from Fribb" in notice
+    assert "Fribb/anime-lists" in notice
+    assert "Anime-Lists/anime-lists" in notice
+    # Wraps across a line in NOTICE_TEXT — check both halves rather than one
+    # contiguous phrase.
+    assert "do not declare a" in notice
+    assert "license for their data" in notice
+
+
+def test_publish_script_degrades_to_manami_only_when_mapping_sources_unavailable(
+        tmp_path, capsys):
+    """Graceful degradation: an explicitly empty/absent Fribb/Anime-Lists
+    source (simulating "unreachable at build time") must still produce a
+    valid, publishable artifact — manami tables alone are enough — and the
+    degradation must be visible in the script's own output, never a hard
+    failure of the whole weekly build."""
+    out_dir = tmp_path / "dist-anime-db"
+    manifest = publish_anime_db.package_artifact(
+        SAMPLE_MANAMI, out_dir, fribb=[], xml_root=None)
+    assert manifest["schema_version"] == anime_db._SCHEMA_VERSION
+
+    captured = capsys.readouterr()
+    assert "Fribb id mappings unavailable" in captured.out
+    assert "Anime-Lists XML unavailable" in captured.out
+
+    gz_bytes = (out_dir / publish_anime_db.GZ_NAME).read_bytes()
+    decompressed = gzip.decompress(gz_bytes)
+    tmp_db = tmp_path / "degraded.sqlite"
+    tmp_db.write_bytes(decompressed)
+    conn = sqlite3.connect(str(tmp_db))
+    try:
+        title_row = conn.execute(
+            "SELECT title FROM anime WHERE title='Mashle'").fetchone()
+        assert title_row is not None
+        mapping_count = conn.execute("SELECT COUNT(*) FROM mappings").fetchone()[0]
+        assert mapping_count == 0
+    finally:
+        conn.close()
+
+
+def test_publish_script_default_fetch_degrades_when_network_down(
+        tmp_path, monkeypatch, capsys):
+    """package_artifact's DEFAULT path (no fribb/xml_root override) fetches
+    live via anime_db._fetch_fribb/_fetch_anime_lists_xml. Both already
+    degrade to empty/None internally rather than raise — this proves the
+    publish script's actual default code path inherits that degradation and
+    still finishes successfully, not just the explicit-empty-args case
+    above."""
+    def always_fails(url, timeout=180):
+        raise RuntimeError("simulated network failure")
+    monkeypatch.setattr(anime_db, "_download", always_fails)
+
+    out_dir = tmp_path / "dist-anime-db"
+    manifest = publish_anime_db.package_artifact(SAMPLE_MANAMI, out_dir)
+    assert manifest["schema_version"] == anime_db._SCHEMA_VERSION
+
+    captured = capsys.readouterr()
+    assert "Fribb id mappings unavailable" in captured.out
+    assert "Anime-Lists XML unavailable" in captured.out
 
 
 def test_publish_then_client_refresh_end_to_end(db_path, tmp_path, monkeypatch):
     """The closing gate's local round-trip proof: publish_anime_db builds the
-    artifact exactly like CI would, and anime_db._refresh_from_manifest()
-    consumes it exactly like a real client would — entirely offline."""
+    FULL artifact (bundled mappings) exactly like CI would, and
+    anime_db._refresh_from_manifest() consumes it exactly like a real client
+    would — entirely offline. Fribb/Anime-Lists URLs are deliberately NOT
+    registered in the mock: a bundled artifact must never re-fetch them."""
     out_dir = tmp_path / "dist-anime-db"
-    manifest = publish_anime_db.package_artifact(SAMPLE_MANAMI, out_dir)
+    manifest = publish_anime_db.package_artifact(
+        SAMPLE_MANAMI, out_dir, fribb=SAMPLE_FRIBB, xml_root=SAMPLE_XML)
     gz_bytes = (out_dir / publish_anime_db.GZ_NAME).read_bytes()
 
     url_map = {
         anime_db.MANIFEST_URL: json.dumps(manifest).encode(),
         manifest["url"]: gz_bytes,
-        anime_db._FRIBB_URL: json.dumps(SAMPLE_FRIBB).encode(),
-        anime_db._ANIME_LISTS_XML_URL: ET.tostring(SAMPLE_XML),
     }
     _mock_downloads(monkeypatch, url_map)
 
@@ -405,5 +468,53 @@ def test_publish_then_client_refresh_end_to_end(db_path, tmp_path, monkeypatch):
     assert "published artifact" in summary
     hits = anime_db.search("Mashle")
     assert hits and hits[0].anidb_id == 17478
+    mapping = anime_db.mapping_for_anidb(17478)
+    assert mapping is not None and mapping["tvdb_id"] == 421737
+
+
+# ---------------------------------------------------------------------------
+# Client-side redundant-merge skip (Task I follow-up, 2026-07-19): a bundled
+# artifact must not re-fetch Fribb/Anime-Lists; a mappings-empty artifact
+# (manami-only — an older publish, or a degraded CI build) must still fall
+# back to the local merge.
+# ---------------------------------------------------------------------------
+
+def test_refresh_skips_redundant_merge_when_artifact_bundles_mappings(
+        db_path, tmp_path, monkeypatch):
+    gz, sha = _gz_of(SAMPLE_MANAMI, tmp_path, fribb=SAMPLE_FRIBB, xml_root=SAMPLE_XML)
+    manifest = _manifest_for(gz, sha, built="2099-01-01T00:00:00Z")
+
+    def trap(url, timeout=180):
+        if url in (anime_db._FRIBB_URL, anime_db._ANIME_LISTS_XML_URL):
+            raise AssertionError(
+                f"redundant fetch of {url} — a bundled artifact must skip this")
+        if url == anime_db.MANIFEST_URL:
+            return json.dumps(manifest).encode()
+        if url == manifest["url"]:
+            return gz
+        raise RuntimeError(f"unexpected url {url}")
+
+    monkeypatch.setattr(anime_db, "_download", trap)
+
+    summary = anime_db.refresh(force=True)
+    assert "published artifact" in summary
+    mapping = anime_db.mapping_for_anidb(17478)
+    assert mapping is not None and mapping["tvdb_id"] == 421737
+
+
+def test_refresh_still_merges_locally_when_artifact_has_no_mappings(
+        db_path, tmp_path, monkeypatch):
+    gz, sha = _gz_of(SAMPLE_MANAMI, tmp_path)  # manami-only: empty mappings
+    manifest = _manifest_for(gz, sha, built="2099-01-01T00:00:00Z")
+    url_map = {
+        anime_db.MANIFEST_URL: json.dumps(manifest).encode(),
+        manifest["url"]: gz,
+        anime_db._FRIBB_URL: json.dumps(SAMPLE_FRIBB).encode(),
+        anime_db._ANIME_LISTS_XML_URL: ET.tostring(SAMPLE_XML),
+    }
+    _mock_downloads(monkeypatch, url_map)
+
+    summary = anime_db.refresh(force=True)
+    assert "published artifact" in summary
     mapping = anime_db.mapping_for_anidb(17478)
     assert mapping is not None and mapping["tvdb_id"] == 421737

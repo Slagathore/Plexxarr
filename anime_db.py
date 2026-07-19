@@ -55,25 +55,28 @@ _ANIME_LISTS_XML_URL = "https://raw.githubusercontent.com/Anime-Lists/anime-list
 # ---------------------------------------------------------------------------
 # Weekly manifest distribution (Task I / FIX_SPRINT_BOOTSTRAP.md section I).
 #
-# CI (.github/workflows/anime-db.yml) builds a manami-only artifact weekly
-# and publishes it under a dedicated ROLLING tag — never a dated tag — so the
-# client never needs the GitHub API (rate-limited, and `/releases/latest`
-# would otherwise collide with updater.py's own use of that exact endpoint
-# for APP updates: if the anime-db publish used a dated tag, GitHub would
-# mark it "latest" and updater.check_for_update() would start reading the
-# anime-db release instead of the newest app version). A rolling tag gives
-# fixed, permanent asset URLs and is published with --latest=false so the
-# app's own release stays "latest".
+# CI (.github/workflows/anime-db.yml) builds the FULL artifact weekly (all
+# three sources merged, exactly like the local build below) and publishes it
+# under a dedicated ROLLING tag — never a dated tag — so the client never
+# needs the GitHub API (rate-limited, and `/releases/latest` would otherwise
+# collide with updater.py's own use of that exact endpoint for APP updates:
+# if the anime-db publish used a dated tag, GitHub would mark it "latest" and
+# updater.check_for_update() would start reading the anime-db release instead
+# of the newest app version). A rolling tag gives fixed, permanent asset URLs
+# and is published with --latest=false so the app's own release stays
+# "latest".
 #
-# Licensing (checked 2026-07-18, see FIX_SPRINT_BOOTSTRAP.md section I): the
-# published artifact carries ONLY manami-project/anime-offline-database
-# tables (ODbL 1.0, share-alike, attribution required — see NOTICE). Fribb/
-# anime-lists and Anime-Lists/anime-lists publish no license file at all, so
-# there is no permission to redistribute their id mappings in our artifact;
-# every client keeps fetching those two small dumps from their own canonical
-# raw.githubusercontent URLs at refresh time and merges them locally, same
-# as today, just on top of the manifest-downloaded manami tables instead of
-# a locally-built copy.
+# Licensing (checked 2026-07-18, see FIX_SPRINT_BOOTSTRAP.md section I):
+# manami-project/anime-offline-database is ODbL 1.0 (share-alike,
+# attribution required — see NOTICE via publish_anime_db.py). Fribb/
+# anime-lists and Anime-Lists/anime-lists publish no license file at all —
+# there is no permission-by-license to redistribute their id mappings.
+# DECISION (Cole, 2026-07-19): bundle all three sources in the published
+# artifact anyway, knowingly accepting the unlicensed-mappings risk, with
+# attribution to both projects in the NOTICE. Clients that already have a
+# manami-only artifact (an older publish, or a build that degraded when a
+# mapping source was unreachable) still merge Fribb/Anime-Lists locally as a
+# fallback — see _merge_local_id_sources() / _refresh_from_manifest().
 # ---------------------------------------------------------------------------
 _REPO = "Slagathore/Sensarr"
 _MANIFEST_TAG = "anime-db-latest"
@@ -119,6 +122,31 @@ def _download(url: str, timeout: int = 180) -> bytes:
     })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
+
+
+def _fetch_fribb(timeout: int = 180) -> list:
+    """Fribb id-mapping dump. Best-effort: unreachable/malformed degrades to
+    an empty list rather than raising — shared by refresh()'s full local
+    build, the manifest-artifact fallback merge, and publish_anime_db.py's
+    CI build, none of which should ever fail outright just because this one
+    optional mapping source is down."""
+    try:
+        fribb = json.loads(_download(_FRIBB_URL, timeout=timeout).decode("utf-8"))
+        return fribb if isinstance(fribb, list) else []
+    except Exception as exc:
+        logger.warning("Fribb anime-lists download failed: %s", exc)
+        return []
+
+
+def _fetch_anime_lists_xml(timeout: int = 180):
+    """Anime-Lists curated XML. Best-effort: unreachable/malformed degrades
+    to None (see _fetch_fribb's docstring for why)."""
+    try:
+        return ET.fromstring(_download(_ANIME_LISTS_XML_URL, timeout=timeout)
+                             .decode("utf-8", "replace"))
+    except Exception as exc:
+        logger.warning("Anime-Lists XML download failed: %s", exc)
+        return None
 
 
 def _extract_ids(sources: list[str]) -> dict[str, int]:
@@ -340,27 +368,15 @@ def _build_database(manami: dict, fribb: list, xml_root, dest: Path) -> None:
 
 
 def build_manami_artifact(manami: dict, dest: Path) -> None:
-    """Build the manami-ONLY artifact published weekly by CI (Task I). Only
-    tables derived from manami-project/anime-offline-database (ODbL 1.0) are
-    populated — no Fribb/Anime-Lists data, per the licensing default plan
-    (see the module-level comment above _REPO). The `mappings` table exists
-    for schema parity but stays empty; refresh() fills it in locally after
-    downloading this artifact, exactly like the full local build does today.
+    """Manami-ONLY build (no Fribb/Anime-Lists merge): a thin convenience
+    wrapper over _build_database for tests/tools that want a minimal
+    artifact without fetching mapping sources, and for the degraded-publish
+    path when both mapping sources are unreachable at build time. The real
+    weekly artifact bundles all three sources (Cole's 2026-07-19 decision,
+    see the module-level comment above _REPO) via publish_anime_db.py
+    calling _build_database directly.
     """
-    tmp = dest.with_suffix(".building")
-    tmp.unlink(missing_ok=True)
-    conn = _connect(tmp)
-    try:
-        _build_schema(conn)
-        has_fts = bool(conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE name='titles_fts'").fetchone())
-        rows = _insert_manami_rows(conn, manami, has_fts)
-        _write_build_meta(conn, len(rows))
-        conn.commit()
-    finally:
-        conn.close()
-    dest.unlink(missing_ok=True)
-    tmp.rename(dest)
+    _build_database(manami, [], None, dest)
 
 
 def _schema_current() -> bool:
@@ -473,6 +489,23 @@ def check_for_manifest_update() -> bool:
     return state == _MANIFEST_NEWER
 
 
+def _mappings_count(dest: Path) -> int:
+    """Row count of the swapped-in DB's `mappings` table. A bundled artifact
+    (the normal case since Cole's 2026-07-19 decision) arrives with this
+    already populated; a manami-only artifact (an older publish, or a
+    degraded CI build — see build_manami_artifact) arrives with it empty.
+    Any read failure counts as 0 — safer to attempt the fallback merge than
+    silently skip it."""
+    try:
+        conn = sqlite3.connect(str(dest))
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM mappings").fetchone()[0])
+        finally:
+            conn.close()
+    except (sqlite3.Error, TypeError):
+        return 0
+
+
 def _atomic_swap(tmp: Path, dest: Path) -> None:
     """os.replace is atomic on both platforms, but stale -wal/-shm sidecars
     left over from the PREVIOUS database would otherwise apply to the new
@@ -483,26 +516,17 @@ def _atomic_swap(tmp: Path, dest: Path) -> None:
 
 
 def _merge_local_id_sources(dest: Path) -> None:
-    """Best-effort client-side merge of Fribb + Anime-Lists onto an
-    already-swapped manami-only artifact (the licensing default plan keeps
-    both out of the redistributed artifact). Failure here does NOT undo the
-    swap: the manami tables are already a strict improvement over whatever
-    was there before, and the next refresh (weekly tick or the next manifest
-    poll) retries the merge."""
-    fribb: list = []
-    try:
-        fribb = json.loads(_download(_FRIBB_URL).decode("utf-8"))
-        if not isinstance(fribb, list):
-            fribb = []
-    except Exception as exc:
-        logger.warning("Fribb anime-lists download failed: %s", exc)
-
-    xml_root = None
-    try:
-        xml_root = ET.fromstring(_download(_ANIME_LISTS_XML_URL).decode("utf-8", "replace"))
-    except Exception as exc:
-        logger.warning("Anime-Lists XML download failed: %s", exc)
-
+    """Fallback client-side merge of Fribb + Anime-Lists onto an
+    already-swapped artifact that came down WITHOUT bundled mappings — an
+    older publish, or a CI run that degraded when a mapping source was
+    unreachable at build time (the real weekly artifact bundles all three
+    sources since Cole's 2026-07-19 decision; see _refresh_from_manifest,
+    which only calls this when the swapped-in mappings table is empty).
+    Failure here does NOT undo the swap: the manami tables are already a
+    strict improvement over whatever was there before, and the next refresh
+    (weekly tick or the next manifest poll) retries the merge."""
+    fribb = _fetch_fribb()
+    xml_root = _fetch_anime_lists_xml()
     if not fribb and xml_root is None:
         return
     conn = _connect(dest)
@@ -577,11 +601,19 @@ def _refresh_from_manifest() -> str | None:
     summary = f"anime metadata replaced from published artifact (schema {artifact_schema})"
     logger.info(summary)
 
-    try:
-        _merge_local_id_sources(dest)
-    except Exception:
-        logger.exception("Anime DB local id-mapping merge failed (non-fatal — "
-                         "manami tables are already live).")
+    # Bundled artifacts (the normal case) already carry Fribb/Anime-Lists
+    # mappings — fetching and merging them again would be pure redundant
+    # network traffic. Only a manami-only artifact (empty mappings table)
+    # needs the client-side fallback merge.
+    if _mappings_count(dest) == 0:
+        try:
+            _merge_local_id_sources(dest)
+        except Exception:
+            logger.exception("Anime DB local id-mapping merge failed (non-fatal — "
+                             "manami tables are already live).")
+    else:
+        logger.debug("Anime DB artifact already bundles id mappings — "
+                     "skipping the redundant local merge.")
     return summary
 
 
@@ -624,19 +656,8 @@ def refresh(force: bool = False) -> str:
         if not isinstance(manami, dict) or not manami.get("data"):
             raise RuntimeError("anime-offline-database download failed — kept previous data")
 
-        try:
-            fribb = json.loads(_download(_FRIBB_URL).decode("utf-8"))
-            if not isinstance(fribb, list):
-                fribb = []
-        except Exception as exc:
-            logger.warning("Fribb anime-lists download failed: %s", exc)
-            fribb = []
-
-        xml_root = None
-        try:
-            xml_root = ET.fromstring(_download(_ANIME_LISTS_XML_URL).decode("utf-8", "replace"))
-        except Exception as exc:
-            logger.warning("Anime-Lists XML download failed: %s", exc)
+        fribb = _fetch_fribb()
+        xml_root = _fetch_anime_lists_xml()
 
         _build_database(manami, fribb, xml_root, _db_path())
         summary = (f"anime metadata rebuilt: {len(manami.get('data', []))} entries, "

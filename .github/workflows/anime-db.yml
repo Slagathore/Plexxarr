@@ -1,6 +1,6 @@
 name: anime-db
 
-# Publishes the weekly manami-only anime metadata artifact that anime_db.py's
+# Publishes the weekly anime metadata artifact that anime_db.py's
 # manifest-first refresh() path pulls instead of every install rebuilding
 # from all three upstream sources itself (Task I / FIX_SPRINT_BOOTSTRAP.md
 # section I; publish_anime_db.py does the actual build).
@@ -11,11 +11,18 @@ name: anime-db
 # 1.0 with attribution (see publish_anime_db.py's NOTICE text / the NOTICE
 # asset below). Fribb/anime-lists and Anime-Lists/anime-lists have NO
 # license file at all (GitHub's license API 404s on both) — there is no
-# permission-by-license to redistribute their id mappings, so this
-# artifact NEVER includes them. Every client fetches those two small dumps
-# from their own canonical raw.githubusercontent URLs at refresh time and
-# merges them locally on top of this artifact, exactly like the old
-# all-local build did for all three sources.
+# permission-by-license to redistribute their id mappings.
+#
+# DECISION (Cole, 2026-07-19): bundle all three sources in this artifact
+# anyway, knowingly accepting the unlicensed-mappings risk, with attribution
+# to both projects in the NOTICE asset (their id mappings are treated as
+# factual data, not copyrightable expression — see publish_anime_db.py's
+# NOTICE_TEXT for the exact wording). This supersedes the earlier
+# manami-only default plan from FIX_SPRINT_BOOTSTRAP.md section I. The
+# build still degrades gracefully: if Fribb or Anime-Lists is unreachable
+# at build time, the artifact still publishes with whatever merged
+# (manami tables alone are always enough for a valid artifact) rather than
+# failing the whole weekly run over one optional mapping source.
 #
 # Tag choice: a single ROLLING tag (anime-db-latest), not a dated tag, always
 # published with --latest=false. Two reasons:
@@ -57,7 +64,7 @@ jobs:
           set -eu
           TAG=anime-db-latest
           BUILT=$(python -c "import json; print(json.load(open('dist-anime-db/latest.json'))['built'])")
-          NOTES="Rebuilt $BUILT — manami-only (ODbL 1.0, see NOTICE). Fribb + Anime-Lists id mappings are merged locally by each client, not shipped here."
+          NOTES="Rebuilt $BUILT — manami (ODbL 1.0) plus Fribb + Anime-Lists id mappings (unlicensed, bundled with attribution per Cole's 2026-07-19 decision). See NOTICE."
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" \
               dist-anime-db/anime-db.sqlite.gz \
