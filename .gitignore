@@ -76,3 +76,9 @@ plexxarr.pid
 
 # Private audit notes, never commit
 *AUDIT*.md
+
+# Private planning/bootstrap notes, never commit
+*BOOTSTRAP*.md
+
+# Local backup snapshots, never commit
+backups/

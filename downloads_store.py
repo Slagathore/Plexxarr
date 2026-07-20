@@ -594,11 +594,16 @@ def get_want(download_id: int) -> dict | None:
 
 
 def delete_download(download_id: int) -> None:
-    """Hard-delete a download row. Retained for callers that truly want the row
-    gone; the DEFAULT removal path is tombstone_download (Task C item 3), which
-    keeps the row + its provenance and merely archives it."""
+    """Hard-delete a download row AND its history. Retained for callers that
+    truly want the row gone; the DEFAULT removal path is tombstone_download
+    (Task C item 3), which keeps the row + its provenance and merely archives
+    it. Without the history delete here, download_history rows for a
+    hard-deleted download would orphan forever (nothing else ever cleans
+    them up by download_id)."""
     with _DL_LOCK, db.connect() as conn:
         conn.execute("DELETE FROM downloads WHERE id = ?", (download_id,))
+        conn.execute("DELETE FROM download_history WHERE download_id = ?",
+                     (download_id,))
         conn.commit()
 
 
@@ -876,6 +881,42 @@ def list_history(*, limit: int = 200) -> list[HistoryRow]:
             (limit,),
         ).fetchall()
     return [HistoryRow(*r) for r in rows]
+
+
+# Release audit: download_history is a forever-growing audit trail (every
+# download/rename/move/error writes a row). Prune anything older than this
+# many days so the table doesn't grow unbounded. A named constant (no config
+# knob) per the fix batch — longer than the 90-day selection-run retention
+# below because this is the human-readable download trail, not per-loser
+# selection forensics.
+DOWNLOAD_HISTORY_RETENTION_DAYS = 180
+
+
+def prune_download_history(*, days: float = DOWNLOAD_HISTORY_RETENTION_DAYS,
+                           now: str | None = None) -> int:
+    """Delete download_history rows older than `days` (default 180). Runs
+    from the same daily maintenance pass that calls
+    prune_selection_run_details. Returns the number of rows deleted.
+
+    The cutoff is formatted exactly like SQLite's CURRENT_TIMESTAMP (the
+    default that populates download_history.at), so the comparison is a
+    correct plain string comparison instead of mixing date formats.
+    """
+    import datetime as _dt
+    if now is None:
+        now_dt = _dt.datetime.now(_dt.timezone.utc)
+    else:
+        now_dt = _dt.datetime.fromisoformat(now)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=_dt.timezone.utc)
+    cutoff = (now_dt - _dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM download_history WHERE at < ?", (cutoff,))
+        conn.commit()
+        return cursor.rowcount or 0
 
 
 # ---------------------------------------------------------------------------

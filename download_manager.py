@@ -744,6 +744,10 @@ class DownloadManager:
         # Task G: one derived SizePick per show PER PASS (the library sample is
         # re-read at the start of each auto-grab pass, not on every candidate).
         self._size_pick_cache: dict[int, size_match.SizePick] = {}
+        # Cosmetic-but-clean (release audit): signals the queue-monitor daemon
+        # thread to stop. shutdown() sets this so the thread actually exits
+        # instead of looping forever with no way to tell it to quit.
+        self._stop_event = threading.Event()
         downloads_store.initialize_downloads_db()
         self._recover_previous_session()
         threading.Thread(target=self._queue_monitor, name="dl-queue-monitor",
@@ -947,10 +951,12 @@ class DownloadManager:
     # ------------------------------------------------------------------
 
     def shutdown(self) -> None:
-        """Graceful close: kill our runner processes and requeue their rows
-        (progress kept — webtorrent re-verifies on resume). Without this,
-        runners survive as headless orphans that download into staging and
-        hold file locks until the next launch's recovery sweep."""
+        """Graceful close: stop the queue-monitor loop, kill our runner
+        processes, and requeue their rows (progress kept — webtorrent
+        re-verifies on resume). Without this, runners survive as headless
+        orphans that download into staging and hold file locks until the
+        next launch's recovery sweep."""
+        self._stop_event.set()
         with self._lock:
             procs = dict(self._processes)
             self._processes.clear()
@@ -1068,9 +1074,15 @@ class DownloadManager:
 
     def _queue_monitor(self) -> None:
         """Every minute: pump the queue, and rotate out any active download
-        that hasn't moved in DOWNLOAD_SLOW_ROTATE_MINUTES while others wait."""
-        while True:
-            time.sleep(60)
+        that hasn't moved in DOWNLOAD_SLOW_ROTATE_MINUTES while others wait.
+
+        Event.wait(60) doubles as the sleep AND the stop check: it returns
+        True the instant shutdown() sets _stop_event (exiting the loop right
+        away) or False after the 60s timeout (run another pass) — so the
+        loop actually exits instead of a bare `while True: time.sleep(60)`
+        with no way to signal it to stop.
+        """
+        while not self._stop_event.wait(60):
             try:
                 self._queue_monitor_pass()
             except Exception:
@@ -1089,6 +1101,13 @@ class DownloadManager:
             if row.status != "downloading":
                 self._progress_seen.pop(row.download_id, None)
                 self._rotation_count.pop(row.download_id, None)
+                # Release audit: _rotate_cooldown was set on every rotation
+                # (below) but only ever popped on the stall-to-error branch —
+                # a row that rotates once and then succeeds/errors/cancels on
+                # its next attempt leaked its entry here forever. Same
+                # lifecycle as the two pops above: once the row is no longer
+                # 'downloading', the cooldown bookkeeping for it is done.
+                self._rotate_cooldown.pop(row.download_id, None)
                 continue
             seen = self._progress_seen.get(row.download_id)
             if seen is None or seen[0] != row.progress:

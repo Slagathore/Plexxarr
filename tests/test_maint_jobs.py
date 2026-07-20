@@ -323,3 +323,33 @@ def test_history_lists_newest_first(registry):
     ours = [r for r in rows if r["tool_key"].startswith("t_hist_")]
     assert len(ours) == 3
     assert all(r["state"] == "done" for r in ours)
+
+
+def test_prune_deletes_old_rows_and_keeps_recent():
+    """Release audit: maintenance_jobs is a forever-growing journal.
+    initialize_maint_jobs_db() must prune rows older than
+    MAINT_JOB_RETENTION_DAYS (default 90) while leaving recent history alone."""
+    assert maint_jobs.MAINT_JOB_RETENTION_DAYS == 90
+    with db.connect() as conn:
+        conn.execute(maint_jobs._SCHEMA_JOBS)
+        old_cur = conn.execute(
+            "INSERT INTO maintenance_jobs (tool_key, label, state, queued_at, "
+            "finished_at) VALUES ('t_prune_old', 'Ancient run', 'done', "
+            "'2015-01-01 00:00:00', '2015-01-01 00:05:00')")
+        old_id = int(old_cur.lastrowid or 0)
+        recent_queued_at = maint_jobs._utcnow()
+        new_cur = conn.execute(
+            "INSERT INTO maintenance_jobs (tool_key, label, state, queued_at, "
+            "finished_at) VALUES ('t_prune_new', 'Recent run', 'done', ?, ?)",
+            (recent_queued_at, recent_queued_at))
+        new_id = int(new_cur.lastrowid or 0)
+        conn.commit()
+
+    maint_jobs.initialize_maint_jobs_db()
+
+    with db.connect() as conn:
+        remaining_ids = {r[0] for r in conn.execute(
+            "SELECT id FROM maintenance_jobs WHERE id IN (?, ?)",
+            (old_id, new_id)).fetchall()}
+    assert old_id not in remaining_ids, "row older than 90 days must be pruned"
+    assert new_id in remaining_ids, "recent row must survive the prune"

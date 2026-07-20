@@ -25,6 +25,8 @@
 import dataclasses
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -101,17 +103,36 @@ def save_json_cache(
     version: int,
     legacy_paths: Iterable[Path | str] = (),
 ) -> bool:
-    """Best-effort write. Returns True when the cache landed on disk.
+    """Best-effort ATOMIC write. Returns True when the cache landed on disk.
+
+    Writes to a temp file in the SAME directory first, then os.replace()s it
+    over the real path. A plain write_text() can leave a truncated/corrupt
+    file behind if the process dies (or is killed) mid-write; os.replace()
+    is an atomic rename on both Windows and POSIX, so a concurrent reader
+    only ever sees the old complete file or the new complete file.
 
     On success, deletes the given legacy pickle files — once a JSON cache
     exists the .pkl siblings are dead weight AND a lingering deserialization
     hazard for older builds.
     """
     path = Path(path)
+    tmp_path: str | None = None
     try:
         encoded = encode_payload(payload)
         text = json.dumps({"version": version, "payload": encoded})
-        path.write_text(text, encoding="utf-8")
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp_path, path)
+            tmp_path = None  # consumed by the replace — nothing left to clean up
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
     except Exception:
         logger.debug("JSON cache save failed for %s.", path, exc_info=True)
         return False

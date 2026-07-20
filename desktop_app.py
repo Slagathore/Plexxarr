@@ -3111,10 +3111,14 @@ class DesktopApp:
     def _refresh_logs(self) -> None:
         if self.log_text is None:
             return
-        logs = get_recent_logs()
-        if len(logs) == self._last_log_count:
+        # Compare the monotonic sequence, not len(): the ring buffer's length
+        # pins at its maxlen once full, which froze this tab permanently.
+        from app_logging import log_sequence
+        seq = log_sequence()
+        if seq == self._last_log_count:
             return
-        self._last_log_count = len(logs)
+        logs = get_recent_logs()
+        self._last_log_count = seq
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
         self.log_text.insert("1.0", "\n".join(logs))
@@ -3891,6 +3895,16 @@ class DesktopApp:
                                 pruned["runs_pruned"])
             except Exception:
                 logger.exception("Selection retention prune failed.")
+            # Release audit: download_history accumulates forever otherwise —
+            # prune rows past the retention default alongside the run above.
+            progress(phase="Pruning old download history…")
+            try:
+                history_deleted = downloads_store.prune_download_history()
+                if history_deleted:
+                    logger.info("Download history retention: pruned %s row(s).",
+                                history_deleted)
+            except Exception:
+                logger.exception("Download history prune failed.")
             # Piggyback the app-update check on the nightly pass.
             progress(phase="Checking for app updates…")
             try:

@@ -72,11 +72,20 @@ def _utcnow() -> str:
         "%Y-%m-%d %H:%M:%S")
 
 
+# Release audit: maintenance_jobs is a forever-growing run journal. Prune
+# anything older than this many days so the table doesn't grow unbounded.
+# A named constant (no config knob) per the fix batch.
+MAINT_JOB_RETENTION_DAYS = 90
+
+
 def initialize_maint_jobs_db() -> int:
-    """Create the journal table and mark stale rows interrupted.
+    """Create the journal table, mark stale rows interrupted, and prune runs
+    older than MAINT_JOB_RETENTION_DAYS.
 
     Any job persisted as 'running' (or still 'queued') belongs to a previous
-    process — its thread is gone. Returns how many rows were flipped.
+    process — its thread is gone. Returns how many rows were flipped (the
+    prune count is logged but not part of this return value, to keep the
+    existing caller contract unchanged).
     """
     with db.connect() as conn:
         conn.execute(_SCHEMA_JOBS)
@@ -90,9 +99,20 @@ def initialize_maint_jobs_db() -> int:
         )
         conn.commit()
         flipped = cur.rowcount or 0
+
+        cutoff = (datetime.datetime.now(datetime.timezone.utc)
+                  - datetime.timedelta(days=MAINT_JOB_RETENTION_DAYS)
+                  ).strftime("%Y-%m-%d %H:%M:%S")
+        prune_cur = conn.execute(
+            "DELETE FROM maintenance_jobs WHERE queued_at < ?", (cutoff,))
+        conn.commit()
+        pruned = prune_cur.rowcount or 0
     if flipped:
         logger.info("Maintenance journal: %d stale run(s) marked interrupted.",
                     flipped)
+    if pruned:
+        logger.info("Maintenance journal: pruned %d run(s) older than %d days.",
+                    pruned, MAINT_JOB_RETENTION_DAYS)
     return flipped
 
 

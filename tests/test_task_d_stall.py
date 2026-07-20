@@ -11,6 +11,7 @@
 #      (fetching metadata / no peers / stalled / waiting for slot / probing).
 # =============================================================================
 
+import threading
 import time
 
 import pytest
@@ -132,3 +133,55 @@ def test_rotate_window_never_preempts_the_runner_stall_timeout(monkeypatch):
 def test_display_status_labels(status, progress, error, phase, expected):
     assert downloads_store.display_status(
         status, progress, error=error, phase=phase) == expected
+
+
+# ---------------------------------------------------------------------------
+# Release audit: _rotate_cooldown leaked forever (set on every rotation,
+# popped only on the stall-to-error branch) and the queue-monitor daemon had
+# no stop flag.
+# ---------------------------------------------------------------------------
+
+def test_rotate_cooldown_popped_once_row_leaves_downloading(monkeypatch):
+    """A row that rotates back to 'queued' (not yet at DOWNLOAD_MAX_ROTATIONS)
+    must still have its _rotate_cooldown entry cleared once the monitor next
+    sees it out of 'downloading' — the same lifecycle _progress_seen and
+    _rotation_count already had. Before the fix, only the stall-to-error
+    branch ever popped _rotate_cooldown, so a row that rotated and then later
+    succeeded/errored/cancelled leaked its entry for the rest of the process."""
+    monkeypatch.setattr(config, "DOWNLOAD_MAX_ROTATIONS", 5)
+    dm = DownloadManager()
+    monkeypatch.setattr(dm, "_maybe_start_next", lambda: None)
+    monkeypatch.setattr(dm, "_notify", lambda *a, **k: None)
+
+    did = downloads_store.create_download(
+        title="Rotate Me", magnet="magnet:?xt=urn:btih:" + "a" * 40,
+        source="tpb", media_type="movie", request_id=None, staging_dir="/tmp",
+        planned_dest=None, planned_name=None, route_reason=None,
+        auto_rename=False, auto_move=False)
+
+    # First pass: force a stall so the row rotates back to 'queued' (rotation
+    # 1 of 5 — well under the cap, so this takes the plain-rotate branch that
+    # SETS _rotate_cooldown, not the stall-to-error branch that pops it).
+    downloads_store.set_status(did, "downloading")
+    dm._progress_seen[did] = (0.0, 0.0)
+    dm._queue_monitor_pass()
+    assert downloads_store.get_download(did).status == "queued"
+    assert did in dm._rotate_cooldown
+
+    # Second pass: the row is no longer 'downloading'. All three bookkeeping
+    # dicts must drop it, not just _progress_seen/_rotation_count.
+    dm._queue_monitor_pass()
+    assert did not in dm._rotate_cooldown
+    assert did not in dm._progress_seen
+    assert did not in dm._rotation_count
+
+
+def test_shutdown_sets_queue_monitor_stop_event(monkeypatch):
+    """shutdown() must signal the queue-monitor loop to stop instead of
+    leaving a bare daemon `while True` with no way to tell it to exit."""
+    dm = DownloadManager()
+    monkeypatch.setattr(dm, "_maybe_start_next", lambda: None)
+    assert isinstance(dm._stop_event, threading.Event)
+    assert not dm._stop_event.is_set()
+    dm.shutdown()
+    assert dm._stop_event.is_set()
