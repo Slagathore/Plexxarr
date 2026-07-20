@@ -65,15 +65,35 @@ jobs:
           TAG=anime-db-latest
           BUILT=$(python -c "import json; print(json.load(open('dist-anime-db/latest.json'))['built'])")
           NOTES="Rebuilt $BUILT — manami (ODbL 1.0) plus Fribb + Anime-Lists id mappings (unlicensed, bundled with attribution per Cole's 2026-07-19 decision). See NOTICE."
+          # Retry wrapper: GitHub's release/upload APIs throw transient
+          # 5xx errors (a real 502 killed run #1 after a good build); a
+          # failed weekly publish costs a whole week, so retry hard.
+          retry() {
+            for i in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "attempt $i failed: $* — sleeping $((i * 30))s" >&2
+              sleep $((i * 30))
+            done
+            echo "giving up after 5 attempts: $*" >&2
+            return 1
+          }
+          # A prior run that died mid-upload leaves a DRAFT release gh can't
+          # see by tag; delete any drafts for our tag so create can succeed.
+          gh api repos/${{ github.repository }}/releases --paginate \
+            --jq '.[] | select(.draft and .tag_name == "'"$TAG"'") | .id' 2>/dev/null \
+            | while read -r draft_id; do
+                echo "deleting dangling draft release $draft_id"
+                gh api -X DELETE "repos/${{ github.repository }}/releases/$draft_id" || true
+              done
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" \
+            retry gh release upload "$TAG" \
               dist-anime-db/anime-db.sqlite.gz \
               dist-anime-db/latest.json \
               dist-anime-db/NOTICE \
               --clobber
-            gh release edit "$TAG" --notes "$NOTES"
+            retry gh release edit "$TAG" --notes "$NOTES"
           else
-            gh release create "$TAG" \
+            retry gh release create "$TAG" \
               dist-anime-db/anime-db.sqlite.gz \
               dist-anime-db/latest.json \
               dist-anime-db/NOTICE \
