@@ -881,6 +881,10 @@ class DesktopApp:
             # rebuild_library_index_from_ui / _handle_library_reindex_result.
             ("Reindex", self.rebuild_library_index_from_ui,
              "Rebuild the local file index used by /search and the Library tab."),
+            ("Backfill Identity", self._run_identity_backfill,
+             "Resolve every library file to its provider identity (episode / "
+             "show-folder / download / provider lookup) so dupes, presence, and "
+             "rename use identity instead of guessing from filenames."),
             ("🔄 Re-run", self._maint_rerun_current,
              "Results are cached (even across restarts) — this forces a fresh "
              "scan of the tool currently displayed."),
@@ -3255,6 +3259,7 @@ class DesktopApp:
             "daily_check": self._run_daily_check,
             "movie_migration": self._run_movie_migration,
             "reindex": self.rebuild_library_index_from_ui,
+            "identity_backfill": self._run_identity_backfill,
         }
         runner = runners.get(tool)
         if runner is None:
@@ -3773,6 +3778,7 @@ class DesktopApp:
             "movie_migration": lambda res: self._handle_movie_migration_plan(*res),
             "combo_clean": lambda res: self._handle_combo_clean_result(job, res),
             "reindex": self._handle_library_reindex_result,
+            "identity_backfill": self._handle_identity_backfill_result,
         }
         handler = handlers.get(job.tool_key)
         if handler is None:
@@ -4309,9 +4315,17 @@ class DesktopApp:
 
         for group in sorted(singles, key=lambda g: -g.total_size_bytes):
             tag = media_type_for_path(group.candidates[0])
+            # Task J: mark how the group was keyed. An identity-keyed group
+            # shows its provenance (episode/show_folder/download/batch_lookup);
+            # a string-keyed group is flagged unidentified so the user knows it
+            # was matched on filename alone and can Resolve it instead.
+            if getattr(group, "unidentified", True):
+                header = f"[unidentified] {group.normalized_title}"
+            else:
+                header = f"[id:{group.resolved_by}] {group.normalized_title}"
             typed_rows.append((
                 tag,
-                ("", group.normalized_title,
+                ("", header,
                  f"{len(group.candidates)} copies",
                  self._fmt_bytes(group.total_size_bytes)),
                 # Same non-delete-action payload convention as the folder-pair
@@ -4342,6 +4356,49 @@ class DesktopApp:
             "Tick the rows you want to delete, then click 'Apply Selected'. "
             "Empty folders left behind will be reported separately so you "
             "can decide whether to remove them.",
+        )
+
+    # =====================================================================
+    # Maintenance tab — library identity backfill (Task J)
+    # =====================================================================
+
+    def _run_identity_backfill(self, *, from_idle: bool = False):
+        """Resolve library files to their provider identity as a registry job.
+        DB-only phases (episode / show-folder / moved-download) run first;
+        the provider-lookup phase for the remaining movies is rate-limited,
+        resumable, and cooperatively cancellable — it never blocks the UI."""
+        if not from_idle and not self._maint_require_library_paths("Backfill Identity"):
+            return None
+
+        def job(progress, cancel_check) -> Any:
+            import library_identity
+            summary = library_identity.backfill_identities(progress, cancel_check)
+            return maint_jobs.JobResult(summary=summary, result=summary)
+
+        return self._maint_submit("identity_backfill", "Backfill Identity", job,
+                                  meta={"idle": from_idle})
+
+    def _handle_identity_backfill_result(self, summary) -> None:
+        self._maint_tool_name = "identity_backfill"
+        self._maint_results = summary
+        cov = (summary or {}).get("coverage", {}) if isinstance(summary, dict) else {}
+        identified = cov.get("identified", 0)
+        indexed = cov.get("indexed", 0)
+        by_source = cov.get("by_source", {})
+        self._maint_status_var.set(
+            f"Identity backfill: {identified}/{indexed} file(s) identified "
+            f"({by_source})."
+        )
+        self._populate_maint_tree(
+            [], col1="Source", col2="Files", col3="")
+        self._show_info(
+            "Backfill Identity",
+            f"Resolved identities for {identified} of {indexed} indexed file(s).\n\n"
+            f"episode: {summary.get('episodes', 0)}  "
+            f"show_folder: {summary.get('show_folder', 0)}  "
+            f"download: {summary.get('download', 0)}  "
+            f"provider lookup: {summary.get('batch_lookup', 0)}"
+            if isinstance(summary, dict) else "Backfill complete.",
         )
 
     # =====================================================================

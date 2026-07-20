@@ -1715,6 +1715,14 @@ class DownloadManager:
         else:
             role = "movie"
         downloads_store.link_request_download(row.request_id, row.download_id, role)
+        # Task J: durably record what each placed file IS, keyed by path, so
+        # dupes/presence/rename join identity instead of re-parsing the name.
+        try:
+            import library_identity
+            library_identity.record_placement(row, moved_final_paths)
+        except Exception:
+            logger.exception("library_identity.record_placement failed for #%s",
+                             row.download_id)
         queue_store.set_status(row.request_id, queue_store.STATUS_PLACED)
         self._finalize_fulfillment(row.request_id)
 

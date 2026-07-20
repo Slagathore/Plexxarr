@@ -328,6 +328,15 @@ def rebuild_library_index(force: bool = False) -> ReindexResult:
             _diff_and_log_events(conn, old_snapshot, new_snapshot)
         conn.commit()
 
+    # Prune identities whose file left the index (Task J lifecycle). Runs after
+    # the index reflects the current disk, so offline-root files (preserved
+    # above) keep their identities.
+    try:
+        import library_identity
+        library_identity.prune_orphans()
+    except Exception:
+        pass
+
     return ReindexResult(
         indexed_files=indexed_count,
         scanned_roots=[str(path) for path in valid_paths],
@@ -439,18 +448,33 @@ def refresh_library_index(force: bool = False) -> RefreshResult:
             _diff_and_log_events(conn, old_snapshot, new_snapshot)
         conn.commit()
 
+    # Identity rows for files that left the index die with them (Task J). The
+    # index already reflects the current disk here (offline-root files were
+    # preserved above), so pruning against it never wipes an offline drive.
+    try:
+        import library_identity
+        library_identity.prune_orphans()
+    except Exception:
+        pass
+
     return RefreshResult(added=len(added), removed=len(removed),
                          updated=len(updated), total=len(new_snapshot))
 
 
 def remove_from_index(paths: list[str]) -> None:
-    """Drop deleted files from the index immediately (no rescan needed)."""
+    """Drop deleted files from the index immediately (no rescan needed). Their
+    stored identity rows die with them (Task J lifecycle)."""
     if not paths:
         return
     with _DB_LOCK, db.connect(_db_path()) as conn:
         conn.executemany("DELETE FROM library_files WHERE path = ?",
                          [(p,) for p in paths])
         conn.commit()
+    try:
+        import library_identity
+        library_identity.remove_identities(paths)
+    except Exception:
+        pass
 
 
 def indexed_file_count() -> int:

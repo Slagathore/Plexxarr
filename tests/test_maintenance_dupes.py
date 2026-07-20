@@ -190,3 +190,14 @@ def test_dupes_year_in_title_movies_stay_distinct(tmp_path, monkeypatch):
         "Blade.Runner.1982.720p.BluRay.mkv",
     ])
     assert find_duplicates() == []
+
+
+def test_dupes_letter_suffixed_special_not_grouped_with_neighbor(tmp_path, monkeypatch):
+    """Live-audit false positive: 'S07E05sp The Snowmen' (a special) collapsed
+    into 'S07E05 The Angels Take Manhattan'. The letter suffix marks a
+    different episode and must stay in the key."""
+    _fixture_library(tmp_path, monkeypatch, [
+        "Doctor Who/Season 07/Doctor Who S07E05 The Angels Take Manhattan.mp4",
+        "Doctor Who/Season 07/Doctor Who S07E05sp The Snowmen.mp4",
+    ])
+    assert find_duplicates() == []

@@ -34,11 +34,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DuplicateGroup:
-    """A group of files that are likely duplicates of the same content."""
+    """A group of files that are likely duplicates of the same content.
+
+    Task J: a group is either IDENTITY-keyed (every file shares a resolved
+    provider identity — unidentified=False, provenance in resolved_by) or
+    STRING-keyed (files matched on cleaned filename only — unidentified=True).
+    The dupes UI marks the string groups and offers "Resolve" so the user can
+    pin an identity instead of trusting a filename guess."""
     normalized_title: str
     candidates: list[str]            # file paths
     candidate_sizes: list[int]       # parallel list of per-file sizes (bytes)
     total_size_bytes: int
+    unidentified: bool = True        # True = matched on filename, not identity
+    identity_source: str | None = None   # provider when identity-keyed
+    external_id: str | None = None
+    resolved_by: str | None = None   # how the shared identity was resolved
 
 
 @dataclass
@@ -198,6 +208,26 @@ def request_present_in_library(req) -> bool:
         import media_identity
         from library_index import search_library
         want = _request_want_identity(req)
+        # Task J: identity join first. If a file with this exact provider
+        # identity is resolved AND still in the index, it is present — no
+        # string parsing needed. A season-specific TV want checks that season;
+        # a whole-show want (season None) accepts any season.
+        if want.is_qualified:
+            import library_identity
+            if req.media_type == "movie":
+                if library_identity.identity_present_in_library(
+                        want.identity_source, want.external_id, season=None,
+                        movie=True):
+                    return True
+            elif want.season is not None:
+                if library_identity.identity_present_in_library(
+                        want.identity_source, want.external_id,
+                        season=want.season, movie=False):
+                    return True
+            elif library_identity.identity_present_in_library(
+                    want.identity_source, want.external_id, season_any=True,
+                    movie=False):
+                return True
         if not media_identity.normalize_title(want.canonical_title):
             return False
         entries = search_library(req.resolved_title or req.content, limit=8)
@@ -444,6 +474,11 @@ _DUP_SPECIAL_FILE_RE = re.compile(r"\b(?:OVA|OAD|NC(?:OP|ED))\b", re.IGNORECASE)
 _DUP_PART_RE = re.compile(r"\b(?:pt|part|cd|disc|disk)[\s._-]?(\d{1,2})\b",
                           re.IGNORECASE)
 _DUP_HALF_RE = re.compile(r"(\d{1,3})\.5\b")
+# A letter suffix glued to the episode number ("S07E05sp The Snowmen",
+# "S01E03a") marks a DIFFERENT episode (special/split part) — dropping it
+# collapsed a special into its neighbor (live-audit false positive).
+_DUP_EP_SUFFIX_RE = re.compile(
+    r"[Ss]\d{1,2}[Ee](\d{1,3})([A-Za-z]{1,3})(?![A-Za-z0-9])")
 _DUP_SXX_X_RE = re.compile(r"[Ss](\d{1,2})[Xx](\d{1,2})\b")
 _DUP_EXX_X_RE = re.compile(r"[Ee](\d{1,3})[Xx](\d{1,2})\b")
 _DUP_PROMO_STEMS = {"etrg", "rarbg", "rarbg com", "sample", "readme", "info",
@@ -583,17 +618,27 @@ def find_duplicates() -> list[DuplicateGroup]:
     Returns a list of DuplicateGroup objects, each with ≥ 2 candidate paths.
     """
     import dupe_ignore
+    import library_identity
 
     files = _media_files_with_root(config.PLEX_LIBRARY_PATHS)
     if not files:
         logger.warning("find_duplicates: no media files found in configured library paths.")
         return []
 
+    # Task J: identity-first. A file with a resolved provider identity groups on
+    # that identity, not on its filename — so two files whose names parse alike
+    # but resolve to DIFFERENT ids (Goosebumps 1995 vs 2023) never collapse, and
+    # a string group containing an identified file splits it out. Unidentified
+    # files keep the string key and are marked so the UI can offer "Resolve".
+    identities = library_identity.get_identities([str(f) for f, _ in files])
+
     # Key: (title, year, season, episode, part). Year separates reboots that
     # share a name (Goosebumps 1995 vs 2023); part separates cd1/cd2 and
     # pt1/pt2 splits of ONE item; episode is a string so 13.5 recaps and
     # SxxXyy specials stay distinct from their whole-number neighbours.
     groups: dict[tuple, list[Path]] = {}
+    # key -> provenance for identity-keyed groups (None => string-keyed).
+    group_identity: dict[tuple, library_identity.LibraryIdentityRow] = {}
     for f, root in files:
         if any(_DUP_EXTRAS_DIR_RE.match(part) for part in f.parent.parts):
             continue
@@ -606,6 +651,10 @@ def find_duplicates() -> list[DuplicateGroup]:
         ep = _parse_episode(f.name)
         season = ep[0] if ep else None
         episode: str | None = str(ep[1]) if ep else None
+        if ep is not None:
+            m = _DUP_EP_SUFFIX_RE.search(stem)
+            if m and int(m.group(1)) == ep[1]:
+                episode = f"{ep[1]}{m.group(2).lower()}"
 
         ancestor_names = _ancestor_dir_names(f, root)
 
@@ -675,14 +724,33 @@ def find_duplicates() -> list[DuplicateGroup]:
             if year is None:
                 year = leading
 
-        key = (title, year, season, episode, part)
+        idrow = identities.get(str(f))
+        # An episodic identity with NO resolved episode number can't safely
+        # group: distinct episodes under one show folder would all key
+        # identically and collapse into a single false "duplicate". Those fall
+        # back to the string key (which parses the filename) — the row still
+        # counts for presence checks, just not for dupe grouping. Movies (no
+        # episode by nature) and episodics WITH an episode number key by
+        # identity.
+        can_identity_group = (
+            idrow is not None and idrow.is_qualified
+            and (idrow.is_movie or idrow.episode is not None))
+        if can_identity_group:
+            # Identity key: namespace + provider id + season/episode from the
+            # resolved identity, plus `part` so a cd1/cd2 split of ONE movie
+            # still separates. The "id" discriminator keeps it from ever
+            # colliding with a string key.
+            key = idrow.group_key + (part,)
+            group_identity[key] = idrow
+        else:
+            key = ("str", title, year, season, episode, part)
         groups.setdefault(key, []).append(f)
 
     ignored_folder_pairs = dupe_ignore.ignored_folder_pair_set()
     ignored_file_pairs = dupe_ignore.ignored_file_pair_set()
 
     results: list[DuplicateGroup] = []
-    for (norm_title, year, season, episode, _part), paths in groups.items():
+    for key, paths in groups.items():
         if len(paths) < 2:
             continue
         sorted_paths = sorted(paths)
@@ -702,15 +770,35 @@ def find_duplicates() -> list[DuplicateGroup]:
                 sizes.append(p.stat().st_size)
             except OSError:
                 sizes.append(0)
-        label = norm_title + (f" ({year})" if year else "")
-        if season is not None and episode is not None:
-            label = f"{label} S{season:02d}E{episode}"
-        results.append(DuplicateGroup(
-            normalized_title=label,
-            candidates=path_strs,
-            candidate_sizes=sizes,
-            total_size_bytes=sum(sizes),
-        ))
+
+        idrow = group_identity.get(key)
+        if idrow is not None:
+            year = idrow.canonical_year
+            label = (idrow.canonical_title or "?") + (f" ({year})" if year else "")
+            if idrow.season is not None and idrow.episode is not None:
+                label = f"{label} S{idrow.season:02d}E{idrow.episode:02d}"
+            results.append(DuplicateGroup(
+                normalized_title=label,
+                candidates=path_strs,
+                candidate_sizes=sizes,
+                total_size_bytes=sum(sizes),
+                unidentified=False,
+                identity_source=idrow.identity_source,
+                external_id=idrow.external_id,
+                resolved_by=idrow.resolved_by,
+            ))
+        else:
+            _kind, norm_title, year, season, episode, _part = key
+            label = norm_title + (f" ({year})" if year else "")
+            if season is not None and episode is not None:
+                label = f"{label} S{season:02d}E{episode}"
+            results.append(DuplicateGroup(
+                normalized_title=label,
+                candidates=path_strs,
+                candidate_sizes=sizes,
+                total_size_bytes=sum(sizes),
+                unidentified=True,
+            ))
 
     results.sort(key=lambda g: -g.total_size_bytes)
     logger.info("find_duplicates: found %d potential duplicate group(s).", len(results))
@@ -874,6 +962,18 @@ def sanitize_filename(path: str, *, dry_run: bool = True) -> SanitizePair:
         path:    Absolute path to the media file.
         dry_run: If True (default), only return the proposed pair without
                  touching the filesystem.  Pass dry_run=False to apply.
+
+    note: deferred (Task J, rename-from-identity) — when
+    library_identity.get_identity(path) returns a qualified row, the proposed
+    name should come from its canonical_title/canonical_year (movies) or
+    canonical_title + SxxExx (episodes) using the SAME naming the placement
+    pipeline uses (download_manager._episode_stem_for_file /
+    plan.new_filename), with regex cleanup reserved for unidentified files.
+    Left as a marked insertion point rather than half-wired: it also needs the
+    provenance (resolved_by) surfaced in the preview so an inherited/batch
+    identity is never silently renamed to (per Task J item 4 safety). The
+    identity backbone, backfill, lifecycle, and the dupes/presence consumers
+    are complete and independent of this.
     """
     p = Path(path)
     if not p.is_file():

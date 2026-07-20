@@ -621,6 +621,28 @@ def check_item_in_library(
                 return True
             if imdb_id and str(imdb_id) in provider_index.show_imdb_ids:
                 return True
+    # Task J: identity join SECOND (provider index first, string match last).
+    # A file resolved to this provider id AND still in the index is present,
+    # with no filename parsing. imdb ids are stored under 'omdb' (the source
+    # media_lookup emits for imdb results), so both are tried.
+    try:
+        import library_identity
+        id_candidates: list[tuple[str, str]] = []
+        if tmdb_id:
+            id_candidates.append(("tmdb", str(tmdb_id)))
+        if tvdb_id:
+            id_candidates.append(("tvdb", str(tvdb_id)))
+        if imdb_id:
+            id_candidates.append(("omdb", str(imdb_id)))
+            id_candidates.append(("imdb", str(imdb_id)))
+        is_movie = kind == "movie"
+        for source, ext in id_candidates:
+            if library_identity.identity_present_in_library(
+                    source, ext, season=None, season_any=not is_movie,
+                    movie=is_movie):
+                return True
+    except Exception:
+        pass
     if not title:
         return False
     try:
