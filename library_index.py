@@ -371,28 +371,84 @@ class RefreshResult:
     aborted_reason: str = ""    # non-empty = index left untouched, here's why
 
 
-def refresh_library_index(force: bool = False) -> RefreshResult:
+def _norm_path(path: str | Path) -> str:
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _is_under(norm: str, norm_prefix: str) -> bool:
+    """True when a normalized path IS a normalized scope prefix or sits under
+    it. Equality covers a scope entry that is the changed file itself;
+    startswith(prefix + sep) covers everything inside a changed directory."""
+    return norm == norm_prefix or norm.startswith(norm_prefix + os.sep)
+
+
+def refresh_library_index(force: bool = False,
+                          scope: list[str] | None = None) -> RefreshResult:
     """Delta pass: reconcile the persisted index against the filesystem
     without a full rebuild — adds new files, drops vanished ones, updates
-    changed sizes. Much faster than rebuild on large libraries."""
+    changed sizes. Much faster than rebuild on large libraries.
+
+    scope (Task K): when given, only the listed paths (files or directories)
+    are walked and reconciled — the folder watcher's per-batch pass over just a
+    settled subtree. A scope entry that doesn't fall under an available
+    configured root is ignored (can't scan it, mustn't remove its rows). The
+    collapse guard is computed against the SCOPED index subset, never the whole
+    index, so a small legitimate scoped pass can't trip it and a large scoped
+    vanish still does. scope=None is the unchanged full delta over every root."""
     initialize_library_index_db()
     valid_paths, missing_paths = _configured_library_paths()
     missing_set = set(missing_paths)
     extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
+    scoped = scope is not None
 
     on_disk: dict[str, tuple[str, str, int, float]] = {}
-    for root_path in valid_paths:
-        for current_root, _dirs, files in os.walk(root_path):
-            for name in files:
-                if extensions and Path(name).suffix.lower() not in extensions:
-                    continue
-                file_path = Path(current_root) / name
-                try:
-                    stat = file_path.stat()
-                except OSError:
-                    continue
-                on_disk[str(file_path)] = (name, str(root_path),
-                                           int(stat.st_size), float(stat.st_mtime))
+
+    def _consider(file_path: str, name: str, root_path: str) -> None:
+        if extensions and Path(name).suffix.lower() not in extensions:
+            return
+        try:
+            stat = os.stat(file_path)
+        except OSError:
+            return
+        on_disk[file_path] = (name, root_path, int(stat.st_size),
+                              float(stat.st_mtime))
+
+    scope_prefixes: list[str] = []
+    if scoped:
+        # Roots longest-first so the most specific configured root owns a file
+        # when roots nest, matching the full pass's "last walk wins" only more
+        # deterministically.
+        norm_roots = sorted(
+            ((_norm_path(v), str(v)) for v in valid_paths),
+            key=lambda t: -len(t[0]))
+
+        def _root_for(path: str) -> str | None:
+            norm = _norm_path(path)
+            for nv, original in norm_roots:
+                if _is_under(norm, nv):
+                    return original
+            return None
+
+        for raw in scope:
+            root = _root_for(raw)
+            if root is None:
+                continue  # outside every available root — skip, never remove
+            scope_prefixes.append(_norm_path(raw))
+            sp = Path(raw)
+            if sp.is_dir():
+                for current_root, _dirs, files in os.walk(raw):
+                    for name in files:
+                        fp = str(Path(current_root) / name)
+                        _consider(fp, name, _root_for(fp) or root)
+            elif sp.is_file():
+                _consider(str(sp), sp.name, root)
+            # A vanished scope path contributes nothing to on_disk; its indexed
+            # rows fall into `removed` below.
+    else:
+        for root_path in valid_paths:
+            for current_root, _dirs, files in os.walk(root_path):
+                for name in files:
+                    _consider(str(Path(current_root) / name), name, str(root_path))
 
     with _DB_LOCK, db.connect(_db_path()) as conn:
         indexed = {row[0]: (int(row[1]), float(row[2])) for row in
@@ -404,9 +460,19 @@ def refresh_library_index(force: bool = False) -> RefreshResult:
                 "SELECT path, name, size_bytes FROM library_files")
         }
 
+        # The rows this pass is allowed to reconcile: everything for a full
+        # pass, only rows under a scope prefix for a scoped one. Rows outside
+        # the scope are never touched (and never counted toward the guard).
+        if scoped:
+            reconcile_indexed = {
+                p: v for p, v in indexed.items()
+                if any(_is_under(_norm_path(p), s) for s in scope_prefixes)}
+        else:
+            reconcile_indexed = indexed
+
         # Files under an unavailable root aren't "removed", they're just
         # unreachable right now (drive unplugged, NAS offline). Keep them.
-        removed = [p for p in indexed
+        removed = [p for p in reconcile_indexed
                    if p not in on_disk and roots_by_path.get(p) not in missing_set]
         added = [p for p in on_disk if p not in indexed]
         updated = [p for p, (name, root, size, mtime) in on_disk.items()
@@ -414,16 +480,18 @@ def refresh_library_index(force: bool = False) -> RefreshResult:
 
         # Collapse guard: same rule as rebuild_library_index — a delta pass
         # that would drop >90% of a substantial index means the roots weren't
-        # really scanned, not that the library vanished.
-        surviving = len(indexed) - len(removed) + len(added)
-        if (not force and len(indexed) >= 100
-                and surviving < len(indexed) // 10):
+        # really scanned, not that the library vanished. Computed against the
+        # scoped subset so a scoped pass judges only its own subtree: a small
+        # subtree never trips it, a large subtree that truly vanished still does.
+        base = len(reconcile_indexed)
+        surviving = base - len(removed) + len(added)
+        if (not force and base >= 100 and surviving < base // 10):
             conn.rollback()
             return RefreshResult(
                 added=0, removed=0, updated=0, total=len(indexed),
                 aborted_reason=(
                     f"refused: rescan would leave {surviving} file(s) of"
-                    f" {len(indexed)} indexed. Check that the media drives are"
+                    f" {base} indexed. Check that the media drives are"
                     " connected, or rerun with force to accept the shrink."),
             )
 
@@ -459,6 +527,26 @@ def refresh_library_index(force: bool = False) -> RefreshResult:
 
     return RefreshResult(added=len(added), removed=len(removed),
                          updated=len(updated), total=len(new_snapshot))
+
+
+def indexed_paths_under(scope: list[str]) -> list[str]:
+    """Every indexed file path that falls under one of the given scope paths.
+    The folder watcher hands these to the scoped identity backfill after a
+    settled subtree's index delta — 'resolve identity for exactly the files now
+    present under what changed'. Membership is normcase/normpath so it is
+    case-correct on Windows; the scan is an in-memory prefix test over the
+    (already cheap) path column, not a fragile SQL LIKE."""
+    if not scope:
+        return []
+    initialize_library_index_db()
+    prefixes = [_norm_path(s) for s in scope]
+    out: list[str] = []
+    with _DB_LOCK, db.connect(_db_path()) as conn:
+        for (path,) in conn.execute("SELECT path FROM library_files"):
+            norm = _norm_path(path)
+            if any(_is_under(norm, pfx) for pfx in prefixes):
+                out.append(path)
+    return out
 
 
 def remove_from_index(paths: list[str]) -> None:

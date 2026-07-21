@@ -34,12 +34,16 @@ hiddenimports = (
     + collect_submodules("RTN")
     + collect_submodules("parsett")
     + collect_submodules("pydantic")
+    # watchdog picks its observer backend at runtime (read_directory_changes on
+    # Windows, inotify on Linux) via dynamic import — collect the lot so the
+    # folder watcher works from the bundle. Optional at runtime either way.
+    + collect_submodules("watchdog")
     + ["pydantic_core", "orjson", "Levenshtein", "arrow", "pymediainfo"]
     # New modules are imported dynamically enough that we pin them explicitly.
     + ["sv_ttk", "send2trash", "shows_tab", "shows_store", "show_tracker",
        "downloads_store", "download_manager", "torrent_search", "torrent_routing",
        "auth_store", "db", "ui_helpers", "health", "watchlist_tab", "video_quality",
-       "subtitles", "anime_db", "media_identity"]
+       "subtitles", "anime_db", "media_identity", "library_watch"]
 )
 
 

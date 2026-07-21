@@ -764,3 +764,41 @@ def backfill_identities(progress=None, cancel_check=None, *,
     summary["pruned"] = prune_orphans()
     summary["coverage"] = coverage_report()
     return summary
+
+
+def backfill_paths(paths: list[str]) -> dict:
+    """Offline (no-network) identity resolution for a SPECIFIC set of newly-seen
+    files — the folder watcher's per-batch pass (Task K item 2). Runs the same
+    episode / show_folder / download phase builders the full backfill uses and
+    writes through the same trust-gated _bulk_upsert, so provenance and trust
+    order are identical; it just keys to `paths` instead of the whole library
+    and skips the network provider lookup (that stays a full-backfill concern).
+
+    The episode and moved-download phases enumerate shows/requests (bounded,
+    fast) and are filtered down to the target paths here; the show-folder phase
+    is fed only the target paths directly. Idempotent — re-running a settled
+    subtree only ever strengthens an identity, never downgrades one."""
+    import os
+
+    if not paths:
+        return {"episodes": 0, "show_folder": 0, "download": 0}
+    initialize_library_identity_db()
+    import shows_store
+    shows = shows_store.list_shows()
+
+    want = {os.path.normcase(os.path.normpath(p)) for p in paths}
+
+    def _keep(records: list[dict]) -> list[dict]:
+        return [r for r in records
+                if os.path.normcase(os.path.normpath(r["path"])) in want]
+
+    def _noop(*_a, **_k):
+        return None
+
+    indexed = [(p, os.path.basename(p)) for p in paths]
+    summary = {
+        "episodes": _bulk_upsert(_keep(_episode_records(_noop, shows))),
+        "show_folder": _bulk_upsert(_show_folder_records(_noop, indexed, shows)),
+        "download": _bulk_upsert(_keep(_download_records(_noop))),
+    }
+    return summary

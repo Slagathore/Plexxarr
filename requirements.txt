@@ -53,3 +53,9 @@ subliminal==2.6.0
 # pip index versions rank-torrent-name -> 1.11.1; requires_python <4.0,>=3.11).
 # Pulls in parsett + pydantic; the PyInstaller specs collect those explicitly.
 rank-torrent-name==1.11.1
+
+# Filesystem watcher (Task K) — Plex-style pickup of manual library additions.
+# Current stable major, live-verified 2026-07-20 (pip index versions watchdog
+# -> 6.0.0). Optional at runtime: library_watch degrades to the nightly delta
+# when it can't import, so a source checkout that hasn't reinstalled still runs.
+watchdog==6.0.0

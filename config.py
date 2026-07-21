@@ -397,6 +397,20 @@ IDLE_CACHE_HOUR: int = int(os.getenv("IDLE_CACHE_HOUR", "4"))
 LIBRARY_CHECK_HOUR: int = int(os.getenv("LIBRARY_CHECK_HOUR", "3"))
 
 # ---------------------------------------------------------------------------
+# Folder watcher (Task K) — Plex-style pickup of manual additions. Watches
+# every PLEX_LIBRARY_PATHS root recursively; a changed subtree is processed
+# only after LIBRARY_WATCH_SETTLE_SECONDS of quiet AND size-stable files (a
+# multi-GB copy keeps growing for minutes, so we wait for it to finish before a
+# scoped index delta + identity pass + request reconciliation runs). Missing
+# watchdog or an unwatchable root degrades to logging + the nightly delta,
+# never crashes.
+# ---------------------------------------------------------------------------
+LIBRARY_WATCH_ENABLED: bool = _env_bool("LIBRARY_WATCH_ENABLED", True)
+LIBRARY_WATCH_SETTLE_SECONDS: int = int(
+    os.getenv("LIBRARY_WATCH_SETTLE_SECONDS", "60")
+)
+
+# ---------------------------------------------------------------------------
 # Torrent download pipeline (webtorrent engine via Node runner)
 # ---------------------------------------------------------------------------
 # Staging directory — every torrent downloads here first; files only move to

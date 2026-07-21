@@ -1,3 +1,4 @@
+import concurrent.futures
 import datetime
 import logging
 import os
@@ -298,10 +299,20 @@ class DesktopApp:
         self._last_log_count = 0
         self._tray_icon = self._build_tray_icon()
         self._quitting = False
+        # Task K: folder watcher (Plex-style pickup of manual additions).
+        # Constructed lazily in _start_library_watcher after UI init; None until
+        # then and whenever watchdog is unavailable / the feature is off.
+        self._library_watcher: Any = None
         self._library_summary_refresh_running = False
         self._library_summary_refresh_pending = False
         self._library_metrics_refresh_running = False
         self._library_metrics_refresh_pending = False
+        # Per-tick refreshers submit onto one shared pool instead of spawning a
+        # fresh daemon thread every 15s tick (which leaked OS handles at idle).
+        self._refresh_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="ui-refresh")
+        self._refresh_lock = threading.Lock()
+        self._refresh_futures: dict[str, concurrent.futures.Future] = {}
 
         self._build_ui()
         self._apply_dark_widget_styles(self.root)
@@ -475,6 +486,7 @@ class DesktopApp:
         self._schedule_auto_grab()
         self._schedule_idle_cache()
         self._schedule_midnight_rollover()
+        self._start_library_watcher()
         # Local anime metadata (manami + anime-lists dumps): build/refresh in
         # the background when missing or older than a week.
         anime_db.ensure_fresh(background=True)
@@ -1684,7 +1696,8 @@ class DesktopApp:
 
     def refresh_status(self) -> None:
         self._update_plex_indicator()
-        self.run_action("Refresh Status", get_status, show_popup=False, update_status_only=True)
+        self.run_action("Refresh Status", get_status, show_popup=False,
+                        update_status_only=True, pooled=True)
 
     def run_health_check(self, *, include_updates: bool = False) -> None:
         """Render the health (and optionally update) report into the Status tab."""
@@ -1708,7 +1721,7 @@ class DesktopApp:
                 logger.exception("Plex status check failed.")
             self._post_to_ui(lambda: self._set_plex_indicator(running))
 
-        threading.Thread(target=worker, name="ui-plex-indicator", daemon=True).start()
+        self._submit_refresh("plex-indicator", worker)
 
     def _set_plex_indicator(self, running: bool) -> None:
         color = _DOT_GREEN if running else _DOT_RED
@@ -1792,7 +1805,7 @@ class DesktopApp:
             "Saved PLEX_TOKEN and PLEX_CLIENT_IDENTIFIER to .env.\n"
             f"Token: {masked_token}")
 
-    def run_action(self, action_name: str, action, *, show_popup: bool = True, update_status_only: bool = False) -> None:
+    def run_action(self, action_name: str, action, *, show_popup: bool = True, update_status_only: bool = False, pooled: bool = False) -> None:
         def worker() -> None:
             try:
                 result = action()
@@ -1803,7 +1816,10 @@ class DesktopApp:
                 action_name, result, show_popup=show_popup, update_status_only=update_status_only,
             ))
 
-        threading.Thread(target=worker, name=f"ui-{action_name.lower().replace(' ', '-')}", daemon=True).start()
+        if pooled:
+            self._submit_refresh(action_name, worker)
+        else:
+            threading.Thread(target=worker, name=f"ui-{action_name.lower().replace(' ', '-')}", daemon=True).start()
 
     def _handle_action_result(self, action_name: str, result: str, *, show_popup: bool, update_status_only: bool) -> None:
         self.last_action_var.set(f"Last action: {action_name}")
@@ -1845,7 +1861,7 @@ class DesktopApp:
                 summary = f"Library summary unavailable: {exc}"
             self._post_to_ui(lambda: self._handle_library_summary_result(summary))
 
-        threading.Thread(target=worker, name="ui-library-summary", daemon=True).start()
+        self._refresh_pool.submit(worker)
 
     def _handle_library_summary_result(self, summary: str) -> None:
         self._library_summary_refresh_running = False
@@ -1876,7 +1892,7 @@ class DesktopApp:
                 metrics = f"Metrics unavailable: {exc}"
             self._post_to_ui(lambda: self._handle_library_metrics_result(metrics))
 
-        threading.Thread(target=worker, name="ui-library-metrics", daemon=True).start()
+        self._refresh_pool.submit(worker)
 
     def _handle_library_metrics_result(self, metrics: str) -> None:
         self._library_metrics_refresh_running = False
@@ -3089,6 +3105,18 @@ class DesktopApp:
         self.refresh_activity_feed()
         self._schedule_status_refresh()
 
+    def _submit_refresh(self, key: str, fn) -> None:
+        """Run a per-tick refresh on the shared pool, skipping the submit while
+        this task's previous run is still in flight so a slow cycle cannot pile
+        up queued work. Safe to call from the tray thread as well as the UI."""
+        with self._refresh_lock:
+            if self._quitting:
+                return
+            pending = self._refresh_futures.get(key)
+            if pending is not None and not pending.done():
+                return
+            self._refresh_futures[key] = self._refresh_pool.submit(fn)
+
     def _refresh_file_ledger_views(self) -> None:
         """Fill the File Changes / Missing Files trees from the ledger."""
         try:
@@ -4117,6 +4145,46 @@ class DesktopApp:
     # Overnight pre-cache — warm every expensive scan while nothing happens
     # =====================================================================
 
+    def _start_library_watcher(self) -> None:
+        """Task K item 3: start the folder watcher after UI init. Off when
+        disabled by config, and a no-op (logged inside the watcher) when
+        watchdog is missing or no root is watchable — the nightly delta still
+        covers everything either way."""
+        if self._quitting or not config.LIBRARY_WATCH_ENABLED:
+            return
+        try:
+            import library_watch
+            watcher = library_watch.LibraryWatcher(self._on_watch_batch)
+            if watcher.start():
+                self._library_watcher = watcher
+        except Exception:
+            logger.exception("Folder watcher failed to start — the nightly "
+                             "delta still covers manual additions.")
+
+    def _on_watch_batch(self, paths: list[str]) -> None:
+        """A settled batch of manual filesystem changes. Runs the scoped
+        pipeline (index delta -> identity -> request reconciliation) through the
+        job registry, marshalled onto the UI thread — the watcher's poller
+        thread must not touch Tk. Idempotent, so app-initiated placements that
+        also fire events are harmless."""
+        if self._quitting or not paths:
+            return
+
+        def submit() -> None:
+            if self._quitting:
+                return
+
+            def job(progress, cancel_check) -> Any:
+                import library_watch
+                summary = library_watch.process_settled_paths(paths, progress=progress)
+                return maint_jobs.JobResult(summary=summary, result=summary)
+
+            self._maint_submit("library_watch",
+                               f"Folder watcher: {len(paths)} change(s)", job,
+                               meta={"idle": True})
+
+        self._post_to_ui(submit)
+
     def _schedule_idle_cache(self) -> None:
         if not self._quitting:
             self.root.after(15 * 60 * 1000, self._idle_cache_tick)
@@ -4214,6 +4282,48 @@ class DesktopApp:
         jobs.append(self._maint_submit(
             "idle_lowqual_scan", "Pre-cache: movie quality scan",
             lowqual_job, meta={"idle": True}))
+
+        # Task K item 4: complete the overnight warm. Identity backfill (its
+        # own registry job, DB phases + the rate-limited provider lookup),
+        # a recommendations refresh, and a full show-episode sync so the
+        # Watchlist and Shows tabs open current the next day too.
+        jobs.append(self._run_identity_backfill(from_idle=True))
+
+        def recs_job(progress, cancel_check) -> Any:
+            progress(phase="Refreshing recommendations…")
+            try:
+                summary = self.watchlist_tab.refresh_recs_headless()
+            except Exception as exc:
+                logger.exception("Idle cache: recommendations refresh failed.")
+                return maint_jobs.JobResult(summary={"recs": f"skipped ({exc})"})
+            return maint_jobs.JobResult(summary=summary)
+
+        jobs.append(self._maint_submit(
+            "idle_recs_refresh", "Pre-cache: recommendations",
+            recs_job, meta={"idle": True}))
+
+        def shows_sync_job(progress, cancel_check) -> Any:
+            # show_tracker.sync_all is headless-safe: it reads shows_store and
+            # writes episode rows, touching no Tk widget. progress bridges its
+            # per-show callback to the job phase line.
+            import show_tracker
+            progress(phase="Syncing tracked show episodes…")
+
+            def sync_progress(done: int, total: int, title: str) -> None:
+                if cancel_check():
+                    raise maint_jobs.JobCancelled(items_done=done)
+                progress(done, total, phase=f"Syncing shows: {title[:40]}")
+
+            try:
+                summaries = show_tracker.sync_all(progress=sync_progress)
+            except Exception as exc:
+                logger.exception("Idle cache: show episode sync failed.")
+                return maint_jobs.JobResult(summary={"shows_synced": f"skipped ({exc})"})
+            return maint_jobs.JobResult(summary={"shows_synced": len(summaries)})
+
+        jobs.append(self._maint_submit(
+            "idle_shows_sync", "Pre-cache: show episode sync",
+            shows_sync_job, meta={"idle": True}))
 
         self._maint_idle_pending = {j.job_id for j in jobs if j is not None}
 
@@ -6480,6 +6590,14 @@ class DesktopApp:
             return
         self._quitting = True
         logger.info("Shutting down desktop app.")
+        with self._refresh_lock:
+            self._refresh_pool.shutdown(wait=False)
+        if self._library_watcher is not None:
+            try:
+                self._library_watcher.stop()
+            except Exception:
+                logger.exception("Failed to stop the folder watcher cleanly.")
+            self._library_watcher = None
         try:
             self.download_manager.shutdown()
         except Exception:

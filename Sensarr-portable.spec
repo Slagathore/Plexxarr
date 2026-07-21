@@ -28,11 +28,14 @@ hiddenimports = (
     + collect_submodules("RTN")
     + collect_submodules("parsett")
     + collect_submodules("pydantic")
+    # watchdog's observer backend is chosen by dynamic import at runtime; collect
+    # every submodule so the folder watcher runs from the bundle (optional dep).
+    + collect_submodules("watchdog")
     + ["pydantic_core", "orjson", "Levenshtein", "arrow", "pymediainfo"]
     + ["sv_ttk", "send2trash", "shows_tab", "shows_store", "show_tracker",
        "downloads_store", "download_manager", "torrent_search", "torrent_routing",
        "auth_store", "db", "ui_helpers", "health", "watchlist_tab", "video_quality",
-       "subtitles", "anime_db", "media_identity"]
+       "subtitles", "anime_db", "media_identity", "library_watch"]
 )
 
 _EXCLUDE_HEAVY = [

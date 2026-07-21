@@ -418,6 +418,52 @@ def _placement_still_valid(req) -> bool:
     return not have_links
 
 
+def reconcile_requests_with_library(statuses: tuple[str, ...] | None = None) -> dict:
+    """Close every outstanding request whose exact identity is NOW present in
+    the library (Task K item 2). The folder watcher calls this after a manual
+    add settles: an admin who grabbed something by hand should watch the
+    matching request close within minutes, not wait for the nightly check.
+
+    Reuses the daily check's own building blocks verbatim — presence via
+    request_present_in_library (identity join first, string match second) and
+    closeability via _closeable_on_library_match (movies and whole-show wants
+    only; a season-specific request is marked found but never closed here). No
+    separate matcher and no reimplementation: this is the daily check's
+    close-if-satisfied rule applied on demand to a wider set of live statuses,
+    including grabbing (the admin beat our own pipeline to it) and
+    needs_attention (a capped request the file finally arrived for)."""
+    import queue_store as qs
+
+    if statuses is None:
+        statuses = (qs.STATUS_OPEN, qs.STATUS_GRABBING,
+                    qs.STATUS_NEEDS_ATTENTION, qs.STATUS_DEFERRED)
+
+    requests = []
+    for status in statuses:
+        requests.extend(qs.list_requests(status=status, limit=2000))
+
+    present = marked_found = closed = 0
+    for req in requests:
+        try:
+            if not request_present_in_library(req):
+                continue
+            present += 1
+            if not req.found_in_library:
+                qs.update_library_status(req.request_id, found=True)
+                marked_found += 1
+            if _closeable_on_library_match(req):
+                qs.set_status(req.request_id, qs.STATUS_FULFILLED)
+                closed += 1
+                logger.info(
+                    "Watcher reconcile: request #%s (%s) is now in the library "
+                    "— closed as fulfilled.", req.request_id,
+                    req.resolved_title or req.content)
+        except Exception:
+            logger.exception("Watcher reconcile failed for request #%s",
+                             getattr(req, "request_id", "?"))
+    return {"present": present, "marked_found": marked_found, "closed": closed}
+
+
 # ---------------------------------------------------------------------------
 # Helpers shared across tools
 # ---------------------------------------------------------------------------

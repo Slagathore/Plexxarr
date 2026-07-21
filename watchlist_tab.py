@@ -329,6 +329,25 @@ class WatchlistTab:
 
         threading.Thread(target=worker, name="wl-recs", daemon=True).start()
 
+    def refresh_recs_headless(self) -> dict:
+        """Compute recommendations and refresh the on-disk cache WITHOUT touching
+        the tree — the overnight idle pass (Task K item 4) calls this so the
+        Watchlist/Recs tab opens warm the next day. Runs on the caller's worker
+        thread; it updates the in-memory state and persists via the same
+        _persist_recs the interactive path uses, leaving the actual redraw for
+        the next tab open/render. Reuses get_recommendations — no second
+        recommender."""
+        from plex_api import get_recommendations
+        account = (config.PLEX_ACCOUNT_NAME or "").strip()
+        result = get_recommendations(account or None)
+        self._library_recs = result.library
+        self._discover_recs = result.discover
+        self._generated_at = result.generated_at
+        if result.top_genres:
+            self._top_genres = result.top_genres
+        self._persist_recs()
+        return {"library": len(result.library), "discover": len(result.discover)}
+
     def _render_recs(self) -> None:
         """Render two honest, never-mixed sections: library (owned,
         unwatched) then discover (not owned). The type filter narrows each
